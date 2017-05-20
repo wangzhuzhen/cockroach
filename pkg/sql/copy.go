@@ -25,8 +25,10 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // COPY FROM is not a usual planNode. After a COPY FROM is executed as a
@@ -46,17 +48,18 @@ type copyNode struct {
 	p             *planner
 	table         parser.TableExpr
 	columns       parser.UnresolvedNames
-	resultColumns ResultColumns
+	resultColumns sqlbase.ResultColumns
 	buf           bytes.Buffer
 	rows          []*parser.Tuple
 	rowsMemAcc    WrappableMemoryAccount
 }
 
-func (n *copyNode) Columns() ResultColumns           { return n.resultColumns }
-func (*copyNode) Ordering() orderingInfo             { return orderingInfo{} }
-func (*copyNode) Values() parser.Datums              { return nil }
-func (*copyNode) MarkDebug(_ explainMode)            {}
-func (*copyNode) Next(context.Context) (bool, error) { return false, nil }
+func (n *copyNode) Columns() sqlbase.ResultColumns                    { return n.resultColumns }
+func (*copyNode) Ordering() orderingInfo                              { return orderingInfo{} }
+func (*copyNode) Values() parser.Datums                               { return nil }
+func (*copyNode) MarkDebug(_ explainMode)                             {}
+func (*copyNode) Next(context.Context) (bool, error)                  { return false, nil }
+func (*copyNode) Spans(context.Context) (_, _ roachpb.Spans, _ error) { panic("unimplemented") }
 
 func (n *copyNode) Close(ctx context.Context) {
 	n.rowsMemAcc.Wsession(n.p.session).Close(ctx)
@@ -73,9 +76,7 @@ func (*copyNode) DebugValues() debugValues {
 
 // CopyFrom begins a COPY.
 // Privileges: INSERT on table.
-func (p *planner) CopyFrom(
-	ctx context.Context, n *parser.CopyFrom, autoCommit bool,
-) (planNode, error) {
+func (p *planner) CopyFrom(ctx context.Context, n *parser.CopyFrom) (planNode, error) {
 	cn := &copyNode{
 		table:   &n.Table,
 		columns: n.Columns,
@@ -85,7 +86,7 @@ func (p *planner) CopyFrom(
 	if err != nil {
 		return nil, err
 	}
-	en, err := p.makeEditNode(ctx, tn, autoCommit, privilege.INSERT)
+	en, err := p.makeEditNode(ctx, tn, privilege.INSERT)
 	if err != nil {
 		return nil, err
 	}
@@ -93,9 +94,9 @@ func (p *planner) CopyFrom(
 	if err != nil {
 		return nil, err
 	}
-	cn.resultColumns = make(ResultColumns, len(cols))
+	cn.resultColumns = make(sqlbase.ResultColumns, len(cols))
 	for i, c := range cols {
-		cn.resultColumns[i] = ResultColumn{Typ: c.Type.ToDatumType()}
+		cn.resultColumns[i] = sqlbase.ResultColumn{Typ: c.Type.ToDatumType()}
 	}
 	cn.p = p
 	cn.rowsMemAcc = p.session.OpenAccount()
@@ -138,10 +139,10 @@ var (
 // sent in a message, there's no guarantee that data contains a complete row
 // (or even a complete datum). It is thus valid to have no new rows added
 // to the internal state after this call.
-func (p *planner) ProcessCopyData(
+func (s *Session) ProcessCopyData(
 	ctx context.Context, data string, msg copyMsg,
 ) (parser.StatementList, error) {
-	cf := p.session.copyFrom
+	cf := s.copyFrom
 	buf := cf.buf
 
 	switch msg {
@@ -356,7 +357,7 @@ var decodeMap = map[byte]byte{
 // CopyData is the statement type after a block of COPY data has been
 // received. There may be additional rows ready to insert. If so, return an
 // insertNode, otherwise emptyNode.
-func (p *planner) CopyData(ctx context.Context, n CopyDataBlock, autoCommit bool) (planNode, error) {
+func (p *planner) CopyData(ctx context.Context, n CopyDataBlock) (planNode, error) {
 	// When this many rows are in the copy buffer, they are inserted.
 	const copyRowSize = 100
 
@@ -380,7 +381,7 @@ func (p *planner) CopyData(ctx context.Context, n CopyDataBlock, autoCommit bool
 		},
 		Returning: parser.AbsentReturningClause,
 	}
-	return p.Insert(ctx, &in, nil, autoCommit)
+	return p.Insert(ctx, &in, nil)
 }
 
 // Format implements the NodeFormatter interface.

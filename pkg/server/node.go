@@ -42,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -56,6 +57,9 @@ const (
 	// gossipStatusInterval is the interval for logging gossip status.
 	gossipStatusInterval = 1 * time.Minute
 	// gossipNodeDescriptorInterval is the interval for gossiping the node descriptor.
+	// Note that increasing this duration may increase the likelihood of gossip
+	// thrashing, since node descriptors are used to determine the number of gossip
+	// hops between nodes (see #9819 for context).
 	gossipNodeDescriptorInterval = 1 * time.Hour
 
 	// FirstNodeID is the node ID of the first node in a new cluster.
@@ -64,9 +68,15 @@ const (
 
 // Metric names.
 var (
-	metaExecLatency = metric.Metadata{Name: "exec.latency"}
-	metaExecSuccess = metric.Metadata{Name: "exec.success"}
-	metaExecError   = metric.Metadata{Name: "exec.error"}
+	metaExecLatency = metric.Metadata{
+		Name: "exec.latency",
+		Help: "Latency of batch KV requests executed on this node"}
+	metaExecSuccess = metric.Metadata{
+		Name: "exec.success",
+		Help: "Number of batch KV requests executed successfully on this node"}
+	metaExecError = metric.Metadata{
+		Name: "exec.error",
+		Help: "Number of batch KV requests that failed to execute on this node"}
 )
 
 // errNeedsBootstrap indicates the node should be used as the seed of
@@ -165,7 +175,7 @@ func incVal(ctx context.Context, db *client.DB, key roachpb.Key, inc int64) (int
 	for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
 		res, err = db.Inc(ctx, key, inc)
 		switch err.(type) {
-		case *roachpb.RetryableTxnError, *roachpb.AmbiguousResultError:
+		case *roachpb.UnhandledRetryableError, *roachpb.AmbiguousResultError:
 			continue
 		}
 		break
@@ -188,7 +198,7 @@ func bootstrapCluster(
 ) (uuid.UUID, error) {
 	clusterID := uuid.MakeV4()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// Make sure that the store config has a valid clock and that it doesn't
 	// try to use gossip, since that can introduce race conditions.
@@ -350,18 +360,25 @@ func (n *Node) initNodeID(id roachpb.NodeID) {
 // start starts the node by registering the storage instance for the
 // RPC service "Node" and initializing stores for each specified
 // engine. Launches periodic store gossiping in a goroutine.
+//
+// The canBootstrap parameter indicates whether this node is eligible
+// to bootstrap a new cluster. The -join flag must be empty.
 func (n *Node) start(
 	ctx context.Context,
 	addr net.Addr,
 	engines []engine.Engine,
 	attrs roachpb.Attributes,
 	locality roachpb.Locality,
+	canBootstrap bool,
 ) error {
 	n.initDescriptor(addr, attrs, locality)
 
 	// Initialize stores, including bootstrapping new ones.
 	if err := n.initStores(ctx, engines, n.stopper, false); err != nil {
 		if err == errNeedsBootstrap {
+			if !canBootstrap {
+				return errCannotJoinSelf
+			}
 			n.initialBoot = true
 			// This node has no initialized stores and no way to connect to
 			// an existing cluster, so we bootstrap it.
@@ -453,17 +470,8 @@ func (n *Node) initStores(
 
 	// If there are no initialized stores and no gossip resolvers,
 	// bootstrap this node as the seed of a new cluster.
-	if n.stores.GetStoreCount() == 0 {
-		resolvers := n.storeCfg.Gossip.GetResolvers()
-		// Check for the case of uninitialized node having only itself specified as join host.
-		switch len(resolvers) {
-		case 0:
-			return errNeedsBootstrap
-		case 1:
-			if resolvers[0].Addr() == n.Descriptor.Address.String() {
-				return errCannotJoinSelf
-			}
-		}
+	if n.stores.GetStoreCount() == 0 && len(n.storeCfg.Gossip.GetResolvers()) == 0 {
+		return errNeedsBootstrap
 	}
 
 	// Verify all initialized stores agree on cluster and node IDs.
@@ -536,6 +544,7 @@ func (n *Node) validateStores() error {
 		if n.ClusterID == (uuid.UUID{}) {
 			n.ClusterID = s.Ident.ClusterID
 			n.initNodeID(s.Ident.NodeID)
+			n.storeCfg.Gossip.SetClusterID(s.Ident.ClusterID)
 		} else if n.ClusterID != s.Ident.ClusterID {
 			return errors.Errorf("store %s cluster ID doesn't match node cluster %q", s, n.ClusterID)
 		} else if n.Descriptor.NodeID != s.Ident.NodeID {
@@ -616,6 +625,7 @@ func (n *Node) connectGossip(ctx context.Context) error {
 
 	if n.ClusterID == (uuid.UUID{}) {
 		n.ClusterID = gossipClusterID
+		n.storeCfg.Gossip.SetClusterID(gossipClusterID)
 	} else if n.ClusterID != gossipClusterID {
 		return errors.Errorf("node %d belongs to cluster %q but is attempting to connect to a gossip network for cluster %q",
 			n.Descriptor.NodeID, n.ClusterID, gossipClusterID)
@@ -627,8 +637,8 @@ func (n *Node) connectGossip(ctx context.Context) error {
 // startGossip loops on a periodic ticker to gossip node-related
 // information. Starts a goroutine to loop until the node is closed.
 func (n *Node) startGossip(stopper *stop.Stopper) {
-	stopper.RunWorker(func() {
-		ctx := n.AnnotateCtx(context.Background())
+	ctx := n.AnnotateCtx(context.Background())
+	stopper.RunWorker(ctx, func(ctx context.Context) {
 		// This should always return immediately and acts as a sanity check that we
 		// don't try to gossip before we're connected.
 		select {
@@ -683,8 +693,8 @@ func (n *Node) gossipStores(ctx context.Context) {
 // store to compute the value of metrics which cannot be incrementally
 // maintained.
 func (n *Node) startComputePeriodicMetrics(stopper *stop.Stopper, interval time.Duration) {
-	stopper.RunWorker(func() {
-		ctx := n.AnnotateCtx(context.Background())
+	ctx := n.AnnotateCtx(context.Background())
+	stopper.RunWorker(ctx, func(ctx context.Context) {
 		// Compute periodic stats at the same frequency as metrics are sampled.
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -717,7 +727,7 @@ func (n *Node) computePeriodicMetrics(ctx context.Context, tick int) error {
 func (n *Node) startWriteSummaries(frequency time.Duration) {
 	ctx := log.WithLogTag(n.AnnotateCtx(context.Background()), "summaries", nil)
 	// Immediately record summaries once on server startup.
-	n.stopper.RunWorker(func() {
+	n.stopper.RunWorker(ctx, func(ctx context.Context) {
 		// Write a status summary immediately; this helps the UI remain
 		// responsive when new nodes are added.
 		if err := n.writeSummaries(ctx); err != nil {
@@ -742,7 +752,7 @@ func (n *Node) startWriteSummaries(frequency time.Duration) {
 // NodeStatusRecorder and persists them to the cockroach data store.
 func (n *Node) writeSummaries(ctx context.Context) error {
 	var err error
-	if runErr := n.stopper.RunTask(func() {
+	if runErr := n.stopper.RunTask(ctx, func(ctx context.Context) {
 		err = n.recorder.WriteStatusSummary(ctx, n.storeCfg.DB)
 	}); runErr != nil {
 		err = runErr
@@ -765,8 +775,8 @@ func (n *Node) recordJoinEvent() {
 		lastUp = n.startedAt
 	}
 
-	n.stopper.RunWorker(func() {
-		ctx, span := n.AnnotateCtxWithSpan(context.Background(), "record-join-event")
+	n.stopper.RunWorker(context.Background(), func(bgCtx context.Context) {
+		ctx, span := n.AnnotateCtxWithSpan(bgCtx, "record-join-event")
 		defer span.Finish()
 		retryOpts := base.DefaultRetryOptions()
 		retryOpts.Closer = n.stopper.ShouldStop()
@@ -801,7 +811,9 @@ func (n *Node) batchInternal(
 	// the request handler) doesn't really fit with the current design of the
 	// security package (which assumes that TLS state is only given at connection
 	// time) - that should be fixed.
-	if peer, ok := peer.FromContext(ctx); ok {
+	if grpcutil.IsLocalRequestContext(ctx) {
+		// this is a in-process request, bypass checks.
+	} else if peer, ok := peer.FromContext(ctx); ok {
 		if tlsInfo, ok := peer.AuthInfo.(credentials.TLSInfo); ok {
 			certUser, err := security.GetCertificateUser(&tlsInfo.State)
 			if err != nil {
@@ -815,10 +827,9 @@ func (n *Node) batchInternal(
 
 	var br *roachpb.BatchResponse
 
-	if err := n.stopper.RunTaskWithErr(func() error {
+	if err := n.stopper.RunTaskWithErr(ctx, func(ctx context.Context) error {
 		var finishSpan func(*roachpb.BatchResponse)
 		// Shadow ctx from the outer function. Written like this to pass the linter.
-		ctx := ctx
 		ctx, finishSpan = n.setupSpanForIncomingRPC(ctx, args.TraceContext)
 		defer func(br **roachpb.BatchResponse) {
 			finishSpan(*br)
@@ -933,7 +944,8 @@ func (n *Node) setupSpanForIncomingRPC(
 				if err == nil {
 					br.CollectedSpans = append(br.CollectedSpans, encSp)
 				} else {
-					log.Warning(ctx, err)
+					// We can't log to the finished span; strip the span from the context.
+					log.Warning(opentracing.ContextWithSpan(ctx, nil), err)
 				}
 			}
 		}

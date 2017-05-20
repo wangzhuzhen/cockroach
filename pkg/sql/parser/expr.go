@@ -141,7 +141,9 @@ func binExprFmtWithParen(buf *bytes.Buffer, f FmtFlags, e1 Expr, op string, e2 E
 	binExprFmtWithParenAndSubOp(buf, f, e1, "", op, e2)
 }
 
-func binExprFmtWithParenAndSubOp(buf *bytes.Buffer, f FmtFlags, e1 Expr, subOp, op string, e2 Expr) {
+func binExprFmtWithParenAndSubOp(
+	buf *bytes.Buffer, f FmtFlags, e1 Expr, subOp, op string, e2 Expr,
+) {
 	exprFmtWithParen(buf, f, e1)
 	buf.WriteByte(' ')
 	if subOp != "" {
@@ -494,7 +496,7 @@ func (*IsOfTypeExpr) operatorExpr() {}
 
 // Format implements the NodeFormatter interface.
 func (node *IsOfTypeExpr) Format(buf *bytes.Buffer, f FmtFlags) {
-	FormatNode(buf, f, node.Expr)
+	exprFmtWithParen(buf, f, node.Expr)
 	buf.WriteString(" IS")
 	if node.Not {
 		buf.WriteString(" NOT")
@@ -744,6 +746,7 @@ const (
 	Div
 	FloorDiv
 	Mod
+	Pow
 	Concat
 	LShift
 	RShift
@@ -752,13 +755,14 @@ const (
 var binaryOpName = [...]string{
 	Bitand:   "&",
 	Bitor:    "|",
-	Bitxor:   "^",
+	Bitxor:   "#",
 	Plus:     "+",
 	Minus:    "-",
 	Mult:     "*",
 	Div:      "/",
 	FloorDiv: "//",
 	Mod:      "%",
+	Pow:      "^",
 	Concat:   "||",
 	LShift:   "<<",
 	RShift:   ">>",
@@ -889,25 +893,25 @@ type FuncExpr struct {
 
 // GetAggregateConstructor exposes the AggregateFunc field for use by
 // the group node in package sql.
-func (node *FuncExpr) GetAggregateConstructor() func() AggregateFunc {
+func (node *FuncExpr) GetAggregateConstructor() func(*EvalContext) AggregateFunc {
 	if node.fn.AggregateFunc == nil {
 		return nil
 	}
-	return func() AggregateFunc {
+	return func(evalCtx *EvalContext) AggregateFunc {
 		types := typesOfExprs(node.Exprs)
-		return node.fn.AggregateFunc(types)
+		return node.fn.AggregateFunc(types, evalCtx)
 	}
 }
 
 // GetWindowConstructor returns a window function constructor if the
 // FuncExpr is a built-in window function.
-func (node *FuncExpr) GetWindowConstructor() func() WindowFunc {
+func (node *FuncExpr) GetWindowConstructor() func(*EvalContext) WindowFunc {
 	if node.fn.WindowFunc == nil {
 		return nil
 	}
-	return func() WindowFunc {
+	return func(evalCtx *EvalContext) WindowFunc {
 		types := typesOfExprs(node.Exprs)
-		return node.fn.WindowFunc(types)
+		return node.fn.WindowFunc(types, evalCtx)
 	}
 }
 
@@ -931,10 +935,9 @@ func (node *FuncExpr) IsImpure() bool {
 	return node.fn.impure
 }
 
-// IsContextDependent returns whether the function depends on data stored in the
-// EvalContext.
-func (node *FuncExpr) IsContextDependent() bool {
-	return node.fn.ContextDependent()
+// IsDistSQLBlacklist returns whether the function is not supported by DistSQL.
+func (node *FuncExpr) IsDistSQLBlacklist() bool {
+	return node.fn.DistSQLBlacklist()
 }
 
 type funcType int
@@ -957,7 +960,9 @@ func (node *FuncExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	if node.Type != 0 {
 		typ = funcTypeName[node.Type] + " "
 	}
-	FormatNode(buf, f, node.Func)
+	fmtDisableAnonymize := *f
+	fmtDisableAnonymize.anonymize = false
+	FormatNode(buf, &fmtDisableAnonymize, node.Func)
 	buf.WriteByte('(')
 	buf.WriteString(typ)
 	FormatNode(buf, f, node.Exprs)
@@ -1051,7 +1056,7 @@ func (node *CastExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 		}
 		fallthrough
 	case castShort:
-		FormatNode(buf, f, node.Expr)
+		exprFmtWithParen(buf, f, node.Expr)
 		buf.WriteString("::")
 		FormatNode(buf, f, node.Type)
 	default:
@@ -1105,7 +1110,7 @@ func validCastTypes(t Type) []Type {
 		return timestampCastTypes
 	case TypeInterval:
 		return intervalCastTypes
-	case TypeOid:
+	case TypeOid, TypeRegClass, TypeRegNamespace, TypeRegProc, TypeRegProcedure, TypeRegType:
 		return oidCastTypes
 	default:
 		// TODO(eisen): currently dead -- there is no syntax yet for casting
@@ -1137,7 +1142,7 @@ type IndirectionExpr struct {
 
 // Format implements the NodeFormatter interface.
 func (node *IndirectionExpr) Format(buf *bytes.Buffer, f FmtFlags) {
-	FormatNode(buf, f, node.Expr)
+	exprFmtWithParen(buf, f, node.Expr)
 	FormatNode(buf, f, node.Indirection)
 }
 
@@ -1160,7 +1165,7 @@ type AnnotateTypeExpr struct {
 func (node *AnnotateTypeExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	switch node.syntaxMode {
 	case annotateShort:
-		FormatNode(buf, f, node.Expr)
+		exprFmtWithParen(buf, f, node.Expr)
 		buf.WriteString(":::")
 		FormatNode(buf, f, node.Type)
 
@@ -1192,9 +1197,9 @@ type CollateExpr struct {
 
 // Format implements the NodeFormatter interface.
 func (node *CollateExpr) Format(buf *bytes.Buffer, f FmtFlags) {
-	FormatNode(buf, f, node.Expr)
+	exprFmtWithParen(buf, f, node.Expr)
 	buf.WriteString(" COLLATE ")
-	buf.WriteString(node.Locale)
+	encodeSQLIdent(buf, node.Locale)
 }
 
 func (node *AliasedTableExpr) String() string { return AsString(node) }

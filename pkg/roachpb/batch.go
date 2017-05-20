@@ -67,26 +67,6 @@ func (ba *BatchRequest) UpdateTxn(otherTxn *Transaction) {
 	ba.Txn = &clonedTxn
 }
 
-// IsConsistencyRelated returns whether the batch consists of a single
-// ComputeChecksum or CheckConsistency request.
-func (ba *BatchRequest) IsConsistencyRelated() bool {
-	if !ba.IsSingleRequest() {
-		return false
-	}
-	_, ok1 := ba.GetArg(ComputeChecksum)
-	_, ok2 := ba.GetArg(CheckConsistency)
-	return ok1 || ok2
-}
-
-// IsFreeze returns whether the batch consists of a single ChangeFrozen request.
-func (ba *BatchRequest) IsFreeze() bool {
-	if !ba.IsSingleRequest() {
-		return false
-	}
-	_, ok := ba.GetArg(ChangeFrozen)
-	return ok
-}
-
 // IsLeaseRequest returns whether the batch consists of a single RequestLease
 // request. Note that TransferLease requests return false.
 // RequestLease requests are special because they're the only type of requests a
@@ -135,17 +115,6 @@ func (ba *BatchRequest) IsSingleRequest() bool {
 	return len(ba.Requests) == 1
 }
 
-// IsNonKV returns true iff all of the requests in the batch have the non-KV
-// flag set.
-func (ba *BatchRequest) IsNonKV() bool {
-	for _, union := range ba.Requests {
-		if (union.GetInner().flags() & isNonKV) == 0 {
-			return false
-		}
-	}
-	return true
-}
-
 // IsSingleSkipLeaseCheckRequest returns true iff the batch contains a single
 // request, and that request has the skipLeaseCheck flag set.
 func (ba *BatchRequest) IsSingleSkipLeaseCheckRequest() bool {
@@ -165,7 +134,7 @@ func (ba *BatchRequest) IsSinglePushTxnRequest() bool {
 // GetPrevLeaseForLeaseRequest returns the previous lease, at the time
 // of proposal, for a request lease or transfer lease request. If the
 // batch does not contain a single lease request, this method will panic.
-func (ba *BatchRequest) GetPrevLeaseForLeaseRequest() *Lease {
+func (ba *BatchRequest) GetPrevLeaseForLeaseRequest() Lease {
 	return ba.Requests[0].GetInner().(leaseRequestor).prevLease()
 }
 

@@ -22,13 +22,11 @@ $subnav-background  = $secondary-gray-4
 
 .page
   position relative
-  min-height 100vh
-  display table // so the page will stretch if the window is small but the content exceeds the window
+  display flex
+  flex-direction column
+  height 100vh
   min-width 100%
   padding-left $nav-width
-  min-height "calc(100vh - %s - 1px)" % $footer-height // 1 more than footer height to account for the border
-  @media (max-height: 415px) // handles the case where the height is smaller than the side-nav
-    min-height 341px
 
   &:after
     content ""
@@ -39,7 +37,7 @@ $subnav-background  = $secondary-gray-4
   padding-top 12px
   padding-bottom 12px
   padding-left 24px
-  z-index 2
+  z-index $z-index-page-config
   position relative
 
   &--fixed
@@ -55,6 +53,7 @@ $subnav-background  = $secondary-gray-4
     margin-right 2rem
 
 .header
+  flex 0 0 auto
   color $dark-blue
   font-size 24px
   padding 24px 24px 12px
@@ -83,6 +82,7 @@ $subnav-background  = $secondary-gray-4
   background-color white
 
 .section
+  flex 1 1 auto
   padding 12px 24px
   max-width 1350px
   clearfix()
@@ -153,7 +153,7 @@ span.icon
   position absolute
   top 0
   right 0
-  z-index 1
+  z-index $z-index-page-config
 
   h2
     font-size 3rem

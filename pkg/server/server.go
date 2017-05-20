@@ -23,8 +23,10 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -47,10 +49,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/migrations"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -125,11 +129,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		cfg.AmbientCtx.Tracer = tracing.NewTracer()
 	}
 
-	// Try loading the TLS configs before anything else.
-	if _, err := cfg.GetServerTLSConfig(); err != nil {
-		return nil, err
-	}
-	if _, err := cfg.GetClientTLSConfig(); err != nil {
+	// Attempt to load TLS configs right away, failures are permanent.
+	if err := cfg.InitializeNodeTLSConfigs(stopper); err != nil {
 		return nil, err
 	}
 
@@ -154,9 +155,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	s.cfg.AmbientCtx.AddLogTag("n", &s.nodeIDContainer)
 
 	ctx := s.AnnotateCtx(context.Background())
-	if s.cfg.Insecure {
-		log.Warning(ctx, "running in insecure mode, this is strongly discouraged. See --insecure.")
-	}
 
 	s.rpcContext = rpc.NewContext(s.cfg.AmbientCtx, s.cfg.Config, s.clock, s.stopper)
 	s.rpcContext.HeartbeatCB = func() {
@@ -172,7 +170,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		&s.nodeIDContainer,
 		s.rpcContext,
 		s.grpc,
-		s.cfg.GossipBootstrapResolvers,
 		s.stopper,
 		s.registry,
 	)
@@ -198,6 +195,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		Clock:           s.clock,
 		RPCContext:      s.rpcContext,
 		RPCRetryOptions: &retryOpts,
+		SendNextTimeout: s.cfg.SendNextTimeout,
 	}
 	s.distSender = kv.NewDistSender(distSenderCfg, s.gossip)
 	s.registry.AddMetricStruct(s.distSender.Metrics())
@@ -250,17 +248,41 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		s.stopper, &s.internalMemMetrics)
 	s.leaseMgr.RefreshLeases(s.stopper, s.db, s.gossip)
 
-	// Set up the DistSQL server
+	s.refreshSettings()
+
+	// We do not set memory monitors or a noteworthy limit because the children of
+	// this monitor will be setting their own noteworthy limits.
+	rootSQLMemoryMonitor := mon.MakeMonitor(
+		"root",
+		nil,           /* curCount */
+		nil,           /* maxHist */
+		-1,            /* increment: use default increment */
+		math.MaxInt64, /* noteworthy */
+	)
+	rootSQLMemoryMonitor.Start(context.Background(), nil, mon.MakeStandaloneBudget(s.cfg.SQLMemoryPoolSize))
+
+	distSQLMetrics := sql.MakeMemMetrics("distsql", cfg.HistogramWindowInterval())
+	s.registry.AddMetric(distSQLMetrics.CurBytesCount)
+	s.registry.AddMetric(distSQLMetrics.MaxBytesHist)
+
+	// Set up the DistSQL server.
 	distSQLCfg := distsqlrun.ServerConfig{
 		AmbientContext: s.cfg.AmbientCtx,
 		DB:             s.db,
-		RPCContext:     s.rpcContext,
-		Stopper:        s.stopper,
+		// DistSQL also uses a DB that bypasses the TxnCoordSender.
+		FlowDB:     client.NewDB(s.distSender, s.clock),
+		RPCContext: s.rpcContext,
+		Stopper:    s.stopper,
+		NodeID:     &s.nodeIDContainer,
+
+		ParentMemoryMonitor: &rootSQLMemoryMonitor,
+		Counter:             distSQLMetrics.CurBytesCount,
+		Hist:                distSQLMetrics.MaxBytesHist,
 	}
 	if s.cfg.TestingKnobs.DistSQL != nil {
 		distSQLCfg.TestingKnobs = *s.cfg.TestingKnobs.DistSQL.(*distsqlrun.TestingKnobs)
 	}
-	s.distSQLServer = distsqlrun.NewServer(distSQLCfg)
+	s.distSQLServer = distsqlrun.NewServer(ctx, distSQLCfg)
 	distsqlrun.RegisterDistSQLServer(s.grpc, s.distSQLServer)
 
 	// Set up admin memory metrics for use by admin SQL executors.
@@ -270,6 +292,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// Set up Executor
 	execCfg := sql.ExecutorConfig{
 		AmbientCtx:              s.cfg.AmbientCtx,
+		ClusterID:               s.ClusterID,
 		NodeID:                  &s.nodeIDContainer,
 		DB:                      s.db,
 		Gossip:                  s.gossip,
@@ -279,6 +302,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		Clock:                   s.clock,
 		DistSQLSrv:              s.distSQLServer,
 		HistogramWindowInterval: s.cfg.HistogramWindowInterval(),
+		RangeDescriptorCache:    s.distSender.RangeDescriptorCache(),
+		LeaseHolderCache:        s.distSender.LeaseHolderCache(),
 	}
 	if s.cfg.TestingKnobs.SQLExecutor != nil {
 		execCfg.TestingKnobs = s.cfg.TestingKnobs.SQLExecutor.(*sql.ExecutorTestingKnobs)
@@ -299,7 +324,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		s.cfg.Config,
 		s.sqlExecutor,
 		&s.internalMemMetrics,
-		s.cfg.SQLMemoryPoolSize,
+		&rootSQLMemoryMonitor,
 		s.cfg.HistogramWindowInterval(),
 	)
 	s.registry.AddMetricStruct(s.pgServer.Metrics())
@@ -333,8 +358,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		RangeLeaseRenewalDuration: renewal,
 		TimeSeriesDataStore:       s.tsDB,
 
-		EnableEpochRangeLeases: envutil.EnvOrDefaultBool(
-			"COCKROACH_ENABLE_EPOCH_RANGE_LEASES", true),
+		EnableEpochRangeLeases: true,
 	}
 	if s.cfg.TestingKnobs.Store != nil {
 		storeCfg.TestingKnobs = *s.cfg.TestingKnobs.Store.(*storage.StoreTestingKnobs)
@@ -349,11 +373,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	s.node = NewNode(storeCfg, s.recorder, s.registry, s.stopper, txnMetrics, sql.MakeEventLogger(s.leaseMgr))
 	roachpb.RegisterInternalServer(s.grpc, s.node)
 	storage.RegisterConsistencyServer(s.grpc, s.node.storesServer)
-	storage.RegisterFreezeServer(s.grpc, s.node.storesServer)
 
 	s.admin = newAdminServer(s)
 	s.status = newStatusServer(
 		s.cfg.AmbientCtx,
+		s.admin,
 		s.db,
 		s.gossip,
 		s.recorder,
@@ -395,6 +419,11 @@ func (s *Server) NodeID() roachpb.NodeID {
 // Only intended to help print debugging info during server startup.
 func (s *Server) InitialBoot() bool {
 	return s.node.initialBoot
+}
+
+// ClusterStores returns a list of known stores in the cluster.
+func (s *Server) ClusterStores() []roachpb.ReplicationTarget {
+	return s.storePool.GetStores()
 }
 
 // grpcGatewayServer represents a grpc service with HTTP endpoints through GRPC
@@ -487,7 +516,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	workersCtx := s.AnnotateCtx(context.Background())
 
-	s.stopper.RunWorker(func() {
+	s.stopper.RunWorker(workersCtx, func(workersCtx context.Context) {
 		<-s.stopper.ShouldQuiesce()
 		if err := httpLn.Close(); err != nil {
 			log.Fatal(workersCtx, err)
@@ -499,22 +528,22 @@ func (s *Server) Start(ctx context.Context) error {
 		clearL := httpMux.Match(cmux.HTTP1())
 		tlsL := httpMux.Match(cmux.Any())
 
-		s.stopper.RunWorker(func() {
+		s.stopper.RunWorker(workersCtx, func(context.Context) {
 			netutil.FatalIfUnexpected(httpMux.Serve())
 		})
 
-		s.stopper.RunWorker(func() {
+		s.stopper.RunWorker(workersCtx, func(context.Context) {
 			netutil.FatalIfUnexpected(plainRedirectServer.Serve(clearL))
 		})
 
 		httpLn = tls.NewListener(tlsL, tlsConfig)
 	}
 
-	s.stopper.RunWorker(func() {
+	s.stopper.RunWorker(workersCtx, func(context.Context) {
 		netutil.FatalIfUnexpected(httpServer.Serve(httpLn))
 	})
 
-	s.stopper.RunWorker(func() {
+	s.stopper.RunWorker(workersCtx, func(context.Context) {
 		<-s.stopper.ShouldQuiesce()
 		netutil.FatalIfUnexpected(anyL.Close())
 		<-s.stopper.ShouldStop()
@@ -525,7 +554,7 @@ func (s *Server) Start(ctx context.Context) error {
 		})
 	})
 
-	s.stopper.RunWorker(func() {
+	s.stopper.RunWorker(workersCtx, func(context.Context) {
 		netutil.FatalIfUnexpected(s.grpc.Serve(anyL))
 	})
 
@@ -573,16 +602,16 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
-	s.stopper.RunWorker(func() {
+	pgCtx := s.pgServer.AmbientCtx.AnnotateCtx(context.Background())
+	s.stopper.RunWorker(pgCtx, func(pgCtx context.Context) {
 		select {
 		case <-serveSQL:
 		case <-s.stopper.ShouldQuiesce():
 			return
 		}
-		pgCtx := s.pgServer.AmbientCtx.AnnotateCtx(context.Background())
-		netutil.FatalIfUnexpected(httpServer.ServeWith(s.stopper, pgL, func(conn net.Conn) {
+		netutil.FatalIfUnexpected(httpServer.ServeWith(pgCtx, s.stopper, pgL, func(conn net.Conn) {
 			connCtx := log.WithLogTagStr(pgCtx, "client", conn.RemoteAddr().String())
-			setTCPKeepAlive(pgCtx, conn)
+			setTCPKeepAlive(connCtx, conn)
 
 			if err := s.pgServer.ServeConn(connCtx, conn); err != nil && !netutil.IsClosedConnection(err) {
 				// Report the error on this connection's context, so that we
@@ -600,7 +629,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// apply it for all web endpoints.
 	s.mux.HandleFunc(debugEndpoint, http.HandlerFunc(handleDebug))
 
-	s.gossip.Start(unresolvedAdvertAddr)
+	// Filter the gossip bootstrap resolvers based on the listen and
+	// advertise addresses.
+	filtered := s.cfg.FilterGossipBootstrapResolvers(ctx, unresolvedListenAddr, unresolvedAdvertAddr)
+	s.gossip.Start(unresolvedAdvertAddr, filtered)
 	log.Event(ctx, "started gossip")
 
 	s.engines, err = s.cfg.CreateEngines()
@@ -652,14 +684,22 @@ func (s *Server) Start(ctx context.Context) error {
 		s.engines,
 		s.cfg.NodeAttributes,
 		s.cfg.Locality,
+		// If the _unfiltered_ list of hosts from the --join flag is
+		// empty, then this node can bootstrap a new cluster. We disallow
+		// this if this node is being started with itself specified as a
+		// --join host, because that's too likely to be operator error.
+		len(s.cfg.GossipBootstrapResolvers) == 0, /* canBootstrap */
 	)
 	if err != nil {
 		return err
 	}
 	log.Event(ctx, "started node")
 
+	// TODO(dt): this would be nice if it raven didn't have a race on SetTags.
+	// raven.SetTagsContext(map[string]string{"cluster": s.ClusterID().String(), "node": s.NodeID().String()})
+
 	// We can now add the node registry.
-	s.recorder.AddNode(s.registry, s.node.Descriptor, s.node.startedAt)
+	s.recorder.AddNode(s.registry, s.node.Descriptor, s.node.startedAt, s.cfg.AdvertiseAddr, s.cfg.HTTPAddr)
 
 	// Begin recording runtime statistics.
 	s.startSampleEnvironment(s.cfg.MetricsSampleInterval)
@@ -687,6 +727,7 @@ func (s *Server) Start(ctx context.Context) error {
 		s.distSender,
 		s.gossip,
 		s.leaseMgr,
+		s.clock,
 	).Start(s.stopper)
 
 	s.sqlExecutor.Start(ctx, &s.adminMemMetrics, s.node.Descriptor)
@@ -695,7 +736,7 @@ func (s *Server) Start(ctx context.Context) error {
 	log.Infof(ctx, "starting %s server at %s", s.cfg.HTTPRequestScheme(), unresolvedHTTPAddr)
 	log.Infof(ctx, "starting grpc/postgres server at %s", unresolvedListenAddr)
 	log.Infof(ctx, "advertising CockroachDB node at %s", unresolvedAdvertAddr)
-	s.stopper.RunWorker(func() {
+	s.stopper.RunWorker(workersCtx, func(context.Context) {
 		serveOnMux.Do(func() {
 			netutil.FatalIfUnexpected(m.Serve())
 		})
@@ -710,23 +751,24 @@ func (s *Server) Start(ctx context.Context) error {
 			return err
 		}
 
-		s.stopper.RunWorker(func() {
+		s.stopper.RunWorker(workersCtx, func(workersCtx context.Context) {
 			<-s.stopper.ShouldQuiesce()
 			if err := unixLn.Close(); err != nil {
 				log.Fatal(workersCtx, err)
 			}
 		})
 
-		s.stopper.RunWorker(func() {
+		pgCtx := s.pgServer.AmbientCtx.AnnotateCtx(context.Background())
+		s.stopper.RunWorker(pgCtx, func(pgCtx context.Context) {
 			select {
 			case <-serveSQL:
 			case <-s.stopper.ShouldQuiesce():
 				return
 			}
-			pgCtx := s.pgServer.AmbientCtx.AnnotateCtx(context.Background())
-			netutil.FatalIfUnexpected(httpServer.ServeWith(s.stopper, unixLn, func(conn net.Conn) {
+			netutil.FatalIfUnexpected(httpServer.ServeWith(pgCtx, s.stopper, unixLn, func(conn net.Conn) {
 				connCtx := log.WithLogTagStr(pgCtx, "client", conn.RemoteAddr().String())
-				if err := s.pgServer.ServeConn(connCtx, conn); err != nil && !netutil.IsClosedConnection(err) {
+				if err := s.pgServer.ServeConn(connCtx, conn); err != nil &&
+					!netutil.IsClosedConnection(err) {
 					// Report the error on this connection's context, so that we
 					// know which remote client caused the error when looking at
 					// the logs.
@@ -777,28 +819,10 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
-	var uiFileSystem http.FileSystem
-	uiDebug := envutil.EnvOrDefaultBool("COCKROACH_DEBUG_UI", false)
-	if uiDebug {
-		uiFileSystem = http.Dir("pkg/ui")
-	} else {
-		uiFileSystem = &assetfs.AssetFS{
-			Asset:     ui.Asset,
-			AssetDir:  ui.AssetDir,
-			AssetInfo: ui.AssetInfo,
-		}
-	}
-	uiFileServer := http.FileServer(uiFileSystem)
-
-	s.mux.HandleFunc("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			if uiDebug {
-				r.URL.Path = "debug.html"
-			} else {
-				r.URL.Path = "release.html"
-			}
-		}
-		uiFileServer.ServeHTTP(w, r)
+	s.mux.Handle("/", http.FileServer(&assetfs.AssetFS{
+		Asset:     ui.Asset,
+		AssetDir:  ui.AssetDir,
+		AssetInfo: ui.AssetInfo,
 	}))
 
 	// TODO(marc): when cookie-based authentication exists,
@@ -809,6 +833,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.mux.Handle("/health", gwMux)
 	s.mux.Handle(statusVars, http.HandlerFunc(s.status.handleVars))
 	s.mux.Handle(rangeDebugEndpoint, http.HandlerFunc(s.status.handleDebugRange))
+	s.mux.Handle(problemRangesDebugEndpoint, http.HandlerFunc(s.status.handleProblemRanges))
 	log.Event(ctx, "added http endpoints")
 
 	// Before serving SQL requests, we have to make sure the database is
@@ -833,6 +858,18 @@ func (s *Server) Start(ctx context.Context) error {
 			log.Error(ctx, err)
 		}
 	}
+
+	if s.cfg.ListeningURLFile != "" {
+		pgURL, err := s.cfg.PGURL(url.User(security.RootUser))
+		if err == nil {
+			err = ioutil.WriteFile(s.cfg.ListeningURLFile, []byte(fmt.Sprintf("%s\n", pgURL)), 0644)
+		}
+
+		if err != nil {
+			log.Error(ctx, err)
+		}
+	}
+
 	if err := sdnotify.Ready(); err != nil {
 		log.Errorf(ctx, "failed to signal readiness using systemd protocol: %s", err)
 	}
@@ -900,13 +937,14 @@ func (s *Server) Undrain(off []serverpb.DrainMode) []serverpb.DrainMode {
 // runtime stat sampler to sample the environment.
 func (s *Server) startSampleEnvironment(frequency time.Duration) {
 	// Immediately record summaries once on server startup.
-	s.stopper.RunWorker(func() {
+	ctx := s.AnnotateCtx(context.Background())
+	s.stopper.RunWorker(ctx, func(ctx context.Context) {
 		ticker := time.NewTicker(frequency)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				s.runtime.SampleEnvironment()
+				s.runtime.SampleEnvironment(ctx)
 			case <-s.stopper.ShouldStop():
 				return
 			}
@@ -916,7 +954,7 @@ func (s *Server) startSampleEnvironment(frequency time.Duration) {
 
 // Stop stops the server.
 func (s *Server) Stop() {
-	s.stopper.Stop()
+	s.stopper.Stop(context.TODO())
 }
 
 // ServeHTTP is necessary to implement the http.Handler interface.

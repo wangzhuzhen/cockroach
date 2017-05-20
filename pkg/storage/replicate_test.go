@@ -23,6 +23,7 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -30,18 +31,20 @@ import (
 
 func TestEagerReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	// Start with the split queue disabled.
+	storeCfg := storage.TestStoreConfig(nil)
+	storeCfg.TestingKnobs.DisableSplitQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
-	store, _ := createTestStore(t, stopper)
+	defer stopper.Stop(context.TODO())
+	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
 	// Disable the replica scanner so that we rely on the eager replication code
 	// path that occurs after splits.
 	store.SetReplicaScannerActive(false)
-
-	<-store.Gossip().Connected
-	if err := store.GossipStore(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	// Enable the split queue and force a scan and process.
+	store.SetSplitQueueActive(true)
+	store.ForceSplitScanAndProcess()
 
 	// The addition of replicas to the replicateQueue after a split
 	// occurs happens after the update of the descriptors in meta2

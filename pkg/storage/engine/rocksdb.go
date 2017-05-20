@@ -22,7 +22,6 @@ package engine
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -49,10 +48,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
-// #cgo CPPFLAGS: -I../../../vendor/github.com/cockroachdb/c-protobuf/internal/src
-// #cgo CPPFLAGS: -I../../../vendor/github.com/cockroachdb/c-rocksdb/internal/include
-// #cgo CXXFLAGS: -std=c++11
-// #cgo linux LDFLAGS: -lrt
+// TODO(tamird): why does rocksdb not link jemalloc,snappy statically?
+
+// #cgo CPPFLAGS: -I../../../c-deps/rocksdb.src/include
+// #cgo CPPFLAGS: -I../../../c-deps/protobuf.src/src
+// #cgo LDFLAGS: -lprotobuf
+// #cgo LDFLAGS: -lrocksdb
+// #cgo LDFLAGS: -lsnappy
+// #cgo CXXFLAGS: -std=c++11 -Werror -Wall -Wno-sign-compare
+// #cgo linux LDFLAGS: -lrt -lpthread
+// #cgo windows LDFLAGS: -lrpcrt4
 //
 // #include <stdlib.h>
 // #include "db.h"
@@ -287,6 +292,7 @@ type RocksDB struct {
 	rdb          *C.DBEngine
 	attrs        roachpb.Attributes // Attributes for this engine
 	dir          string             // The data directory
+	tempDir      string             // A path for storing temp files (ideally under dir).
 	cache        RocksDBCache       // Shared cache.
 	maxSize      int64              // Used for calculating rebalancing and free space.
 	maxOpenFiles int                // The maximum number of open files this instance will use.
@@ -317,6 +323,7 @@ func NewRocksDB(
 	if dir == "" {
 		panic("dir must be non-empty")
 	}
+
 	r := &RocksDB{
 		attrs:        attrs,
 		dir:          dir,
@@ -325,6 +332,16 @@ func NewRocksDB(
 		maxOpenFiles: maxOpenFiles,
 		deallocated:  make(chan struct{}),
 	}
+
+	temp := filepath.Join(dir, "tmp")
+	if err := os.RemoveAll(temp); err != nil {
+		return nil, err
+	}
+
+	if err := r.SetTempDir(temp); err != nil {
+		return nil, err
+	}
+
 	if err := r.open(); err != nil {
 		return nil, err
 	}
@@ -339,9 +356,15 @@ func newMemRocksDB(attrs roachpb.Attributes, cache RocksDBCache, maxSize int64) 
 		maxSize:     maxSize,
 		deallocated: make(chan struct{}),
 	}
+
+	if err := r.SetTempDir(os.TempDir()); err != nil {
+		return nil, err
+	}
+
 	if err := r.open(); err != nil {
 		return nil, err
 	}
+
 	return r, nil
 }
 
@@ -593,6 +616,13 @@ func (r *RocksDB) NewIterator(prefix bool) Iterator {
 	return newRocksDBIterator(r.rdb, prefix, r)
 }
 
+// NewTimeBoundIterator is like NewIterator, but returns a time-bound iterator.
+func (r *RocksDB) NewTimeBoundIterator(start, end hlc.Timestamp) Iterator {
+	it := &rocksDBIterator{}
+	it.initTimeBound(r.rdb, start, end, r)
+	return it
+}
+
 // NewSnapshot creates a snapshot handle from engine and returns a
 // read-only rocksDBSnapshot engine.
 func (r *RocksDB) NewSnapshot() Reader {
@@ -727,6 +757,11 @@ func (r *rocksDBSnapshot) Iterate(start, end MVCCKey, f func(MVCCKeyValue) (bool
 // engine using the snapshot handle.
 func (r *rocksDBSnapshot) NewIterator(prefix bool) Iterator {
 	return newRocksDBIterator(r.handle, prefix, r)
+}
+
+// NewTimeBoundIterator is like NewIterator, but returns a time-bound iterator.
+func (r *rocksDBSnapshot) NewTimeBoundIterator(start, end hlc.Timestamp) Iterator {
+	panic("not implemented")
 }
 
 // reusableIterator wraps rocksDBIterator and allows reuse of an iterator
@@ -867,7 +902,7 @@ func (r *rocksDBBatchIterator) SeekReverse(key MVCCKey) {
 	r.iter.SeekReverse(key)
 }
 
-func (r *rocksDBBatchIterator) Valid() bool {
+func (r *rocksDBBatchIterator) Valid() (bool, error) {
 	return r.iter.Valid()
 }
 
@@ -916,10 +951,6 @@ func (r *rocksDBBatchIterator) UnsafeKey() MVCCKey {
 
 func (r *rocksDBBatchIterator) UnsafeValue() []byte {
 	return r.iter.UnsafeValue()
-}
-
-func (r *rocksDBBatchIterator) Error() error {
-	return r.iter.Error()
 }
 
 func (r *rocksDBBatchIterator) Less(key MVCCKey) bool {
@@ -1095,6 +1126,11 @@ func (r *rocksDBBatch) NewIterator(prefix bool) Iterator {
 	return iter
 }
 
+// NewTimeBoundIterator is like NewIterator, but returns a time-bound iterator.
+func (r *rocksDBBatch) NewTimeBoundIterator(start, end hlc.Timestamp) Iterator {
+	panic("not implemented")
+}
+
 func (r *rocksDBBatch) Commit(syncCommit bool) error {
 	if r.Closed() {
 		panic("this batch was already committed")
@@ -1248,6 +1284,7 @@ type rocksDBIterator struct {
 	iter   *C.DBIterator
 	valid  bool
 	reseek bool
+	err    error
 	key    C.DBKey
 	value  C.DBSlice
 }
@@ -1280,6 +1317,14 @@ func (r *rocksDBIterator) getIter() *C.DBIterator {
 
 func (r *rocksDBIterator) init(rdb *C.DBEngine, prefix bool, engine Reader) {
 	r.iter = C.DBNewIter(rdb, C.bool(prefix))
+	if r.iter == nil {
+		panic("unable to create iterator")
+	}
+	r.engine = engine
+}
+
+func (r *rocksDBIterator) initTimeBound(rdb *C.DBEngine, start, end hlc.Timestamp, engine Reader) {
+	r.iter = C.DBNewTimeBoundIter(rdb, goToCTimestamp(start), goToCTimestamp(end))
 	if r.iter == nil {
 		panic("unable to create iterator")
 	}
@@ -1329,10 +1374,10 @@ func (r *rocksDBIterator) SeekReverse(key MVCCKey) {
 		}
 		r.setState(C.DBIterSeek(r.iter, goToCKey(key)))
 		// Maybe the key sorts after the last key in RocksDB.
-		if !r.Valid() {
+		if ok, _ := r.Valid(); !ok {
 			r.setState(C.DBIterSeekToLast(r.iter))
 		}
-		if !r.Valid() {
+		if ok, _ := r.Valid(); !ok {
 			return
 		}
 		// Make sure the current key is <= the provided key.
@@ -1342,8 +1387,8 @@ func (r *rocksDBIterator) SeekReverse(key MVCCKey) {
 	}
 }
 
-func (r *rocksDBIterator) Valid() bool {
-	return r.valid
+func (r *rocksDBIterator) Valid() (bool, error) {
+	return r.valid, r.err
 }
 
 func (r *rocksDBIterator) Next() {
@@ -1392,10 +1437,6 @@ func (r *rocksDBIterator) UnsafeValue() []byte {
 	return cSliceToUnsafeGoBytes(r.value)
 }
 
-func (r *rocksDBIterator) Error() error {
-	return statusToError(C.DBIterError(r.iter))
-}
-
 func (r *rocksDBIterator) Less(key MVCCKey) bool {
 	return r.UnsafeKey().Less(key)
 }
@@ -1405,6 +1446,7 @@ func (r *rocksDBIterator) setState(state C.DBIterState) {
 	r.reseek = false
 	r.key = state.key
 	r.value = state.value
+	r.err = statusToError(state.status)
 }
 
 func (r *rocksDBIterator) ComputeStats(
@@ -1522,6 +1564,13 @@ func cSliceToUnsafeGoBytes(s C.DBSlice) []byte {
 	}
 	// Interpret the C pointer as a pointer to a Go array, then slice.
 	return (*[maxArrayLen]byte)(unsafe.Pointer(s.data))[:s.len:s.len]
+}
+
+func goToCTimestamp(ts hlc.Timestamp) C.DBTimestamp {
+	return C.DBTimestamp{
+		wall_time: C.int64_t(ts.WallTime),
+		logical:   C.int32_t(ts.Logical),
+	}
 }
 
 func statusToError(s C.DBStatus) error {
@@ -1645,7 +1694,12 @@ func dbIterate(
 	defer it.Close()
 
 	it.Seek(start)
-	for ; it.Valid(); it.Next() {
+	for ; ; it.Next() {
+		if ok, err := it.Valid(); err != nil {
+			return err
+		} else if !ok {
+			break
+		}
 		k := it.Key()
 		if !k.Less(end) {
 			break
@@ -1654,8 +1708,7 @@ func dbIterate(
 			return err
 		}
 	}
-	// Check for any errors during iteration.
-	return it.Error()
+	return nil
 }
 
 // TODO(dan): Rename this to RocksDBSSTFileReader and RocksDBSSTFileWriter.
@@ -1668,27 +1721,20 @@ type RocksDBSstFileReader struct {
 	// we can use an in-memory RocksDB with this, because AddFile doesn't then
 	// work with files on disk. This should also work with overlapping files.
 
-	dir     string
 	rocksDB *RocksDB
 }
 
 // MakeRocksDBSstFileReader creates a RocksDBSstFileReader that uses a scratch
 // directory which is cleaned up by `Close`.
-func MakeRocksDBSstFileReader() (RocksDBSstFileReader, error) {
-	dir, err := ioutil.TempDir("", "RocksDBSstFileReader")
-	if err != nil {
-		return RocksDBSstFileReader{}, err
-	}
-
+func MakeRocksDBSstFileReader(tempdir string) (RocksDBSstFileReader, error) {
 	// TODO(dan): I pulled all these magic numbers out of nowhere. Make them
 	// less magic.
 	cache := NewRocksDBCache(1 << 20)
-	rocksDB, err := NewRocksDB(
-		roachpb.Attributes{}, dir, cache, 512<<20, DefaultMaxOpenFiles)
+	rocksDB, err := NewRocksDB(roachpb.Attributes{}, tempdir, cache, 512<<20, DefaultMaxOpenFiles)
 	if err != nil {
 		return RocksDBSstFileReader{}, err
 	}
-	return RocksDBSstFileReader{dir, rocksDB}, nil
+	return RocksDBSstFileReader{rocksDB}, nil
 }
 
 // AddFile links the file at the given path into a database. See the RocksDB
@@ -1723,9 +1769,6 @@ func (fr *RocksDBSstFileReader) Close() {
 	}
 	fr.rocksDB.Close()
 	fr.rocksDB = nil
-	if err := os.RemoveAll(fr.dir); err != nil {
-		log.Warningf(context.TODO(), "error removing temp rocksdb directory %q: %s", fr.dir, err)
-	}
 }
 
 // RocksDBSstFileWriter creates a file suitable for importing with
@@ -1763,7 +1806,7 @@ func (fw *RocksDBSstFileWriter) Add(kv MVCCKeyValue) error {
 }
 
 // Close finishes the writer, flushing any remaining writes to disk. At least
-// one kv entry must have been added.
+// one kv entry must have been added. Close is idempotent.
 func (fw *RocksDBSstFileWriter) Close() error {
 	if fw.fw == nil {
 		return nil
@@ -1789,4 +1832,18 @@ func RunLDB(args []string) {
 	}()
 
 	C.DBRunLDB(C.int(len(argv)), &argv[0])
+}
+
+// GetTempDir returns a temp path (usually under the store directory).
+func (r *RocksDB) GetTempDir() string {
+	return r.tempDir
+}
+
+// SetTempDir allows overriding the tempdir returned by GetTempDir.
+func (r *RocksDB) SetTempDir(d string) error {
+	if err := os.MkdirAll(d, 0755); err != nil {
+		return err
+	}
+	r.tempDir = d
+	return nil
 }

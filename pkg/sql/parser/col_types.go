@@ -19,7 +19,10 @@ package parser
 import (
 	"bytes"
 	"fmt"
+	"math"
 
+	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/pkg/errors"
 )
 
@@ -141,15 +144,18 @@ var (
 
 // FloatColType represents a REAL, DOUBLE or FLOAT type.
 type FloatColType struct {
-	Name string
-	Prec int
+	Name          string
+	Prec          int
+	PrecSpecified bool // true if the value of Prec is not the default
 }
 
-func newFloatColType(prec int) *FloatColType {
-	if prec == 0 {
+// NewFloatColType creates a type representing a FLOAT, optionally with a
+// precision.
+func NewFloatColType(prec int, precSpecified bool) *FloatColType {
+	if prec == 0 && !precSpecified {
 		return floatColTypeFloat
 	}
-	return &FloatColType{Name: "FLOAT", Prec: prec}
+	return &FloatColType{Name: "FLOAT", Prec: prec, PrecSpecified: precSpecified}
 }
 
 // Format implements the NodeFormatter interface.
@@ -184,6 +190,44 @@ func (node *DecimalColType) Format(buf *bytes.Buffer, f FmtFlags) {
 		}
 		buf.WriteByte(')')
 	}
+}
+
+// LimitDecimalWidth limits d's precision (total number of digits) and scale
+// (number of digits after the decimal point).
+func LimitDecimalWidth(d *apd.Decimal, precision, scale int) error {
+	if d.Form != apd.Finite || precision <= 0 {
+		return nil
+	}
+	// Use +1 here because it is inverted later.
+	if scale < math.MinInt32+1 || scale > math.MaxInt32 {
+		return errors.New("scale out of range")
+	}
+	if scale > precision {
+		return pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError, "scale (%d) must be between 0 and precision (%d)", scale, precision)
+	}
+
+	// http://www.postgresql.org/docs/9.5/static/datatype-numeric.html
+	// "If the scale of a value to be stored is greater than
+	// the declared scale of the column, the system will round the
+	// value to the specified number of fractional digits. Then,
+	// if the number of digits to the left of the decimal point
+	// exceeds the declared precision minus the declared scale, an
+	// error is raised."
+
+	c := DecimalCtx.WithPrecision(uint32(precision))
+	c.Traps = apd.InvalidOperation
+
+	if _, err := c.Quantize(d, d, -int32(scale)); err != nil {
+		var lt string
+		switch v := precision - scale; v {
+		case 0:
+			lt = "1"
+		default:
+			lt = fmt.Sprintf("10^%d", v)
+		}
+		return pgerror.NewErrorf(pgerror.CodeNumericValueOutOfRangeError, "value with precision %d, scale %d must round to an absolute value less than %s", precision, scale, lt)
+	}
+	return nil
 }
 
 // Pre-allocated immutable date column type.
@@ -299,7 +343,7 @@ func (node *CollatedStringColType) Format(buf *bytes.Buffer, f FmtFlags) {
 		fmt.Fprintf(buf, "(%d)", node.N)
 	}
 	buf.WriteString(" COLLATE ")
-	buf.WriteString(node.Locale)
+	encodeSQLIdent(buf, node.Locale)
 }
 
 // ArrayColType represents an ARRAY column type.
@@ -348,11 +392,11 @@ var int2vectorColType = &VectorColType{
 // Pre-allocated immutable postgres oid column types.
 var (
 	oidColTypeOid          = &OidColType{Name: "OID"}
+	oidColTypeRegClass     = &OidColType{Name: "REGCLASS"}
+	oidColTypeRegNamespace = &OidColType{Name: "REGNAMESPACE"}
 	oidColTypeRegProc      = &OidColType{Name: "REGPROC"}
 	oidColTypeRegProcedure = &OidColType{Name: "REGPROCEDURE"}
-	oidColTypeRegClass     = &OidColType{Name: "REGCLASS"}
 	oidColTypeRegType      = &OidColType{Name: "REGTYPE"}
-	oidColTypeRegNamespace = &OidColType{Name: "REGNAMESPACE"}
 )
 
 // OidColType represents an OID type, which is the type of system object
@@ -369,6 +413,44 @@ type OidColType struct {
 // Format implements the NodeFormatter interface.
 func (node *OidColType) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString(node.Name)
+}
+
+func oidColTypeToType(ct *OidColType) Type {
+	switch ct {
+	case oidColTypeOid:
+		return TypeOid
+	case oidColTypeRegClass:
+		return TypeRegClass
+	case oidColTypeRegNamespace:
+		return TypeRegNamespace
+	case oidColTypeRegProc:
+		return TypeRegProc
+	case oidColTypeRegProcedure:
+		return TypeRegProcedure
+	case oidColTypeRegType:
+		return TypeRegType
+	default:
+		panic(fmt.Sprintf("unexpected *OidColType: %v", ct))
+	}
+}
+
+func oidTypeToColType(t Type) *OidColType {
+	switch t {
+	case TypeOid:
+		return oidColTypeOid
+	case TypeRegClass:
+		return oidColTypeRegClass
+	case TypeRegNamespace:
+		return oidColTypeRegNamespace
+	case TypeRegProc:
+		return oidColTypeRegProc
+	case TypeRegProcedure:
+		return oidColTypeRegProcedure
+	case TypeRegType:
+		return oidColTypeRegType
+	default:
+		panic(fmt.Sprintf("unexpected type: %v", t))
+	}
 }
 
 func (node *BoolColType) String() string           { return AsString(node) }
@@ -392,6 +474,8 @@ func (node *OidColType) String() string            { return AsString(node) }
 // normalization.
 func DatumTypeToColumnType(t Type) (ColumnType, error) {
 	switch t {
+	case TypeBool:
+		return boolColTypeBool, nil
 	case TypeInt:
 		return intColTypeInt, nil
 	case TypeFloat:
@@ -412,11 +496,23 @@ func DatumTypeToColumnType(t Type) (ColumnType, error) {
 		return nameColTypeName, nil
 	case TypeBytes:
 		return bytesColTypeBytes, nil
-	case TypeOid:
-		return oidColTypeOid, nil
+	case TypeOid,
+		TypeRegClass,
+		TypeRegNamespace,
+		TypeRegProc,
+		TypeRegProcedure,
+		TypeRegType:
+		return oidTypeToColType(t), nil
 	default:
 		if typ, ok := t.(TCollatedString); ok {
 			return &CollatedStringColType{Name: "STRING", Locale: typ.Locale}, nil
+		}
+		if typ, ok := t.(TArray); ok {
+			elemTyp, err := DatumTypeToColumnType(typ.Typ)
+			if err != nil {
+				return nil, err
+			}
+			return arrayOf(elemTyp, Exprs(nil))
 		}
 	}
 	return nil, errors.Errorf("value type %s cannot be used for table columns", t)
@@ -455,7 +551,7 @@ func CastTargetToDatumType(t CastTargetType) Type {
 	case *VectorColType:
 		return TypeIntVector
 	case *OidColType:
-		return TypeOid
+		return oidColTypeToType(ct)
 	default:
 		panic(errors.Errorf("unexpected CastTarget %T", t))
 	}

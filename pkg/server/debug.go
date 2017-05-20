@@ -19,10 +19,13 @@ package server
 import (
 	"fmt"
 	"net/http"
+	"strings"
 
 	// Register the net/trace endpoint with http.DefaultServeMux.
 	"golang.org/x/net/trace"
 
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/pkg/errors"
 	"github.com/rcrowley/go-metrics"
 	"github.com/rcrowley/go-metrics/exp"
 
@@ -38,6 +41,26 @@ const debugEndpoint = "/debug/"
 // We use the default http mux for the debug endpoint (as pprof and net/trace
 // register to that via import, and go-metrics registers to that via exp.Exp())
 var debugServeMux = http.DefaultServeMux
+
+const (
+	debugRemoteOff   = "off"
+	debugRemoteLocal = "local"
+	debugRemoteAny   = "any"
+)
+
+var debugRemote = settings.RegisterValidatedStringSetting(
+	"server.remote_debugging.mode",
+	"set to enable remote debugging, localhost-only or disable (any, local, off)",
+	"local",
+	func(s string) error {
+		switch strings.ToLower(s) {
+		case debugRemoteOff, debugRemoteLocal, debugRemoteAny:
+			return nil
+		default:
+			return errors.Errorf("invalid mode: '%s'", s)
+		}
+	},
+)
 
 // handleDebug passes requests with the debugPathPrefix onto the default
 // serve mux, which is preconfigured (by import of net/http/pprof and registration
@@ -56,13 +79,28 @@ func init() {
 	// TODO(mberhault): properly secure this once we require client certs.
 	origAuthRequest := trace.AuthRequest
 	trace.AuthRequest = func(req *http.Request) (bool, bool) {
-		_, sensitive := origAuthRequest(req)
-		return true, sensitive
+		allow, sensitive := origAuthRequest(req)
+		switch strings.ToLower(debugRemote.Get()) {
+		case debugRemoteAny:
+			allow = true
+		case debugRemoteLocal:
+			break
+		default:
+			allow = false
+		}
+		return allow, sensitive
 	}
 
 	debugServeMux.HandleFunc(debugEndpoint, func(w http.ResponseWriter, r *http.Request) {
+		if any, _ := trace.AuthRequest(r); !any {
+			http.Error(w, "not allowed (due to the 'server.remote_debugging.mode' setting)",
+				http.StatusForbidden)
+			return
+		}
+
 		if r.URL.Path != debugEndpoint {
 			http.Redirect(w, r, debugEndpoint, http.StatusMovedPermanently)
+			return
 		}
 
 		// The explicit header is necessary or (at least Chrome) will try to
@@ -107,6 +145,11 @@ func init() {
       <tr>
         <td>range status</td>
         <td><a href="/debug/range?id=1">range</a></td>
+      </tr>
+      <tr>
+        <td>problem ranges</td>
+        <td><a href="/debug/problemranges">on the cluster</a></td>
+        <td><a href="/debug/problemranges?node_id=1">on a specific node</a></td>
       </tr>
       <tr>
         <td>raft</td>

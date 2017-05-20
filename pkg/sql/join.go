@@ -24,7 +24,9 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 type joinType int
@@ -62,7 +64,7 @@ func (b *bucket) AddRow(row parser.Datums) {
 
 type buckets struct {
 	buckets      map[string]*bucket
-	rowContainer *RowContainer
+	rowContainer *sqlbase.RowContainer
 }
 
 func (b *buckets) Buckets() map[string]*bucket {
@@ -81,7 +83,7 @@ func (b *buckets) AddRow(
 	if err != nil {
 		return err
 	}
-	if err := acc.Grow(ctx, sizeOfDatums); err != nil {
+	if err := acc.Grow(ctx, sqlbase.SizeOfDatums); err != nil {
 		return err
 	}
 	bk.AddRow(rowCopy)
@@ -134,7 +136,7 @@ type joinNode struct {
 	pred *joinPredicate
 
 	// columns contains the metadata for the results of this node.
-	columns ResultColumns
+	columns sqlbase.ResultColumns
 
 	// output contains the last generated row of results from this node.
 	output parser.Datums
@@ -173,11 +175,11 @@ type joinNode struct {
 func commonColumns(left, right *dataSourceInfo) parser.NameList {
 	var res parser.NameList
 	for _, cLeft := range left.sourceColumns {
-		if cLeft.hidden {
+		if cLeft.Hidden {
 			continue
 		}
 		for _, cRight := range right.sourceColumns {
-			if cRight.hidden {
+			if cRight.Hidden {
 				continue
 			}
 
@@ -264,13 +266,19 @@ func (p *planner) makeJoin(
 	}
 
 	n.buffer = &RowBuffer{
-		RowContainer: NewRowContainer(p.session.TxnState.makeBoundAccount(), n.Columns(), 0),
+		RowContainer: sqlbase.NewRowContainer(
+			p.session.TxnState.makeBoundAccount(), sqlbase.ColTypeInfoFromResCols(n.Columns()), 0,
+		),
 	}
 
 	n.bucketsMemAcc = p.session.TxnState.OpenAccount()
 	n.buckets = buckets{
-		buckets:      make(map[string]*bucket),
-		rowContainer: NewRowContainer(p.session.TxnState.makeBoundAccount(), n.right.plan.Columns(), 0),
+		buckets: make(map[string]*bucket),
+		rowContainer: sqlbase.NewRowContainer(
+			p.session.TxnState.makeBoundAccount(),
+			sqlbase.ColTypeInfoFromResCols(n.right.plan.Columns()),
+			0,
+		),
 	}
 
 	return planDataSource{
@@ -280,7 +288,7 @@ func (p *planner) makeJoin(
 }
 
 // Columns implements the planNode interface.
-func (n *joinNode) Columns() ResultColumns { return n.columns }
+func (n *joinNode) Columns() sqlbase.ResultColumns { return n.columns }
 
 // Ordering implements the planNode interface.
 func (n *joinNode) Ordering() orderingInfo { return orderingInfo{} }
@@ -293,6 +301,18 @@ func (n *joinNode) MarkDebug(mode explainMode) {
 	n.explain = mode
 	n.left.plan.MarkDebug(mode)
 	n.right.plan.MarkDebug(mode)
+}
+
+func (n *joinNode) Spans(ctx context.Context) (reads, writes roachpb.Spans, err error) {
+	leftReads, leftWrites, err := n.left.plan.Spans(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	rightReads, rightWrites, err := n.right.plan.Spans(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return append(leftReads, rightReads...), append(leftWrites, rightWrites...), nil
 }
 
 // Start implements the planNode interface.

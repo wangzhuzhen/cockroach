@@ -24,12 +24,14 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/testutils/gossiputil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -87,21 +89,21 @@ func (m *mockNodeLiveness) nodeLivenessFunc(
 // createTestStorePool creates a stopper, gossip and storePool for use in
 // tests. Stopper must be stopped by the caller.
 func createTestStorePool(
-	timeUntilStoreDead time.Duration, deterministic bool, defaultNodeStatus nodeStatus,
+	timeUntilStoreDeadValue time.Duration, deterministic bool, defaultNodeStatus nodeStatus,
 ) (*stop.Stopper, *gossip.Gossip, *hlc.ManualClock, *StorePool, *mockNodeLiveness) {
 	stopper := stop.NewStopper()
 	mc := hlc.NewManualClock(123)
 	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
 	rpcContext := rpc.NewContext(log.AmbientContext{}, &base.Config{Insecure: true}, clock, stopper)
 	server := rpc.NewServer(rpcContext) // never started
-	g := gossip.NewTest(1, rpcContext, server, nil, stopper, metric.NewRegistry())
+	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry())
 	mnl := newMockNodeLiveness(defaultNodeStatus)
 	storePool := NewStorePool(
 		log.AmbientContext{},
 		g,
 		clock,
 		mnl.nodeLivenessFunc,
-		timeUntilStoreDead,
+		settings.TestingDuration(timeUntilStoreDeadValue),
 		deterministic,
 	)
 	return stopper, g, mc, storePool, mnl
@@ -113,7 +115,7 @@ func TestStorePoolGossipUpdate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp, _ := createTestStorePool(
 		TestTimeUntilStoreDead, false /* deterministic */, nodeStatusDead)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
 
 	sp.detailsMu.RLock()
@@ -169,7 +171,7 @@ func TestStorePoolGetStoreList(t *testing.T) {
 	// We're going to manually mark stores dead in this test.
 	stopper, g, _, sp, mnl := createTestStorePool(
 		TestTimeUntilStoreDead, false /* deterministic */, nodeStatusDead)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
 	constraints := config.Constraints{Constraints: []config.Constraint{{Value: "ssd"}, {Value: "dc"}}}
 	required := []string{"ssd", "dc"}
@@ -300,7 +302,7 @@ func TestStorePoolGetStoreDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp, _ := createTestStorePool(
 		TestTimeUntilStoreDead, false /* deterministic */, nodeStatusDead)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(uniqueStore, t)
 
@@ -318,7 +320,7 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp, mnl := createTestStorePool(
 		TestTimeUntilStoreDead, false /* deterministic */, nodeStatusDead)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
 
 	stores := []*roachpb.StoreDescriptor{
@@ -419,7 +421,7 @@ func TestStorePoolDefaultState(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, _, _, sp, _ := createTestStorePool(
 		TestTimeUntilStoreDead, false /* deterministic */, nodeStatusDead)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(0, []roachpb.ReplicaDescriptor{{StoreID: 1}})
 	if len(liveReplicas) != 0 || len(deadReplicas) != 0 {
@@ -442,13 +444,13 @@ func TestStorePoolThrottle(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp, _ := createTestStorePool(
 		TestTimeUntilStoreDead, false /* deterministic */, nodeStatusDead)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(uniqueStore, t)
 
 	{
-		expected := sp.clock.Now().GoTime().Add(sp.declinedReservationsTimeout)
+		expected := sp.clock.Now().GoTime().Add(declinedReservationsTimeout.Get())
 		sp.throttle(throttleDeclined, 1)
 
 		sp.detailsMu.Lock()
@@ -461,7 +463,7 @@ func TestStorePoolThrottle(t *testing.T) {
 	}
 
 	{
-		expected := sp.clock.Now().GoTime().Add(sp.failedReservationsTimeout)
+		expected := sp.clock.Now().GoTime().Add(failedReservationsTimeout.Get())
 		sp.throttle(throttleFailed, 1)
 
 		sp.detailsMu.Lock()
@@ -478,7 +480,7 @@ func TestGetLocalities(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp, _ := createTestStorePool(
 		TestTimeUntilStoreDead, false /* deterministic */, nodeStatusDead)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
 
 	// Creates a node with a locality with the number of tiers passed in. The

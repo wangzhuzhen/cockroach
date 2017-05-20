@@ -63,7 +63,7 @@ func runDump(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// TODO(knz/mjibson) dump foreign key constraints and dump in
+	// TODO(knz/mjibson): dump foreign key constraints and dump in
 	// topological order to ensure key relationships can be verified
 	// during load.
 
@@ -107,14 +107,11 @@ func getDumpMetadata(
 	conn *sqlConn, dbName string, tableNames []string, asOf string,
 ) (mds []tableMetadata, clusterTS string, err error) {
 	if asOf == "" {
-		// Converting to a string here is useful since we only need a string below
-		// for the AS OF SYSTEM TIME insertion and the database is guaranteed to be
-		// able to parse its own output.
-		vals, err := conn.QueryRow("SELECT now()::string", nil)
+		vals, err := conn.QueryRow("SELECT cluster_logical_timestamp()", nil)
 		if err != nil {
 			return nil, "", err
 		}
-		clusterTS = vals[0].(string)
+		clusterTS = string(vals[0].([]byte))
 	} else {
 		// Validate the timestamp. This prevents SQL injection.
 		if _, err := parser.ParseDTimestamp(asOf, time.Nanosecond); err != nil {
@@ -176,7 +173,9 @@ func getTableNames(conn *sqlConn, dbName string, ts string) (tableNames []string
 	return tableNames, nil
 }
 
-func getMetadataForTable(conn *sqlConn, dbName, tableName string, ts string) (tableMetadata, error) {
+func getMetadataForTable(
+	conn *sqlConn, dbName, tableName string, ts string,
+) (tableMetadata, error) {
 	// Fetch column types.
 	rows, err := conn.Query(fmt.Sprintf(`
 		SELECT COLUMN_NAME, DATA_TYPE
@@ -210,7 +209,7 @@ func getMetadataForTable(conn *sqlConn, dbName, tableName string, ts string) (ta
 		if colnames.Len() > 0 {
 			colnames.WriteString(", ")
 		}
-		parser.Name(name).Format(&colnames, parser.FmtSimple)
+		parser.FormatNode(&colnames, parser.FmtSimple, parser.Name(name))
 	}
 	if err := rows.Close(); err != nil {
 		return tableMetadata{}, err
@@ -265,7 +264,7 @@ func getMetadataForTable(conn *sqlConn, dbName, tableName string, ts string) (ta
 		if idxColNames.Len() > 0 {
 			idxColNames.WriteString(", ")
 		}
-		parser.Name(name).Format(&idxColNames, parser.FmtSimple)
+		parser.FormatNode(&idxColNames, parser.FmtSimple, parser.Name(name))
 		numIndexCols++
 	}
 	if err := rows.Close(); err != nil {
@@ -416,7 +415,7 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, md tableMetadat
 					default:
 						panic(errors.Errorf("unknown timestamp type: %s, %v: %s", t, cols[si], md.columnTypes[cols[si]]))
 					}
-					ivals[si] = fmt.Sprintf("%s", d)
+					ivals[si] = d.String()
 				default:
 					panic(errors.Errorf("unknown field type: %T (%s)", t, cols[si]))
 				}

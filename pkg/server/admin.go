@@ -33,24 +33,19 @@ import (
 	"google.golang.org/grpc/codes"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -59,13 +54,9 @@ const (
 	// administrative interface to the cockroach cluster.
 	adminPrefix = "/_admin/v1/"
 
-	// eventLimit is the maximum number of events returned by any endpoints
-	// returning events.
-	apiEventLimit = 1000
-
-	// serverUIDataKeyPrefix must precede all UIData keys that are read from the
-	// server.
-	serverUIDataKeyPrefix = "server."
+	// defaultAPIEventLimit is the default maximum number of events returned by any
+	// endpoints returning events.
+	defaultAPIEventLimit = 1000
 )
 
 // apiServerMessage is the standard body for all HTTP 500 responses.
@@ -690,6 +681,11 @@ func (s *adminServer) Events(
 	ctx, session := s.NewContextAndSessionForRPC(ctx, args)
 	defer session.Finish(s.server.sqlExecutor)
 
+	limit := req.Limit
+	if limit == 0 {
+		limit = defaultAPIEventLimit
+	}
+
 	// Execute the query.
 	q := makeSQLQuery()
 	q.Append("SELECT timestamp, eventType, targetID, reportingID, info, uniqueID ")
@@ -702,7 +698,9 @@ func (s *adminServer) Events(
 		q.Append("AND targetID = $ ", parser.NewDInt(parser.DInt(req.TargetId)))
 	}
 	q.Append("ORDER BY timestamp DESC ")
-	q.Append("LIMIT $", parser.NewDInt(parser.DInt(apiEventLimit)))
+	if limit > 0 {
+		q.Append("LIMIT $", parser.NewDInt(parser.DInt(limit)))
+	}
 	if len(q.Errors()) > 0 {
 		return nil, s.serverErrors(q.Errors())
 	}
@@ -722,7 +720,7 @@ func (s *adminServer) Events(
 		if err := scanner.ScanIndex(row, 0, &ts); err != nil {
 			return nil, err
 		}
-		event.Timestamp = serverpb.EventsResponse_Event_Timestamp{Sec: ts.Unix(), Nsec: uint32(ts.Nanosecond())}
+		event.Timestamp = ts
 		if err := scanner.ScanIndex(row, 1, &event.EventType); err != nil {
 			return nil, err
 		}
@@ -737,6 +735,83 @@ func (s *adminServer) Events(
 		}
 		if err := scanner.ScanIndex(row, 5, &event.UniqueID); err != nil {
 			return nil, err
+		}
+
+		resp.Events = append(resp.Events, event)
+	}
+	return &resp, nil
+}
+
+// RangeLog is an endpoint that returns the latest range log entries.
+func (s *adminServer) RangeLog(
+	ctx context.Context, req *serverpb.RangeLogRequest,
+) (*serverpb.RangeLogResponse, error) {
+	args := sql.SessionArgs{User: s.getUser(req)}
+	ctx, session := s.NewContextAndSessionForRPC(ctx, args)
+	defer session.Finish(s.server.sqlExecutor)
+
+	limit := req.Limit
+	if limit == 0 {
+		limit = defaultAPIEventLimit
+	}
+
+	// Execute the query.
+	q := makeSQLQuery()
+	q.Append("SELECT timestamp, rangeID, storeID, eventType, otherRangeID, info ")
+	q.Append("FROM system.rangelog ")
+	rangeID := parser.NewDInt(parser.DInt(req.RangeId))
+	q.Append("WHERE rangeID = $ OR otherRangeID = $", rangeID, rangeID)
+	q.Append("ORDER BY timestamp DESC ")
+	if limit > 0 {
+		q.Append("LIMIT $", parser.NewDInt(parser.DInt(limit)))
+	}
+	if len(q.Errors()) > 0 {
+		return nil, s.serverErrors(q.Errors())
+	}
+	r := s.server.sqlExecutor.ExecuteStatements(session, q.String(), q.QueryArguments())
+	defer r.Close(ctx)
+	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+		return nil, s.serverError(err)
+	}
+
+	// Marshal response.
+	var resp serverpb.RangeLogResponse
+	scanner := makeResultScanner(r.ResultList[0].Columns)
+	for i, nRows := 0, r.ResultList[0].Rows.Len(); i < nRows; i++ {
+		row := r.ResultList[0].Rows.At(i)
+		if row.Len() != 6 {
+			return nil, errors.Errorf("incorrect number of columns in response, expected 6, got %d", row.Len())
+		}
+		var event serverpb.RangeLogResponse_Event
+		var ts time.Time
+		if err := scanner.ScanIndex(row, 0, &ts); err != nil {
+			return nil, errors.Wrap(err, fmt.Sprintf("Timestamp didn't parse correctly: %s", row[0].String()))
+		}
+		event.Timestamp = ts
+		var rangeID int64
+		if err := scanner.ScanIndex(row, 1, &rangeID); err != nil {
+			return nil, errors.Wrap(err, fmt.Sprintf("RangeID didn't parse correctly: %s", row[1].String()))
+		}
+		event.RangeID = roachpb.RangeID(rangeID)
+		var storeID int64
+		if err := scanner.ScanIndex(row, 2, &storeID); err != nil {
+			return nil, errors.Wrap(err, fmt.Sprintf("StoreID didn't parse correctly: %s", row[2].String()))
+		}
+		event.StoreID = roachpb.StoreID(int32(storeID))
+		if err := scanner.ScanIndex(row, 3, &event.EventType); err != nil {
+			return nil, errors.Wrap(err, fmt.Sprintf("EventType didn't parse correctly: %s", row[3].String()))
+		}
+		var otherRangeID int64
+		if row[4].String() != "NULL" {
+			if err := scanner.ScanIndex(row, 4, &otherRangeID); err != nil {
+				return nil, errors.Wrap(err, fmt.Sprintf("OtherRangeID didn't parse correctly: %s", row[4].String()))
+			}
+			event.OtherRangeID = roachpb.RangeID(otherRangeID)
+		}
+		if row[5].String() != "NULL" {
+			if err := scanner.ScanIndex(row, 5, &event.Info); err != nil {
+				return nil, errors.Wrap(err, fmt.Sprintf("info didn't parse correctly: %s", row[5].String()))
+			}
 		}
 
 		resp.Events = append(resp.Events, event)
@@ -791,7 +866,7 @@ func (s *adminServer) getUIData(
 
 		resp.KeyValues[string(dKey)] = serverpb.GetUIDataResponse_Value{
 			Value:       []byte(*dValue),
-			LastUpdated: serverpb.GetUIDataResponse_Timestamp{Sec: dLastUpdated.Unix(), Nsec: uint32(dLastUpdated.Nanosecond())},
+			LastUpdated: dLastUpdated.Time,
 		}
 	}
 	return &resp, nil
@@ -855,6 +930,31 @@ func (s *adminServer) GetUIData(
 	return resp, nil
 }
 
+// Settings returns settings associated with the given keys.
+func (s *adminServer) Settings(
+	ctx context.Context, req *serverpb.SettingsRequest,
+) (*serverpb.SettingsResponse, error) {
+	keys := req.Keys
+	if len(keys) == 0 {
+		keys = settings.Keys()
+	}
+
+	resp := serverpb.SettingsResponse{KeyValues: make(map[string]serverpb.SettingsResponse_Value)}
+	for _, k := range keys {
+		v, desc, ok := settings.Lookup(k)
+		if !ok {
+			continue
+		}
+		resp.KeyValues[k] = serverpb.SettingsResponse_Value{
+			Type:        v.Typ(),
+			Value:       v.String(),
+			Description: desc,
+		}
+	}
+
+	return &resp, nil
+}
+
 // Cluster returns cluster metadata.
 func (s *adminServer) Cluster(
 	_ context.Context, req *serverpb.ClusterRequest,
@@ -866,6 +966,7 @@ func (s *adminServer) Cluster(
 	return &serverpb.ClusterResponse{ClusterID: clusterID.String()}, nil
 }
 
+// Health returns liveness for the node target of the request.
 func (s *adminServer) Health(
 	ctx context.Context, req *serverpb.HealthRequest,
 ) (*serverpb.HealthResponse, error) {
@@ -879,6 +980,7 @@ func (s *adminServer) Health(
 	return &serverpb.HealthResponse{}, nil
 }
 
+// Liveness returns the liveness state of all nodes on the cluster.
 func (s *adminServer) Liveness(
 	context.Context, *serverpb.LivenessRequest,
 ) (*serverpb.LivenessResponse, error) {
@@ -887,6 +989,47 @@ func (s *adminServer) Liveness(
 	}, nil
 }
 
+// QueryPlan returns a JSON representation of a distsql physical query
+// plan.
+func (s *adminServer) QueryPlan(
+	ctx context.Context, req *serverpb.QueryPlanRequest,
+) (*serverpb.QueryPlanResponse, error) {
+	args := sql.SessionArgs{User: s.getUser(req)}
+	ctx, session := s.NewContextAndSessionForRPC(ctx, args)
+	defer session.Finish(s.server.sqlExecutor)
+
+	// As long as there's only one query provided it's safe to construct the
+	// explain query.
+	stmts, err := parser.Parse(req.Query)
+	if err != nil {
+		return nil, s.serverError(err)
+	}
+	if len(stmts) > 1 {
+		return nil, s.serverErrorf("more than one query provided")
+	}
+
+	explain := fmt.Sprintf(
+		"SELECT JSON FROM [EXPLAIN (distsql) %s]",
+		strings.Trim(req.Query, ";"))
+	r := s.server.sqlExecutor.ExecuteStatements(session, explain, nil)
+	defer r.Close(ctx)
+	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+		return nil, s.serverError(err)
+	}
+
+	row := r.ResultList[0].Rows.At(0)
+	dbDatum, ok := parser.AsDString(row[0])
+	if !ok {
+		return nil, s.serverErrorf("type assertion failed on json: %T", row[0])
+	}
+
+	return &serverpb.QueryPlanResponse{
+		DistSQLPhysicalQueryPlan: string(dbDatum),
+	}, nil
+}
+
+// Drain puts the node into the specified drain mode(s) and optionally
+// instructs the process to terminate.
 func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_DrainServer) error {
 	on := make([]serverpb.DrainMode, len(req.On))
 	for i := range req.On {
@@ -919,9 +1062,9 @@ func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_Dr
 	}
 
 	s.server.grpc.Stop()
-	go s.server.stopper.Stop()
 
 	ctx := stream.Context()
+	go s.server.stopper.Stop(ctx)
 
 	select {
 	case <-s.server.stopper.IsStopped():
@@ -929,226 +1072,6 @@ func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_Dr
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-// waitForStoreFrozen polls the given stores until they all report having no
-// unfrozen Replicas (or an error or timeout occurs).
-func (s *adminServer) waitForStoreFrozen(
-	stream serverpb.Admin_ClusterFreezeServer,
-	stores map[roachpb.StoreID]roachpb.NodeID,
-	wantFrozen bool,
-) error {
-	mu := struct {
-		syncutil.Mutex
-		oks map[roachpb.StoreID]bool
-	}{
-		oks: make(map[roachpb.StoreID]bool),
-	}
-
-	opts := base.DefaultRetryOptions()
-	opts.Closer = s.server.stopper.ShouldQuiesce()
-	opts.MaxRetries = 20
-	sem := make(chan struct{}, 256)
-	errChan := make(chan error, 1)
-	sendErr := func(err error) {
-		select {
-		case errChan <- err:
-		default:
-		}
-	}
-
-	numWaiting := len(stores) // loop until this drops to zero
-	var err error
-	for r := retry.Start(opts); r.Next(); {
-		mu.Lock()
-		for storeID, nodeID := range stores {
-			storeID, nodeID := storeID, nodeID // loop-local copies for goroutine
-			var nodeDesc roachpb.NodeDescriptor
-			if err := s.server.gossip.GetInfoProto(gossip.MakeNodeIDKey(nodeID), &nodeDesc); err != nil {
-				sendErr(err)
-				break
-			}
-			addr := nodeDesc.Address.String()
-
-			if _, inflightOrSucceeded := mu.oks[storeID]; inflightOrSucceeded {
-				continue
-			}
-			mu.oks[storeID] = false // mark as inflight
-			action := func() (err error) {
-				var resp *storage.PollFrozenResponse
-				defer func() {
-					message := fmt.Sprintf("node %d, store %d: ", nodeID, storeID)
-
-					if err != nil {
-						message += err.Error()
-					} else {
-						numMismatching := len(resp.Results)
-						mu.Lock()
-						if numMismatching == 0 {
-							// If the Store is in the right state, mark it as such.
-							// This means we won't try it again.
-							message += "ready"
-							mu.oks[storeID] = true
-						} else {
-							// Otherwise, forget that we tried the Store so that
-							// the retry loop picks it up again.
-							message += fmt.Sprintf("%d replicas report wrong status", numMismatching)
-							if limit := 10; numMismatching > limit {
-								message += " [truncated]: "
-								resp.Results = resp.Results[:limit]
-							} else {
-								message += ": "
-							}
-							message += fmt.Sprintf("%+v", resp.Results)
-							delete(mu.oks, storeID)
-						}
-						mu.Unlock()
-					}
-					err = stream.Send(&serverpb.ClusterFreezeResponse{
-						Message: message,
-					})
-				}()
-				conn, err := s.server.rpcContext.GRPCDial(addr)
-				if err != nil {
-					return err
-				}
-				client := storage.NewFreezeClient(conn)
-				resp, err = client.PollFrozen(context.TODO(),
-					&storage.PollFrozenRequest{
-						StoreRequestHeader: storage.StoreRequestHeader{
-							NodeID:  nodeID,
-							StoreID: storeID,
-						},
-						// If we are looking to freeze everything, we want to
-						// collect thawed Replicas, and vice versa.
-						CollectFrozen: !wantFrozen,
-					})
-				return err
-			}
-			// Run a limited, non-blocking task. That means the task simply
-			// won't run if the semaphore is full (or the node is draining).
-			// Both are handled by the surrounding retry loop.
-			if err := s.server.stopper.RunLimitedAsyncTask(
-				context.TODO(), sem, true /* wait */, func(_ context.Context) {
-					if err := action(); err != nil {
-						sendErr(err)
-					}
-				}); err != nil {
-				// Node draining.
-				sendErr(err)
-				break
-			}
-		}
-
-		numWaiting = len(stores)
-		for _, ok := range mu.oks {
-			if ok {
-				// Store has reported that it is frozen.
-				numWaiting--
-				continue
-			}
-		}
-		mu.Unlock()
-
-		select {
-		case err = <-errChan:
-		default:
-		}
-
-		// Keep going unless there's been an error or everyone's frozen.
-		if err != nil || numWaiting == 0 {
-			break
-		}
-		if err := stream.Send(&serverpb.ClusterFreezeResponse{
-			Message: fmt.Sprintf("waiting for %d store%s to apply operation",
-				numWaiting, util.Pluralize(int64(numWaiting))),
-		}); err != nil {
-			return err
-		}
-	}
-	if err != nil {
-		return err
-	}
-	if numWaiting > 0 {
-		err = fmt.Errorf("timed out waiting for %d store%s to report freeze",
-			numWaiting, util.Pluralize(int64(numWaiting)))
-	}
-	return err
-}
-
-func (s *adminServer) ClusterFreeze(
-	req *serverpb.ClusterFreezeRequest, stream serverpb.Admin_ClusterFreezeServer,
-) error {
-	var totalAffected int64
-	stores := make(map[roachpb.StoreID]roachpb.NodeID)
-	process := func(from, to roachpb.Key) (roachpb.Key, error) {
-		b := &client.Batch{}
-		fa := roachpb.NewChangeFrozen(from, to, req.Freeze, build.GetInfo().Tag)
-		b.AddRawRequest(fa)
-		if err := s.server.db.Run(context.TODO(), b); err != nil {
-			return nil, err
-		}
-		fr := b.RawResponse().Responses[0].GetInner().(*roachpb.ChangeFrozenResponse)
-		totalAffected += fr.RangesAffected
-		for storeID, nodeID := range fr.Stores {
-			stores[storeID] = nodeID
-		}
-		return fr.MinStartKey.AsRawKey(), nil
-	}
-
-	task := "thaw"
-	if req.Freeze {
-		task = "freeze"
-		// When freezing, we save the meta2 and meta1 range for last to avoid
-		// interfering with command routing.
-		// Note that we freeze only Ranges whose StartKey is included. In
-		// particular, a Range which contains some meta keys will not be frozen
-		// by the request that begins at Meta2KeyMax. ChangeFreeze gives us the
-		// leftmost covered Range back, which we use for the next request to
-		// avoid split-related races.
-		freezeTo := roachpb.KeyMax // updated as we go along
-		freezeFroms := []roachpb.Key{
-			keys.Meta2KeyMax, // freeze userspace
-			keys.Meta1KeyMax, // freeze all meta2 ranges
-			keys.LocalMax,    // freeze first range (meta1)
-		}
-
-		for i, freezeFrom := range freezeFroms {
-			if err := stream.Send(&serverpb.ClusterFreezeResponse{
-				Message: fmt.Sprintf("freezing meta ranges [stage %d]", i+1),
-			}); err != nil {
-				return err
-			}
-			var err error
-			if freezeTo, err = process(freezeFrom, freezeTo); err != nil {
-				return err
-			}
-		}
-	} else {
-		if err := stream.Send(&serverpb.ClusterFreezeResponse{
-			Message: fmt.Sprintf("unfreezing ranges"),
-		}); err != nil {
-			return err
-		}
-		// When unfreezing, we walk in opposite order and try the first range
-		// first. We should be able to get there if the first range manages to
-		// gossip. From that, we can talk to the second level replicas, and
-		// then to everyone else. Because ChangeFrozen works in forward order,
-		// we can simply hit the whole keyspace at once.
-		// TODO(tschottdorf): make the first range replicas gossip their
-		// descriptor unconditionally or we won't always be able to unfreeze
-		// (except by restarting a node which holds the first range).
-		if _, err := process(keys.LocalMax, roachpb.KeyMax); err != nil {
-			return err
-		}
-	}
-	if err := stream.Send(&serverpb.ClusterFreezeResponse{
-		RangesAffected: totalAffected,
-		Message:        fmt.Sprintf("proposed %s to %d ranges", task, totalAffected),
-	}); err != nil {
-		return err
-	}
-	return s.waitForStoreFrozen(stream, stores, req.Freeze)
 }
 
 // sqlQuery allows you to incrementally build a SQL query that uses
@@ -1231,7 +1154,7 @@ type resultScanner struct {
 	colNameToIdx map[string]int
 }
 
-func makeResultScanner(cols []sql.ResultColumn) resultScanner {
+func makeResultScanner(cols []sqlbase.ResultColumn) resultScanner {
 	rs := resultScanner{
 		colNameToIdx: make(map[string]int),
 	}
@@ -1389,7 +1312,7 @@ func (s *adminServer) queryNamespaceID(
 	const query = `SELECT id FROM system.namespace WHERE parentID = $1 AND name = $2`
 	params := parser.MakePlaceholderInfo()
 	params.SetValue(`1`, parser.NewDInt(parser.DInt(parentID)))
-	params.SetValue(`2`, parser.NewDString(name))
+	params.SetValue(`2`, parser.NewDString(parser.ReNormalizeName(name)))
 	r := s.server.sqlExecutor.ExecuteStatements(session, query, &params)
 	defer r.Close(ctx)
 	if err := s.checkQueryResults(r.ResultList, 1); err != nil {

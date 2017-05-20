@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
@@ -44,6 +45,7 @@ var informationSchema = virtualSchema{
 		informationSchemaTablePrivileges,
 		informationSchemaTablesTable,
 		informationSchemaViewsTable,
+		informationSchemaUserPrivileges,
 	},
 }
 
@@ -329,7 +331,16 @@ CREATE TABLE information_schema.statistics (
 				// Columns in the primary key that aren't in index.ColumnNames or
 				// index.StoreColumnNames are implicit columns in the index.
 				var implicitCols map[string]struct{}
-				if len(index.ExtraColumnIDs) > len(index.StoreColumnNames) {
+				var hasImplicitCols bool
+				if index.HasOldStoredColumns() {
+					// Old STORING format: implicit columns are extra columns minus stored
+					// columns.
+					hasImplicitCols = len(index.ExtraColumnIDs) > len(index.StoreColumnNames)
+				} else {
+					// New STORING format: implicit columns are extra columns.
+					hasImplicitCols = len(index.ExtraColumnIDs) > 0
+				}
+				if hasImplicitCols {
 					implicitCols = make(map[string]struct{})
 					for _, col := range table.PrimaryIndex.ColumnNames {
 						implicitCols[col] = struct{}{}
@@ -404,6 +415,30 @@ CREATE TABLE information_schema.table_constraints (
 			}
 			return nil
 		})
+	},
+}
+
+var informationSchemaUserPrivileges = virtualSchemaTable{
+	schema: `
+CREATE TABLE information_schema.user_privileges (
+	GRANTEE STRING NOT NULL DEFAULT '',
+	TABLE_CATALOG STRING NOT NULL DEFAULT '',
+	PRIVILEGE_TYPE STRING NOT NULL DEFAULT '',
+	IS_GRANTABLE BOOL NOT NULL DEFAULT FALSE
+);`,
+	populate: func(ctx context.Context, p *planner, addRow func(...parser.Datum) error) error {
+		grantee := parser.NewDString(security.RootUser)
+		for _, p := range privilege.List(privilege.ByValue[:]).SortedNames() {
+			if err := addRow(
+				grantee,              // grantee
+				defString,            // table_catalog
+				parser.NewDString(p), // privilege_type
+				parser.DNull,         // is_grantable
+			); err != nil {
+				return err
+			}
+		}
+		return nil
 	},
 }
 
@@ -535,7 +570,7 @@ func forEachDatabaseDesc(
 	ctx context.Context, p *planner, fn func(*sqlbase.DatabaseDescriptor) error,
 ) error {
 	// Handle real schemas
-	dbDescs, err := p.getAllDatabaseDescs(ctx)
+	dbDescs, err := getAllDatabaseDescs(ctx, p.txn)
 	if err != nil {
 		return err
 	}
@@ -616,7 +651,7 @@ func forEachTableDescWithTableLookup(
 	databases := make(map[string]dbDescTables)
 
 	// Handle real schemas.
-	descs, err := p.getAllDescriptors(ctx)
+	descs, err := getAllDescriptors(ctx, p.txn)
 	if err != nil {
 		return err
 	}
@@ -636,7 +671,7 @@ func forEachTableDescWithTableLookup(
 	// Next, iterate through all table descriptors, using the mapping from sqlbase.ID
 	// to database name to add descriptors to a dbDescTables' tables map.
 	for _, desc := range descs {
-		if table, ok := desc.(*sqlbase.TableDescriptor); ok {
+		if table, ok := desc.(*sqlbase.TableDescriptor); ok && !table.Dropped() {
 			dbName, ok := dbIDsToName[table.GetParentID()]
 			if !ok {
 				return errors.Errorf("no database with ID %d found", table.GetParentID())

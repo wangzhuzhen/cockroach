@@ -53,12 +53,13 @@ specialized hardware or number of cores (e.g. "gpu", "x16c"). For example:
 	Locality = FlagInfo{
 		Name: "locality",
 		Description: `
-Not fully implemented. https://github.com/cockroachdb/cockroach/issues/4868
 An ordered, comma-separated list of key-value pairs that describe the topography
 of the machine. Topography might include country, datacenter or rack
 designations. Data is automatically replicated to maximize diversities of each
-tier. The order of tiers is used to determine the priority of the diversity. The
-tiers and order must be the same on all nodes.  For example:
+tier. The order of tiers is used to determine the priority of the diversity, so
+the more inclusive localities like country should come before less inclusive
+localities like datacenter. The tiers and order must be the same on all nodes.
+Including more tiers is better than including fewer. For example:
 <PRE>
 
   --locality=country=us,region=us-west,datacenter=us-west-1b,rack=12
@@ -198,9 +199,10 @@ hostname if advertise-host is not specified.`,
 	}
 
 	ServerPort = FlagInfo{
-		Name:        "port",
-		Shorthand:   "p",
-		Description: `The port to bind to.`,
+		Name:      "port",
+		Shorthand: "p",
+		Description: `
+The port to bind to.`,
 	}
 
 	AdvertiseHost = FlagInfo{
@@ -208,6 +210,13 @@ hostname if advertise-host is not specified.`,
 		Description: `
 The hostname to advertise to other CockroachDB nodes for intra-cluster
 communication; it must resolve from other nodes in the cluster.`,
+	}
+
+	AdvertisePort = FlagInfo{
+		Name: "advertise-port",
+		Description: `
+The port to advertise to other CockroachDB nodes for intra-cluster
+communication.`,
 	}
 
 	ServerHTTPHost = FlagInfo{
@@ -218,6 +227,13 @@ communication; it must resolve from other nodes in the cluster.`,
 	ServerHTTPPort = FlagInfo{
 		Name:        "http-port",
 		Description: `The port to bind to for HTTP requests.`,
+	}
+
+	ListeningURLFile = FlagInfo{
+		Name: "listening-url-file",
+		Description: `
+After the CockroachDB node has started up successfully, it will
+write its connection URL to the specified file.`,
 	}
 
 	PIDFile = FlagInfo{
@@ -236,18 +252,44 @@ Note: when given a path to a unix socket, most postgres clients will
 open "<given path>/.s.PGSQL.<server port>"`,
 	}
 
-	Insecure = FlagInfo{
+	ClientInsecure = FlagInfo{
 		Name:   "insecure",
 		EnvVar: "COCKROACH_INSECURE",
 		Description: `
-Run over non-encrypted (non-TLS) connections. This is strongly discouraged for
-production usage and this flag must be explicitly specified in order for the
-server to listen on an external address in insecure mode.`,
+Connect to an insecure cluster. This is strongly discouraged for
+production usage.`,
 	}
 
+	ServerInsecure = FlagInfo{
+		Name: "insecure",
+		Description: `
+Start an insecure node, using unencrypted (non-TLS) connections,
+listening on all IP addresses (unless --host is provided) and
+disabling password authentication for all database users. This is
+strongly discouraged for production usage and should never be used on
+a public network without combining it with --host.`,
+	}
+
+	// KeySize, CertificateLifetime, AllowKeyReuse, and OverwriteFiles are used for
+	// certificate generation functions.
 	KeySize = FlagInfo{
 		Name:        "key-size",
 		Description: `Key size in bits for CA/Node/Client certificates.`,
+	}
+
+	CertificateLifetime = FlagInfo{
+		Name:        "lifetime",
+		Description: `Certificate lifetime.`,
+	}
+
+	AllowCAKeyReuse = FlagInfo{
+		Name:        "allow-ca-key-reuse",
+		Description: `Use the CA key if it exists.`,
+	}
+
+	OverwriteFiles = FlagInfo{
+		Name:        "overwrite",
+		Description: `Certificate and key files are overwritten if they exist.`,
 	}
 
 	MaxResults = FlagInfo{
@@ -260,28 +302,52 @@ server to listen on an external address in insecure mode.`,
 		Description: `Prompt for the new user's password.`,
 	}
 
-	CACert = FlagInfo{
-		Name:        "ca-cert",
-		EnvVar:      "COCKROACH_CA_CERT",
-		Description: `Path to the CA certificate. Needed by clients and servers in secure mode.`,
+	CertsDir = FlagInfo{
+		Name:   "certs-dir",
+		EnvVar: "COCKROACH_CERTS_DIR",
+		Description: `
+The path to the directory containing SSL certificates and keys.
+<PRE>
+
+Cockroach looks for certificates and keys inside the directory using the
+following naming scheme:
+
+  - CA certificate and key: ca.crt, ca.key
+  - Server certificate and key: node.crt, node.key
+  - Client certificate and key: client.<user>.crt, client.<user>.key
+
+When running client commands, the user can be specified with the --user flag.
+</PRE>
+
+Keys have a minimum permission requirement of 0700 (rwx------). This restriction can be
+disabled by setting the environment variable COCKROACH_SKIP_KEY_PERMISSION_CHECK to true.`,
+	}
+
+	// Server version of the certs directory flag, cannot be set through environment.
+	ServerCertsDir = FlagInfo{
+		Name:        "certs-dir",
+		Description: CertsDir.Description,
 	}
 
 	CAKey = FlagInfo{
 		Name:        "ca-key",
 		EnvVar:      "COCKROACH_CA_KEY",
-		Description: `Path to the key protecting --ca-cert. Only needed when signing new certificates.`,
+		Description: `Path to the CA key.`,
 	}
 
-	Cert = FlagInfo{
-		Name:        "cert",
-		EnvVar:      "COCKROACH_CERT",
-		Description: `Path to the client or server certificate. Needed in secure mode.`,
-	}
+	MaxOffset = FlagInfo{
+		Name: "max-offset",
+		Description: `
+Maximum allowed clock offset for the cluster. If observed clock offsets exceed
+this limit, servers will crash to minimize the likelihood of reading
+inconsistent data. Increasing this value will increase the time to recovery of
+failures as well as the frequency of uncertainty-based read restarts.
+<PRE>
 
-	Key = FlagInfo{
-		Name:        "key",
-		EnvVar:      "COCKROACH_KEY",
-		Description: `Path to the key protecting --cert. Needed in secure mode.`,
+</PRE>
+Note that this value must be the same on all nodes in the cluster. In order to
+change it, every node in the cluster must be stopped and restarted with the new
+value.`,
 	}
 
 	Store = FlagInfo{
@@ -386,18 +452,6 @@ is the prefix for range local keys.`}
 	Sizes = FlagInfo{
 		Name:        "sizes",
 		Description: `Print key and value sizes along with their associated key.`,
-	}
-
-	RaftTickInterval = FlagInfo{
-		Name: "raft-tick-interval",
-		Description: `
-The resolution of the Raft timer; other raft timeouts are
-defined in terms of multiples of this value.`,
-	}
-
-	UndoFreezeCluster = FlagInfo{
-		Name:        "undo",
-		Description: `Attempt to undo an earlier attempt to freeze the cluster.`,
 	}
 
 	Replicated = FlagInfo{

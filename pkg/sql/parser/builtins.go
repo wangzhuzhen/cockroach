@@ -21,8 +21,11 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
-	"errors"
+	"crypto/sha512"
 	"fmt"
+	"hash"
+	"hash/crc32"
+	"hash/fnv"
 	"math"
 	"math/rand"
 	"net"
@@ -34,15 +37,18 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/lib/pq/oid"
+	"github.com/knz/strtime"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/pkg/errors"
 )
 
 var (
@@ -103,15 +109,22 @@ type Builtin struct {
 	// in separate statements, and should not be marked as impure.
 	impure bool
 
-	// Set to true when a function depends on data stored in the EvalContext, e.g.
-	// statement_timestamp. Currently used for DistSQL to determine if expressions
-	// can be evaluated on a different node without sending over the EvalContext.
-	ctxDependent bool
+	// Set to true when a function depends on members of the EvalContext that are
+	// not marshalled by DistSQL (e.g. planner). Currently used for DistSQL to
+	// determine if expressions can be evaluated on a different node without
+	// sending over the EvalContext.
+	//
+	// TODO(andrei): Get rid of the planner from the EvalContext and then we can
+	// get rid of this blacklist.
+	distsqlBlacklist bool
 
 	// Set to true when a function may change at every row whether or
 	// not it is applied to an expression that contains row-dependent
 	// variables. Used e.g. by `random` and aggregate functions.
 	needsRepeatedEvaluation bool
+
+	// Set to true when the built-in can only be used by security.RootUser.
+	privileged bool
 
 	class    FunctionClass
 	category string
@@ -123,8 +136,8 @@ type Builtin struct {
 	// might be more appropriate.
 	Info string
 
-	AggregateFunc func([]Type) AggregateFunc
-	WindowFunc    func([]Type) WindowFunc
+	AggregateFunc func([]Type, *EvalContext) AggregateFunc
+	WindowFunc    func([]Type, *EvalContext) WindowFunc
 	fn            func(*EvalContext, Datums) (Datum, error)
 }
 
@@ -183,10 +196,10 @@ func (b Builtin) Impure() bool {
 	return b.impure
 }
 
-// ContextDependent returns true if this builtin depends on data stored in the
-// EvalContext.
-func (b Builtin) ContextDependent() bool {
-	return b.ctxDependent
+// DistSQLBlacklist returns true if the builtin is not supported by DistSQL.
+// See distsqlBlacklist.
+func (b Builtin) DistSQLBlacklist() bool {
+	return b.distsqlBlacklist
 }
 
 // FixedReturnType returns a fixed type that the function returns, returning Any
@@ -207,6 +220,7 @@ func init() {
 	initAggregateBuiltins()
 	initWindowBuiltins()
 	initGeneratorBuiltins()
+	initPGBuiltins()
 
 	names := make([]string, 0, len(Builtins))
 	funDefs = make(map[string]*FunctionDefinition)
@@ -224,6 +238,8 @@ func init() {
 		funDefs[uname] = funDefs[name]
 	}
 }
+
+var digitNames = []string{"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"}
 
 // Builtins contains the built-in functions indexed by name.
 var Builtins = map[string][]Builtin{
@@ -416,8 +432,9 @@ var Builtins = map[string][]Builtin{
 
 	"repeat": {
 		Builtin{
-			Types:      ArgTypes{{"input", TypeString}, {"repeat_counter", TypeInt}},
-			ReturnType: fixedReturnType(TypeString),
+			Types:            ArgTypes{{"input", TypeString}, {"repeat_counter", TypeInt}},
+			distsqlBlacklist: true,
+			ReturnType:       fixedReturnType(TypeString),
 			fn: func(_ *EvalContext, args Datums) (_ Datum, err error) {
 				s := string(MustBeDString(args[0]))
 				count := int(MustBeDInt(args[1]))
@@ -446,17 +463,55 @@ var Builtins = map[string][]Builtin{
 		return nil, errEmptyInputString
 	}, TypeInt, "Calculates the ASCII value for the first character in `val`.")},
 
-	"md5": {stringBuiltin1(func(s string) (Datum, error) {
-		return NewDString(fmt.Sprintf("%x", md5.Sum([]byte(s)))), nil
-	}, TypeString, "Calculates the MD5 hash value of `val`.")},
+	"md5": hashBuiltin(
+		func() hash.Hash { return md5.New() },
+		"Calculates the MD5 hash value of a set of values.",
+	),
 
-	"sha1": {stringBuiltin1(func(s string) (Datum, error) {
-		return NewDString(fmt.Sprintf("%x", sha1.Sum([]byte(s)))), nil
-	}, TypeString, "Calculates the SHA1 hash value of `val`.")},
+	"sha1": hashBuiltin(
+		func() hash.Hash { return sha1.New() },
+		"Calculates the SHA1 hash value of a set of values.",
+	),
 
-	"sha256": {stringBuiltin1(func(s string) (Datum, error) {
-		return NewDString(fmt.Sprintf("%x", sha256.Sum256([]byte(s)))), nil
-	}, TypeString, "Calculates the SHA256 hash value of `val`.")},
+	"sha256": hashBuiltin(
+		func() hash.Hash { return sha256.New() },
+		"Calculates the SHA256 hash value of a set of values.",
+	),
+
+	"sha512": hashBuiltin(
+		func() hash.Hash { return sha512.New() },
+		"Calculates the SHA512 hash value of a set of values.",
+	),
+
+	"fnv32": hash32Builtin(
+		func() hash.Hash32 { return fnv.New32() },
+		"Calculates the 32-bit FNV-1 hash value of a set of values.",
+	),
+
+	"fnv32a": hash32Builtin(
+		func() hash.Hash32 { return fnv.New32a() },
+		"Calculates the 32-bit FNV-1a hash value of a set of values.",
+	),
+
+	"fnv64": hash64Builtin(
+		func() hash.Hash64 { return fnv.New64() },
+		"Calculates the 64-bit FNV-1 hash value of a set of values.",
+	),
+
+	"fnv64a": hash64Builtin(
+		func() hash.Hash64 { return fnv.New64a() },
+		"Calculates the 64-bit FNV-1a hash value of a set of values.",
+	),
+
+	"crc32ieee": hash32Builtin(
+		func() hash.Hash32 { return crc32.New(crc32.IEEETable) },
+		"Calculates the CRC-32 hash using the IEEE polynomial.",
+	),
+
+	"crc32c": hash32Builtin(
+		func() hash.Hash32 { return crc32.New(crc32.MakeTable(crc32.Castagnoli)) },
+		"Calculates the CRC-32 hash using the Castagnoli polynomial.",
+	),
 
 	"to_hex": {
 		Builtin{
@@ -467,13 +522,22 @@ var Builtins = map[string][]Builtin{
 			},
 			Info: "Converts `val` to its hexadecimal representation.",
 		},
+		Builtin{
+			Types:      ArgTypes{{"val", TypeBytes}},
+			ReturnType: fixedReturnType(TypeString),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				bytes := *(args[0].(*DBytes))
+				return NewDString(fmt.Sprintf("%x", []byte(bytes))), nil
+			},
+			Info: "Converts `val` to its hexadecimal representation.",
+		},
 	},
 
 	// The SQL parser coerces POSITION to STRPOS.
 	"strpos": {stringBuiltin2("input", "find", func(s, substring string) (Datum, error) {
 		index := strings.Index(s, substring)
 		if index < 0 {
-			return NewDInt(0), nil
+			return DZero, nil
 		}
 
 		return NewDInt(DInt(utf8.RuneCountInString(s[:index]) + 1)), nil
@@ -814,7 +878,7 @@ var Builtins = map[string][]Builtin{
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				fromTime := args[0].(*DTimestamp).Time
 				format := string(MustBeDString(args[1]))
-				t, err := timeutil.Strftime(fromTime, format)
+				t, err := strtime.Strftime(fromTime, format)
 				if err != nil {
 					return nil, err
 				}
@@ -829,7 +893,7 @@ var Builtins = map[string][]Builtin{
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				fromTime := time.Unix(int64(*args[0].(*DDate))*secondsInDay, 0).UTC()
 				format := string(MustBeDString(args[1]))
-				t, err := timeutil.Strftime(fromTime, format)
+				t, err := strtime.Strftime(fromTime, format)
 				if err != nil {
 					return nil, err
 				}
@@ -844,7 +908,7 @@ var Builtins = map[string][]Builtin{
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
 				fromTime := args[0].(*DTimestampTZ).Time
 				format := string(MustBeDString(args[1]))
-				t, err := timeutil.Strftime(fromTime, format)
+				t, err := strtime.Strftime(fromTime, format)
 				if err != nil {
 					return nil, err
 				}
@@ -857,12 +921,12 @@ var Builtins = map[string][]Builtin{
 
 	"experimental_strptime": {
 		Builtin{
-			Types:      ArgTypes{{"format", TypeString}, {"input", TypeString}},
+			Types:      ArgTypes{{"input", TypeString}, {"format", TypeString}},
 			ReturnType: fixedReturnType(TypeTimestampTZ),
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
-				format := string(MustBeDString(args[0]))
-				toParse := string(MustBeDString(args[1]))
-				t, err := timeutil.Strptime(format, toParse)
+				toParse := string(MustBeDString(args[0]))
+				format := string(MustBeDString(args[1]))
+				t, err := strtime.Strptime(toParse, format)
 				if err != nil {
 					return nil, err
 				}
@@ -875,9 +939,8 @@ var Builtins = map[string][]Builtin{
 
 	"age": {
 		Builtin{
-			Types:        ArgTypes{{"val", TypeTimestampTZ}},
-			ReturnType:   fixedReturnType(TypeInterval),
-			ctxDependent: true,
+			Types:      ArgTypes{{"val", TypeTimestampTZ}},
+			ReturnType: fixedReturnType(TypeInterval),
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 				return timestampMinusBinOp.fn(ctx, ctx.GetTxnTimestamp(time.Microsecond), args[0])
 			},
@@ -895,9 +958,8 @@ var Builtins = map[string][]Builtin{
 
 	"current_date": {
 		Builtin{
-			Types:        ArgTypes{},
-			ReturnType:   fixedReturnType(TypeDate),
-			ctxDependent: true,
+			Types:      ArgTypes{},
+			ReturnType: fixedReturnType(TypeDate),
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 				t := ctx.GetTxnTimestamp(time.Microsecond).Time
 				return NewDDateFromTime(t, ctx.GetLocation()), nil
@@ -916,17 +978,15 @@ var Builtins = map[string][]Builtin{
 			ReturnType:        fixedReturnType(TypeTimestampTZ),
 			preferredOverload: true,
 			impure:            true,
-			ctxDependent:      true,
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 				return MakeDTimestampTZ(ctx.GetStmtTimestamp(), time.Microsecond), nil
 			},
 			Info: "Returns the current statement's timestamp.",
 		},
 		Builtin{
-			Types:        ArgTypes{},
-			ReturnType:   fixedReturnType(TypeTimestamp),
-			impure:       true,
-			ctxDependent: true,
+			Types:      ArgTypes{},
+			ReturnType: fixedReturnType(TypeTimestamp),
+			impure:     true,
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 				return MakeDTimestamp(ctx.GetStmtTimestamp(), time.Microsecond), nil
 			},
@@ -936,11 +996,10 @@ var Builtins = map[string][]Builtin{
 
 	"cluster_logical_timestamp": {
 		Builtin{
-			Types:        ArgTypes{},
-			ReturnType:   fixedReturnType(TypeDecimal),
-			category:     categorySystemInfo,
-			impure:       true,
-			ctxDependent: true,
+			Types:      ArgTypes{},
+			ReturnType: fixedReturnType(TypeDecimal),
+			category:   categorySystemInfo,
+			impure:     true,
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 				return ctx.GetClusterTimestamp(), nil
 			},
@@ -1171,6 +1230,27 @@ var Builtins = map[string][]Builtin{
 		}, "Calculates the largest integer not greater than `val`."),
 	},
 
+	"isnan": {
+		Builtin{
+			// Can't use floatBuiltin1 here because this one returns
+			// a boolean.
+			Types:      ArgTypes{{"val", TypeFloat}},
+			ReturnType: fixedReturnType(TypeBool),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				return MakeDBool(DBool(isNaN(args[0]))), nil
+			},
+			Info: "Returns true if `val` is NaN, false otherwise.",
+		},
+		Builtin{
+			Types:      ArgTypes{{"val", TypeDecimal}},
+			ReturnType: fixedReturnType(TypeBool),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				return MakeDBool(DBool(isNaN(args[0]))), nil
+			},
+			Info: "Returns true if `val` is NaN, false otherwise.",
+		},
+	},
+
 	"ln": {
 		floatBuiltin1(func(x float64) (Datum, error) {
 			return NewDFloat(DFloat(math.Log(x))), nil
@@ -1234,7 +1314,7 @@ var Builtins = map[string][]Builtin{
 
 	"round": {
 		floatBuiltin1(func(x float64) (Datum, error) {
-			return round(x, 0)
+			return NewDFloat(DFloat(round(x))), nil
 		}, "Rounds `val` to the nearest integer using half to even (banker's) rounding."),
 		decimalBuiltin1(func(x *apd.Decimal) (Datum, error) {
 			return roundDecimal(x, 0)
@@ -1244,7 +1324,25 @@ var Builtins = map[string][]Builtin{
 			Types:      ArgTypes{{"input", TypeFloat}, {"decimal_accuracy", TypeInt}},
 			ReturnType: fixedReturnType(TypeFloat),
 			fn: func(_ *EvalContext, args Datums) (Datum, error) {
-				return round(float64(*args[0].(*DFloat)), int64(MustBeDInt(args[1])))
+				var x apd.Decimal
+				if _, err := x.SetFloat64(float64(*args[0].(*DFloat))); err != nil {
+					return nil, err
+				}
+
+				// TODO(mjibson): make sure this fits in an int32.
+				scale := int32(MustBeDInt(args[1]))
+
+				var d apd.Decimal
+				if _, err := RoundCtx.Quantize(&d, &x, -scale); err != nil {
+					return nil, err
+				}
+
+				f, err := d.Float64()
+				if err != nil {
+					return nil, err
+				}
+
+				return NewDFloat(DFloat(f)), nil
 			},
 			Info: "Keeps `decimal_accuracy` number of figures to the right of the zero position " +
 				" in `input` using half to even (banker's) rounding.",
@@ -1295,7 +1393,7 @@ var Builtins = map[string][]Builtin{
 				case x < 0:
 					return NewDInt(-1), nil
 				case x == 0:
-					return NewDInt(0), nil
+					return DZero, nil
 				}
 				return NewDInt(1), nil
 			},
@@ -1339,6 +1437,36 @@ var Builtins = map[string][]Builtin{
 			x.Modf(&dd.Decimal, frac)
 			return dd, nil
 		}, "Truncates the decimal values of `val`."),
+	},
+
+	"to_english": {
+		Builtin{
+			Types:      ArgTypes{{"val", TypeInt}},
+			ReturnType: fixedReturnType(TypeString),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				val := int(*args[0].(*DInt))
+				var buf bytes.Buffer
+				if val < 0 {
+					buf.WriteString("minus-")
+					val = -val
+				}
+				var digits []string
+				digits = append(digits, digitNames[val%10])
+				for val > 9 {
+					val /= 10
+					digits = append(digits, digitNames[val%10])
+				}
+				for i := len(digits) - 1; i >= 0; i-- {
+					if i < len(digits)-1 {
+						buf.WriteByte('-')
+					}
+					buf.WriteString(digits[i])
+				}
+				return NewDString(buf.String()), nil
+			},
+			category: categoryString,
+			Info:     "This function enunciates the value of its argument using English cardinals.",
+		},
 	},
 
 	// Array functions.
@@ -1442,10 +1570,9 @@ var Builtins = map[string][]Builtin{
 	// and the session's database search path.
 	"current_schemas": {
 		Builtin{
-			Types:        ArgTypes{{"include_pg_catalog", TypeBool}},
-			ReturnType:   fixedReturnType(TypeStringArray),
-			category:     categorySystemInfo,
-			ctxDependent: true,
+			Types:      ArgTypes{{"include_pg_catalog", TypeBool}},
+			ReturnType: fixedReturnType(TypeStringArray),
+			category:   categorySystemInfo,
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 				includePgCatalog := *(args[0].(*DBool))
 				schemas := NewDArray(TypeString)
@@ -1468,20 +1595,70 @@ var Builtins = map[string][]Builtin{
 		},
 	},
 
+	"crdb_internal.force_internal_error": {
+		Builtin{
+			Types:      ArgTypes{{"msg", TypeString}},
+			ReturnType: fixedReturnType(TypeInt),
+			impure:     true,
+			privileged: true,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				msg := string(*args[0].(*DString))
+				return nil, pgerror.NewError(pgerror.CodeInternalError, msg)
+			},
+			category: categorySystemInfo,
+			Info:     "This function is used only by CockroachDB's developers for testing purposes.",
+		},
+	},
+
+	"crdb_internal.force_panic": {
+		Builtin{
+			Types:      ArgTypes{{"msg", TypeString}},
+			ReturnType: fixedReturnType(TypeInt),
+			impure:     true,
+			privileged: true,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				msg := string(*args[0].(*DString))
+				panic(msg)
+			},
+			category: categorySystemInfo,
+			Info:     "This function is used only by CockroachDB's developers for testing purposes.",
+		},
+	},
+
+	"crdb_internal.force_log_fatal": {
+		Builtin{
+			Types:      ArgTypes{{"msg", TypeString}},
+			ReturnType: fixedReturnType(TypeInt),
+			impure:     true,
+			privileged: true,
+			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
+				msg := string(*args[0].(*DString))
+				log.Fatal(ctx.Ctx(), msg)
+				return nil, nil
+			},
+			category: categorySystemInfo,
+			Info:     "This function is used only by CockroachDB's developers for testing purposes.",
+		},
+	},
+
 	"crdb_internal.force_retry": {
 		Builtin{
 			Types:      ArgTypes{{"val", TypeInterval}},
 			ReturnType: fixedReturnType(TypeInt),
 			impure:     true,
+			privileged: true,
 			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 				minDuration := args[0].(*DInterval).Duration
 				elapsed := duration.Duration{
 					Nanos: int64(ctx.stmtTimestamp.Sub(ctx.txnTimestamp)),
 				}
 				if elapsed.Compare(minDuration) < 0 {
-					return nil, roachpb.NewRetryableTxnError("forced by crdb_internal.force_retry()", nil /* txnID */)
+					return nil, roachpb.NewHandledRetryableTxnError(
+						"forced by crdb_internal.force_retry()",
+						nil, /* txnID */
+						roachpb.Transaction{})
 				}
-				return NewDInt(0), nil
+				return DZero, nil
 			},
 			category: categorySystemInfo,
 			Info:     "This function is used only by CockroachDB's developers for testing purposes.",
@@ -1503,227 +1680,13 @@ var Builtins = map[string][]Builtin{
 					if err != nil {
 						return nil, err
 					}
-					return nil, roachpb.NewRetryableTxnError("forced by crdb_internal.force_retry()", &uuid)
+					return nil, roachpb.NewHandledRetryableTxnError(
+						"forced by crdb_internal.force_retry()", &uuid, roachpb.Transaction{})
 				}
-				return NewDInt(0), nil
+				return DZero, nil
 			},
 			category: categorySystemInfo,
 			Info:     "This function is used only by CockroachDB's developers for testing purposes.",
-		},
-	},
-
-	// pg_catalog functions.
-	// See https://www.postgresql.org/docs/9.6/static/functions-info.html.
-	"pg_backend_pid": {
-		Builtin{
-			Types:      ArgTypes{},
-			ReturnType: fixedReturnType(TypeInt),
-			fn: func(_ *EvalContext, _ Datums) (Datum, error) {
-				return NewDInt(-1), nil
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility with PostgreSQL.",
-		},
-	},
-
-	// Postgres defines pg_get_expr as a function that "decompiles the internal form
-	// of an expression", which is provided in the pg_node_tree type. In Cockroach's
-	// pg_catalog implementation, we populate all pg_node_tree columns with the
-	// corresponding expression as a string, which means that this function can simply
-	// return the first argument directly. It also means we can ignore the second and
-	// optional third argument.
-	"pg_get_expr": {
-		Builtin{
-			Types: ArgTypes{
-				{"pg_node_tree", TypeString},
-				{"relation_oid", TypeOid},
-			},
-			ReturnType: fixedReturnType(TypeString),
-			fn: func(_ *EvalContext, args Datums) (Datum, error) {
-				return args[0], nil
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility with PostgreSQL.",
-		},
-		Builtin{
-			Types: ArgTypes{
-				{"pg_node_tree", TypeString},
-				{"relation_oid", TypeOid},
-				{"pretty_bool", TypeBool},
-			},
-			ReturnType: fixedReturnType(TypeString),
-			fn: func(_ *EvalContext, args Datums) (Datum, error) {
-				return args[0], nil
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility with PostgreSQL.",
-		},
-	},
-
-	// pg_get_indexdef functions like SHOW CREATE INDEX would if we supported that
-	// statement.
-	"pg_get_indexdef": {
-		Builtin{
-			Types: ArgTypes{
-				{"index_oid", TypeOid},
-			},
-			ReturnType: fixedReturnType(TypeString),
-			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
-				r, err := ctx.Planner.QueryRow(
-					ctx.Ctx(), "SELECT indexdef FROM pg_catalog.pg_indexes WHERE crdb_oid=$1", args[0])
-				if err != nil {
-					return nil, err
-				}
-				if len(r) == 0 {
-					return nil, fmt.Errorf("unknown index (OID=%s)", args[0])
-				}
-				return r[0], nil
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility with PostgreSQL.",
-		},
-		// The other overload for this function, pg_get_indexdef(index_oid,
-		// column_no, pretty_bool), is unimplemented, because it isn't used by
-		// supported ORMs.
-	},
-
-	"pg_typeof": {
-		// TODO(knz): This is a proof-of-concept until TypeAny works
-		// properly.
-		Builtin{
-			Types:      ArgTypes{{"val", TypeAny}},
-			ReturnType: fixedReturnType(TypeString),
-			fn: func(_ *EvalContext, args Datums) (Datum, error) {
-				return NewDString(args[0].ResolvedType().String()), nil
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility with PostgreSQL.",
-		},
-	},
-	"pg_get_userbyid": {
-		Builtin{
-			Types: ArgTypes{
-				{"role_oid", TypeOid},
-			},
-			ReturnType: fixedReturnType(TypeString),
-			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
-				oid := args[0]
-				t, err := ctx.Planner.QueryRow(
-					ctx.Ctx(), "SELECT rolname FROM pg_catalog.pg_roles WHERE oid=$1", oid)
-				if err != nil {
-					return nil, err
-				}
-				if len(t) == 0 {
-					return NewDString(fmt.Sprintf("unknown (OID=%s)", args[0])), nil
-				}
-				return t[0], nil
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility with PostgreSQL.",
-		},
-	},
-	"format_type": {
-		Builtin{
-			// TODO(jordan) typemod should be a Nullable TypeInt when supported.
-			Types:      ArgTypes{{"type_oid", TypeOid}, {"typemod", TypeInt}},
-			ReturnType: fixedReturnType(TypeString),
-			fn: func(ctx *EvalContext, args Datums) (Datum, error) {
-				typ, ok := OidToType[oid.Oid(int(args[0].(*DOid).DInt))]
-				if !ok {
-					return NewDString(fmt.Sprintf("unknown (OID=%s)", args[0])), nil
-				}
-				return NewDString(typ.SQLName()), nil
-			},
-			category: categoryCompatibility,
-			Info: "Returns the SQL name of a data type that is " +
-				"identified by its type OID and possibly a type modifier. " +
-				"Currently, the type modifier is ignored.",
-		},
-	},
-	"col_description": {
-		Builtin{
-			Types:      ArgTypes{{"table_oid", TypeOid}, {"column_number", TypeInt}},
-			ReturnType: fixedReturnType(TypeString),
-			fn: func(_ *EvalContext, _ Datums) (Datum, error) {
-				return DNull, nil
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility with PostgreSQL.",
-		},
-	},
-	"obj_description": {
-		Builtin{
-			Types:      ArgTypes{{"object_oid", TypeOid}},
-			ReturnType: fixedReturnType(TypeString),
-			fn: func(_ *EvalContext, _ Datums) (Datum, error) {
-				return DNull, nil
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility with PostgreSQL.",
-		},
-		Builtin{
-			Types:      ArgTypes{{"object_oid", TypeOid}, {"catalog_name", TypeString}},
-			ReturnType: fixedReturnType(TypeString),
-			fn: func(_ *EvalContext, _ Datums) (Datum, error) {
-				return DNull, nil
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility.",
-		},
-	},
-	"oid": {
-		Builtin{
-			Types:      ArgTypes{{"int", TypeInt}},
-			ReturnType: fixedReturnType(TypeOid),
-			fn: func(_ *EvalContext, args Datums) (Datum, error) {
-				return NewDOid(*args[0].(*DInt)), nil
-			},
-			category: categoryCompatibility,
-			Info:     "Converts an integer to an OID.",
-		},
-	},
-	"shobj_description": {
-		Builtin{
-			Types:      ArgTypes{{"object_oid", TypeOid}, {"catalog_name", TypeString}},
-			ReturnType: fixedReturnType(TypeString),
-			fn: func(_ *EvalContext, _ Datums) (Datum, error) {
-				return DNull, nil
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility with PostgreSQL.",
-		},
-	},
-	"pg_try_advisory_lock": {
-		Builtin{
-			Types:      ArgTypes{{"int", TypeInt}},
-			ReturnType: fixedReturnType(TypeBool),
-			fn: func(_ *EvalContext, _ Datums) (Datum, error) {
-				return DBoolTrue, nil
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility.",
-		},
-	},
-	"pg_advisory_unlock": {
-		Builtin{
-			Types:      ArgTypes{{"int", TypeInt}},
-			ReturnType: fixedReturnType(TypeBool),
-			fn: func(_ *EvalContext, _ Datums) (Datum, error) {
-				return DBoolTrue, nil
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility.",
-		},
-	},
-	"array_in": {
-		Builtin{
-			Types:      ArgTypes{{"string", TypeString}, {"element_oid", TypeInt}, {"element_typmod", TypeInt}},
-			ReturnType: fixedReturnType(TypeString),
-			fn: func(_ *EvalContext, _ Datums) (Datum, error) {
-				return nil, errors.New("unimplemented")
-			},
-			category: categoryCompatibility,
-			Info:     "Not usable; exposed only for ORM compatibility with PostgreSQL.",
 		},
 	},
 }
@@ -1846,17 +1809,15 @@ var txnTSImpl = []Builtin{
 		ReturnType:        fixedReturnType(TypeTimestampTZ),
 		preferredOverload: true,
 		impure:            true,
-		ctxDependent:      true,
 		fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 			return ctx.GetTxnTimestamp(time.Microsecond), nil
 		},
 		Info: "Returns the current transaction's timestamp.",
 	},
 	{
-		Types:        ArgTypes{},
-		ReturnType:   fixedReturnType(TypeTimestamp),
-		impure:       true,
-		ctxDependent: true,
+		Types:      ArgTypes{},
+		ReturnType: fixedReturnType(TypeTimestamp),
+		impure:     true,
 		fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 			return ctx.GetTxnTimestampNoZone(time.Microsecond), nil
 		},
@@ -1880,9 +1841,7 @@ var powImpls = []Builtin{
 		},
 		ReturnType: fixedReturnType(TypeInt),
 		fn: func(_ *EvalContext, args Datums) (Datum, error) {
-			x := int64(MustBeDInt(args[0]))
-			y := int64(MustBeDInt(args[1]))
-			return NewDInt(DInt(intPow(x, y))), nil
+			return intPow(MustBeDInt(args[0]), MustBeDInt(args[1]))
 		},
 		Info: "Calculates `x`^`y`.",
 	},
@@ -2001,6 +1960,97 @@ func bytesBuiltin1(f func(string) (Datum, error), returnType Type, info string) 
 			return f(string(*args[0].(*DBytes)))
 		},
 		Info: info,
+	}
+}
+
+func feedHash(h hash.Hash, args Datums) {
+	for _, datum := range args {
+		if datum == DNull {
+			continue
+		}
+		var buf string
+		if d, ok := datum.(*DBytes); ok {
+			buf = string(*d)
+		} else {
+			buf = string(MustBeDString(datum))
+		}
+		if _, err := h.Write([]byte(buf)); err != nil {
+			panic(errors.Wrap(err, `"It never returns an error." -- https://golang.org/pkg/hash`))
+		}
+	}
+}
+
+func hashBuiltin(newHash func() hash.Hash, info string) []Builtin {
+	return []Builtin{
+		{
+			Types:      VariadicType{TypeString},
+			ReturnType: fixedReturnType(TypeString),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				h := newHash()
+				feedHash(h, args)
+				return NewDString(fmt.Sprintf("%x", h.Sum(nil))), nil
+			},
+			Info: info,
+		},
+		{
+			Types:      VariadicType{TypeBytes},
+			ReturnType: fixedReturnType(TypeString),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				h := newHash()
+				feedHash(h, args)
+				return NewDString(fmt.Sprintf("%x", h.Sum(nil))), nil
+			},
+			Info: info,
+		},
+	}
+}
+
+func hash32Builtin(newHash func() hash.Hash32, info string) []Builtin {
+	return []Builtin{
+		{
+			Types:      VariadicType{TypeString},
+			ReturnType: fixedReturnType(TypeInt),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				h := newHash()
+				feedHash(h, args)
+				return NewDInt(DInt(h.Sum32())), nil
+			},
+			Info: info,
+		},
+		{
+			Types:      VariadicType{TypeBytes},
+			ReturnType: fixedReturnType(TypeInt),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				h := newHash()
+				feedHash(h, args)
+				return NewDInt(DInt(h.Sum32())), nil
+			},
+			Info: info,
+		},
+	}
+}
+func hash64Builtin(newHash func() hash.Hash64, info string) []Builtin {
+	return []Builtin{
+		{
+			Types:      VariadicType{TypeString},
+			ReturnType: fixedReturnType(TypeInt),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				h := newHash()
+				feedHash(h, args)
+				return NewDInt(DInt(h.Sum64())), nil
+			},
+			Info: info,
+		},
+		{
+			Types:      VariadicType{TypeBytes},
+			ReturnType: fixedReturnType(TypeInt),
+			fn: func(_ *EvalContext, args Datums) (Datum, error) {
+				h := newHash()
+				feedHash(h, args)
+				return NewDInt(DInt(h.Sum64())), nil
+			},
+			Info: info,
+		},
 	}
 }
 
@@ -2128,7 +2178,7 @@ var flagToNotByte = map[syntax.Flags]byte{
 // http://www.postgresql.org/docs/9.0/static/functions-matching.html#POSIX-EMBEDDED-OPTIONS-TABLE.
 // It then returns an adjusted regexp pattern.
 func regexpEvalFlags(pattern, sqlFlags string) (string, error) {
-	flags := syntax.DotNL
+	flags := syntax.DotNL | syntax.OneLine
 
 	for _, sqlFlag := range sqlFlags {
 		switch sqlFlag {
@@ -2139,12 +2189,12 @@ func regexpEvalFlags(pattern, sqlFlags string) (string, error) {
 		case 'c':
 			flags &^= syntax.FoldCase
 		case 's':
-			flags |= syntax.DotNL
+			flags &^= syntax.DotNL
 		case 'm', 'n':
 			flags &^= syntax.DotNL
-			flags |= syntax.OneLine
+			flags &^= syntax.OneLine
 		case 'p':
-			flags |= syntax.DotNL
+			flags &^= syntax.DotNL
 			flags |= syntax.OneLine
 		case 'w':
 			flags |= syntax.DotNL
@@ -2192,36 +2242,72 @@ func overlay(s, to string, pos, size int) (Datum, error) {
 	return NewDString(string(runes[:pos]) + to + string(runes[after:])), nil
 }
 
-func round(x float64, n int64) (Datum, error) {
-	pow := math.Pow(10, float64(n))
-
-	if pow == 0 {
-		// Rounding to so many digits on the left that we're underflowing.
-		// Avoid a NaN below.
-		return NewDFloat(DFloat(0)), nil
-	}
-	if math.Abs(x*pow) > 1e17 {
-		// Rounding touches decimals below float precision; the operation
-		// is a no-op.
-		return NewDFloat(DFloat(x)), nil
+// Transcribed from Postgres' src/port/rint.c, with c-style comments preserved
+// for ease of mapping.
+//
+// https://github.com/postgres/postgres/blob/REL9_6_3/src/port/rint.c
+func round(x float64) float64 {
+	/* Per POSIX, NaNs must be returned unchanged. */
+	if math.IsNaN(x) {
+		return x
 	}
 
-	v, frac := math.Modf(x * pow)
-	// The following computation implements unbiased rounding, also
-	// called bankers' rounding. It ensures that values that fall
-	// exactly between two integers get equal chance to be rounded up or
-	// down.
-	if x > 0.0 {
-		if frac > 0.5 || (frac == 0.5 && uint64(v)%2 != 0) {
-			v += 1.0
-		}
-	} else {
-		if frac < -0.5 || (frac == -0.5 && uint64(v)%2 != 0) {
-			v -= 1.0
-		}
+	/* Both positive and negative zero should be returned unchanged. */
+	if x == 0.0 {
+		return x
 	}
 
-	return NewDFloat(DFloat(v / pow)), nil
+	roundFn := math.Ceil
+	if math.Signbit(x) {
+		roundFn = math.Floor
+	}
+
+	/*
+	 * Subtracting 0.5 from a number very close to -0.5 can round to
+	 * exactly -1.0, producing incorrect results, so we take the opposite
+	 * approach: add 0.5 to the negative number, so that it goes closer to
+	 * zero (or at most to +0.5, which is dealt with next), avoiding the
+	 * precision issue.
+	 */
+	xOrig := x
+	x -= math.Copysign(0.5, x)
+
+	/*
+	 * Be careful to return minus zero when input+0.5 >= 0, as that's what
+	 * rint() should return with negative input.
+	 */
+	if x == 0 || math.Signbit(x) != math.Signbit(xOrig) {
+		return math.Copysign(0.0, xOrig)
+	}
+
+	/*
+	 * For very big numbers the input may have no decimals.  That case is
+	 * detected by testing x+0.5 == x+1.0; if that happens, the input is
+	 * returned unchanged.  This also covers the case of minus infinity.
+	 */
+	if x == xOrig-math.Copysign(1.0, x) {
+		return xOrig
+	}
+
+	/* Otherwise produce a rounded estimate. */
+	r := roundFn(x)
+
+	/*
+	 * If the rounding did not produce exactly input+0.5 then we're done.
+	 */
+	if r != x {
+		return r
+	}
+
+	/*
+	 * The original fractional part was exactly 0.5 (since
+	 * floor(input+0.5) == input+0.5).  We need to round to nearest even.
+	 * Dividing input+0.5 by 2, taking the floor and multiplying by 2
+	 * yields the closest even number.  This part assumes that division by
+	 * 2 is exact, which should be OK because underflow is impossible
+	 * here: x is an integer.
+	 */
+	return roundFn(x*0.5) * 2.0
 }
 
 func roundDecimal(x *apd.Decimal, n int32) (Datum, error) {
@@ -2253,23 +2339,18 @@ func pickFromTuple(ctx *EvalContext, greatest bool, args Datums) (Datum, error) 
 	return g, nil
 }
 
-func intPow(x, y int64) int64 {
-	// Calculate x^y by squaring. See:
-	// https://en.wikipedia.org/wiki/Exponentiation_by_squaring
-	// special case 1: x == 0 (result 1 if y = 0, 0 otherwise)
-	// special case 2: y < 0 (result 0)
-	if y < 0 {
-		return 0
+func intPow(x, y DInt) (*DInt, error) {
+	xd := apd.New(int64(x), 0)
+	yd := apd.New(int64(y), 0)
+	_, err := DecimalCtx.Pow(xd, xd, yd)
+	if err != nil {
+		return nil, err
 	}
-	var ret int64 = 1
-	for y > 0 {
-		if y&1 == 1 {
-			ret *= x
-		}
-		x *= x
-		y >>= 1
+	i, err := xd.Int64()
+	if err != nil {
+		return nil, errIntOutOfRange
 	}
-	return ret
+	return NewDInt(DInt(i)), nil
 }
 
 var uniqueIntState struct {
@@ -2346,7 +2427,9 @@ func arrayLower(arr *DArray, dim int64) Datum {
 	return arrayLower(a, dim-1)
 }
 
-func extractStringFromTimestamp(_ *EvalContext, fromTime time.Time, timeSpan string) (Datum, error) {
+func extractStringFromTimestamp(
+	_ *EvalContext, fromTime time.Time, timeSpan string,
+) (Datum, error) {
 	switch timeSpan {
 	case "year", "years":
 		return NewDInt(DInt(fromTime.Year())), nil

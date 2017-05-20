@@ -19,8 +19,13 @@ import (
 	"fmt"
 	"math"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/sql/mon"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/pkg/errors"
 )
 
 func initAggregateBuiltins() {
@@ -58,12 +63,17 @@ func initAggregateBuiltins() {
 // AggregateFunc accumulates the result of a function of a Datum.
 type AggregateFunc interface {
 	// Add accumulates the passed datum into the AggregateFunc.
-	Add(*EvalContext, Datum)
+	Add(context.Context, Datum) error
 
 	// Result returns the current value of the accumulation. This value
 	// will be a deep copy of any AggregateFunc internal state, so that
 	// it will not be mutated by additional calls to Add.
-	Result() Datum
+	Result() (Datum, error)
+
+	// Close closes out the AggregateFunc and allows it to release any memory it
+	// requested during aggregation, and must be called upon completion of the
+	// aggregation.
+	Close(context.Context)
 }
 
 // Aggregates are a special class of builtin functions that are wrapped
@@ -112,7 +122,7 @@ var Aggregates = map[string][]Builtin{
 	},
 
 	"concat_agg": {
-		// TODO(knz) When CockroachDB supports STRING_AGG, CONCAT_AGG(X)
+		// TODO(knz): When CockroachDB supports STRING_AGG, CONCAT_AGG(X)
 		// should be substituted to STRING_AGG(X, '') and executed as
 		// such (no need for a separate implementation).
 		makeAggBuiltin(TypeString, TypeString, newStringConcatAggregate,
@@ -170,14 +180,21 @@ var Aggregates = map[string][]Builtin{
 		makeAggBuiltin(TypeFloat, TypeFloat, newFloatStdDevAggregate,
 			"Calculates the standard deviation of the selected values."),
 	},
+
+	"xor_agg": {
+		makeAggBuiltin(TypeBytes, TypeBytes, newBytesXorAggregate,
+			"Calculates the bitwise XOR of the selected values."),
+		makeAggBuiltin(TypeInt, TypeInt, newIntXorAggregate,
+			"Calculates the bitwise XOR of the selected values."),
+	},
 }
 
-func makeAggBuiltin(in, ret Type, f func([]Type) AggregateFunc, info string) Builtin {
+func makeAggBuiltin(in, ret Type, f func([]Type, *EvalContext) AggregateFunc, info string) Builtin {
 	return makeAggBuiltinWithReturnType(in, fixedReturnType(ret), f, info)
 }
 
 func makeAggBuiltinWithReturnType(
-	in Type, retType returnTyper, f func([]Type) AggregateFunc, info string,
+	in Type, retType returnTyper, f func([]Type, *EvalContext) AggregateFunc, info string,
 ) Builtin {
 	return Builtin{
 		// See the comment about aggregate functions in the definitions
@@ -187,8 +204,8 @@ func makeAggBuiltinWithReturnType(
 		Types:         ArgTypes{{"arg", in}},
 		ReturnType:    retType,
 		AggregateFunc: f,
-		WindowFunc: func(params []Type) WindowFunc {
-			return newAggregateWindow(f(params))
+		WindowFunc: func(params []Type, evalCtx *EvalContext) WindowFunc {
+			return newAggregateWindow(f(params, evalCtx))
 		},
 		Info: info,
 	}
@@ -207,6 +224,9 @@ var _ AggregateFunc = &intVarianceAggregate{}
 var _ AggregateFunc = &floatVarianceAggregate{}
 var _ AggregateFunc = &decimalVarianceAggregate{}
 var _ AggregateFunc = &identAggregate{}
+var _ AggregateFunc = &concatAggregate{}
+var _ AggregateFunc = &bytesXorAggregate{}
+var _ AggregateFunc = &intXorAggregate{}
 
 // In order to render the unaggregated (i.e. grouped) fields, during aggregation,
 // the values for those fields have to be stored for each bucket.
@@ -218,53 +238,75 @@ type identAggregate struct {
 	val Datum
 }
 
-// IsIdentAggregate returns true for identAggregate.
-func IsIdentAggregate(f AggregateFunc) bool {
-	_, ok := f.(*identAggregate)
-	return ok
-}
-
 // NewIdentAggregate returns an identAggregate (see comment on struct).
-func NewIdentAggregate() AggregateFunc {
+func NewIdentAggregate(*EvalContext) AggregateFunc {
 	return &identAggregate{}
 }
 
 // Add sets the value to the passed datum.
-func (a *identAggregate) Add(_ *EvalContext, datum Datum) {
-	a.val = datum
+func (a *identAggregate) Add(_ context.Context, datum Datum) error {
+	// If we see at least one non-NULL value, ignore any NULLs.
+	// This is used in distributed multi-stage aggregations, where a local stage
+	// with multiple (parallel) instances feeds into a final stage. If some of the
+	// instances see no rows, they emit a NULL; the final IDENT aggregator needs
+	// to ignore these.
+	// TODO(radu): this - along with other hacks like special-handling of the nil
+	// result in (*aggregateGroupHolder).Eval - illustrates why IDENT as an
+	// aggregator is not a sound. We should remove this concept and handle GROUP
+	// BY columns separately in the groupNode and the aggregator processor
+	// (#12525).
+	if a.val == nil || datum != DNull {
+		a.val = datum
+	}
+	return nil
 }
 
 // Result returns the value most recently passed to Add.
-func (a *identAggregate) Result() Datum {
+func (a *identAggregate) Result() (Datum, error) {
 	// It is significant that identAggregate returns nil, and not DNull,
 	// if no result was known via Add(). See
 	// sql.(*aggregateFuncHolder).Eval() for details.
-	return a.val
+	return a.val, nil
 }
+
+// Close is no-op in aggregates using constant space.
+func (a *identAggregate) Close(context.Context) {}
 
 type arrayAggregate struct {
 	arr *DArray
+	acc mon.BoundAccount
 }
 
-func newArrayAggregate(params []Type) AggregateFunc {
+func newArrayAggregate(params []Type, evalCtx *EvalContext) AggregateFunc {
 	return &arrayAggregate{
 		arr: NewDArray(params[0]),
+		acc: evalCtx.Mon.MakeBoundAccount(),
 	}
 }
 
 // Add accumulates the passed datum into the array.
-func (a *arrayAggregate) Add(_ *EvalContext, datum Datum) {
-	if err := a.arr.Append(datum); err != nil {
-		panic(fmt.Sprintf("error appending to array: %s", err))
+func (a *arrayAggregate) Add(ctx context.Context, datum Datum) error {
+	if err := a.acc.Grow(ctx, int64(datum.Size())); err != nil {
+		return err
 	}
+	if err := a.arr.Append(datum); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Result returns an array of all datums passed to Add.
-func (a *arrayAggregate) Result() Datum {
+func (a *arrayAggregate) Result() (Datum, error) {
 	if len(a.arr.Array) > 0 {
-		return a.arr
+		return a.arr, nil
 	}
-	return DNull
+	return DNull, nil
+}
+
+// Close allows the aggregate to release the memory it requested during
+// operation.
+func (a *arrayAggregate) Close(ctx context.Context) {
+	a.acc.Close(ctx)
 }
 
 type avgAggregate struct {
@@ -272,63 +314,72 @@ type avgAggregate struct {
 	count int
 }
 
-func newIntAvgAggregate(params []Type) AggregateFunc {
-	return &avgAggregate{agg: newIntSumAggregate(params)}
+func newIntAvgAggregate(params []Type, evalCtx *EvalContext) AggregateFunc {
+	return &avgAggregate{agg: newIntSumAggregate(params, evalCtx)}
 }
-func newFloatAvgAggregate(params []Type) AggregateFunc {
-	return &avgAggregate{agg: newFloatSumAggregate(params)}
+func newFloatAvgAggregate(params []Type, evalCtx *EvalContext) AggregateFunc {
+	return &avgAggregate{agg: newFloatSumAggregate(params, evalCtx)}
 }
-func newDecimalAvgAggregate(params []Type) AggregateFunc {
-	return &avgAggregate{agg: newDecimalSumAggregate(params)}
+func newDecimalAvgAggregate(params []Type, evalCtx *EvalContext) AggregateFunc {
+	return &avgAggregate{agg: newDecimalSumAggregate(params, evalCtx)}
 }
 
 // Add accumulates the passed datum into the average.
-func (a *avgAggregate) Add(ctx *EvalContext, datum Datum) {
+func (a *avgAggregate) Add(ctx context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
-	a.agg.Add(ctx, datum)
+	if err := a.agg.Add(ctx, datum); err != nil {
+		return err
+	}
 	a.count++
+	return nil
 }
 
 // Result returns the average of all datums passed to Add.
-func (a *avgAggregate) Result() Datum {
-	sum := a.agg.Result()
+func (a *avgAggregate) Result() (Datum, error) {
+	sum, err := a.agg.Result()
+	if err != nil {
+		return nil, err
+	}
 	if sum == DNull {
-		return sum
+		return sum, nil
 	}
 	switch t := sum.(type) {
 	case *DFloat:
-		return NewDFloat(*t / DFloat(a.count))
+		return NewDFloat(*t / DFloat(a.count)), nil
 	case *DDecimal:
 		count := apd.New(int64(a.count), 0)
 		_, err := DecimalCtx.Quo(&t.Decimal, &t.Decimal, count)
-		if err != nil {
-			// TODO(mjibson): see #13640
-			panic(err)
-		}
-		return t
+		return t, err
 	default:
-		panic(fmt.Sprintf("unexpected SUM result type: %s", t))
+		return nil, errors.Errorf("unexpected SUM result type: %s", t)
 	}
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *avgAggregate) Close(context.Context) {}
 
 type concatAggregate struct {
 	forBytes   bool
 	sawNonNull bool
 	result     bytes.Buffer
+	acc        mon.BoundAccount
 }
 
-func newBytesConcatAggregate(_ []Type) AggregateFunc {
-	return &concatAggregate{forBytes: true}
+func newBytesConcatAggregate(_ []Type, evalCtx *EvalContext) AggregateFunc {
+	return &concatAggregate{
+		forBytes: true,
+		acc:      evalCtx.Mon.MakeBoundAccount(),
+	}
 }
-func newStringConcatAggregate(_ []Type) AggregateFunc {
-	return &concatAggregate{}
+func newStringConcatAggregate(_ []Type, evalCtx *EvalContext) AggregateFunc {
+	return &concatAggregate{acc: evalCtx.Mon.MakeBoundAccount()}
 }
 
-func (a *concatAggregate) Add(_ *EvalContext, datum Datum) {
+func (a *concatAggregate) Add(ctx context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 	a.sawNonNull = true
 	var arg string
@@ -337,19 +388,29 @@ func (a *concatAggregate) Add(_ *EvalContext, datum Datum) {
 	} else {
 		arg = string(MustBeDString(datum))
 	}
+	if err := a.acc.Grow(ctx, int64(datum.Size())); err != nil {
+		return err
+	}
 	a.result.WriteString(arg)
+	return nil
 }
 
-func (a *concatAggregate) Result() Datum {
+func (a *concatAggregate) Result() (Datum, error) {
 	if !a.sawNonNull {
-		return DNull
+		return DNull, nil
 	}
 	if a.forBytes {
 		res := DBytes(a.result.String())
-		return &res
+		return &res, nil
 	}
 	res := DString(a.result.String())
-	return &res
+	return &res, nil
+}
+
+// Close allows the aggregate to release the memory it requested during
+// operation.
+func (a *concatAggregate) Close(ctx context.Context) {
+	a.acc.Close(ctx)
 }
 
 type boolAndAggregate struct {
@@ -357,162 +418,187 @@ type boolAndAggregate struct {
 	result     bool
 }
 
-func newBoolAndAggregate(_ []Type) AggregateFunc {
+func newBoolAndAggregate(_ []Type, _ *EvalContext) AggregateFunc {
 	return &boolAndAggregate{}
 }
 
-func (a *boolAndAggregate) Add(_ *EvalContext, datum Datum) {
+func (a *boolAndAggregate) Add(_ context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 	if !a.sawNonNull {
 		a.sawNonNull = true
 		a.result = true
 	}
 	a.result = a.result && bool(*datum.(*DBool))
+	return nil
 }
 
-func (a *boolAndAggregate) Result() Datum {
+func (a *boolAndAggregate) Result() (Datum, error) {
 	if !a.sawNonNull {
-		return DNull
+		return DNull, nil
 	}
-	return MakeDBool(DBool(a.result))
+	return MakeDBool(DBool(a.result)), nil
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *boolAndAggregate) Close(context.Context) {}
 
 type boolOrAggregate struct {
 	sawNonNull bool
 	result     bool
 }
 
-func newBoolOrAggregate(_ []Type) AggregateFunc {
+func newBoolOrAggregate(_ []Type, _ *EvalContext) AggregateFunc {
 	return &boolOrAggregate{}
 }
 
-func (a *boolOrAggregate) Add(_ *EvalContext, datum Datum) {
+func (a *boolOrAggregate) Add(_ context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 	a.sawNonNull = true
 	a.result = a.result || bool(*datum.(*DBool))
+	return nil
 }
 
-func (a *boolOrAggregate) Result() Datum {
+func (a *boolOrAggregate) Result() (Datum, error) {
 	if !a.sawNonNull {
-		return DNull
+		return DNull, nil
 	}
-	return MakeDBool(DBool(a.result))
+	return MakeDBool(DBool(a.result)), nil
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *boolOrAggregate) Close(context.Context) {}
 
 type countAggregate struct {
 	count int
 }
 
-func newCountAggregate(_ []Type) AggregateFunc {
+func newCountAggregate(_ []Type, _ *EvalContext) AggregateFunc {
 	return &countAggregate{}
 }
 
-func (a *countAggregate) Add(_ *EvalContext, datum Datum) {
+func (a *countAggregate) Add(_ context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 	a.count++
-	return
+	return nil
 }
 
-func (a *countAggregate) Result() Datum {
-	return NewDInt(DInt(a.count))
+func (a *countAggregate) Result() (Datum, error) {
+	return NewDInt(DInt(a.count)), nil
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *countAggregate) Close(context.Context) {}
 
 // MaxAggregate keeps track of the largest value passed to Add.
 type MaxAggregate struct {
-	max Datum
+	max     Datum
+	evalCtx *EvalContext
 }
 
-func newMaxAggregate(_ []Type) AggregateFunc {
-	return &MaxAggregate{}
+func newMaxAggregate(_ []Type, evalCtx *EvalContext) AggregateFunc {
+	return &MaxAggregate{evalCtx: evalCtx}
 }
 
 // Add sets the max to the larger of the current max or the passed datum.
-func (a *MaxAggregate) Add(ctx *EvalContext, datum Datum) {
+func (a *MaxAggregate) Add(_ context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 	if a.max == nil {
 		a.max = datum
-		return
+		return nil
 	}
-	c := a.max.Compare(ctx, datum)
+	c := a.max.Compare(a.evalCtx, datum)
 	if c < 0 {
 		a.max = datum
 	}
+	return nil
 }
 
 // Result returns the largest value passed to Add.
-func (a *MaxAggregate) Result() Datum {
+func (a *MaxAggregate) Result() (Datum, error) {
 	if a.max == nil {
-		return DNull
+		return DNull, nil
 	}
-	return a.max
+	return a.max, nil
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *MaxAggregate) Close(context.Context) {}
 
 // MinAggregate keeps track of the smallest value passed to Add.
 type MinAggregate struct {
-	min Datum
+	min     Datum
+	evalCtx *EvalContext
 }
 
-func newMinAggregate(_ []Type) AggregateFunc {
-	return &MinAggregate{}
+func newMinAggregate(_ []Type, evalCtx *EvalContext) AggregateFunc {
+	return &MinAggregate{evalCtx: evalCtx}
 }
 
 // Add sets the min to the smaller of the current min or the passed datum.
-func (a *MinAggregate) Add(ctx *EvalContext, datum Datum) {
+func (a *MinAggregate) Add(_ context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 	if a.min == nil {
 		a.min = datum
-		return
+		return nil
 	}
-	c := a.min.Compare(ctx, datum)
+	c := a.min.Compare(a.evalCtx, datum)
 	if c > 0 {
 		a.min = datum
 	}
+	return nil
 }
 
 // Result returns the smallest value passed to Add.
-func (a *MinAggregate) Result() Datum {
+func (a *MinAggregate) Result() (Datum, error) {
 	if a.min == nil {
-		return DNull
+		return DNull, nil
 	}
-	return a.min
+	return a.min, nil
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *MinAggregate) Close(context.Context) {}
 
 type smallIntSumAggregate struct {
 	sum         int64
 	seenNonNull bool
 }
 
-func newSmallIntSumAggregate(_ []Type) AggregateFunc {
+func newSmallIntSumAggregate(_ []Type, _ *EvalContext) AggregateFunc {
 	return &smallIntSumAggregate{}
 }
 
 // Add adds the value of the passed datum to the sum.
-func (a *smallIntSumAggregate) Add(_ *EvalContext, datum Datum) {
+func (a *smallIntSumAggregate) Add(_ context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 
 	a.sum += int64(MustBeDInt(datum))
 	a.seenNonNull = true
+	return nil
 }
 
 // Result returns the sum.
-func (a *smallIntSumAggregate) Result() Datum {
+func (a *smallIntSumAggregate) Result() (Datum, error) {
 	if !a.seenNonNull {
-		return DNull
+		return DNull, nil
 	}
-	return NewDInt(DInt(a.sum))
+	return NewDInt(DInt(a.sum)), nil
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *smallIntSumAggregate) Close(context.Context) {}
 
 type intSumAggregate struct {
 	// Either the `intSum` and `decSum` fields contains the
@@ -525,14 +611,14 @@ type intSumAggregate struct {
 	seenNonNull bool
 }
 
-func newIntSumAggregate(_ []Type) AggregateFunc {
+func newIntSumAggregate(_ []Type, _ *EvalContext) AggregateFunc {
 	return &intSumAggregate{}
 }
 
 // Add adds the value of the passed datum to the sum.
-func (a *intSumAggregate) Add(_ *EvalContext, datum Datum) {
+func (a *intSumAggregate) Add(_ context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 
 	t := int64(MustBeDInt(datum))
@@ -552,22 +638,22 @@ func (a *intSumAggregate) Add(_ *EvalContext, datum Datum) {
 
 		if a.large {
 			a.tmpDec.SetCoefficient(t)
-			// TODO(mjibson): see #13640
 			_, err := ExactCtx.Add(&a.decSum.Decimal, &a.decSum.Decimal, &a.tmpDec)
 			if err != nil {
-				panic(err)
+				return err
 			}
 		} else {
 			a.intSum += t
 		}
 	}
 	a.seenNonNull = true
+	return nil
 }
 
 // Result returns the sum.
-func (a *intSumAggregate) Result() Datum {
+func (a *intSumAggregate) Result() (Datum, error) {
 	if !a.seenNonNull {
-		return DNull
+		return DNull, nil
 	}
 	dd := &DDecimal{}
 	if a.large {
@@ -575,95 +661,109 @@ func (a *intSumAggregate) Result() Datum {
 	} else {
 		dd.SetCoefficient(a.intSum)
 	}
-	return dd
+	return dd, nil
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *intSumAggregate) Close(context.Context) {}
 
 type decimalSumAggregate struct {
 	sum        apd.Decimal
 	sawNonNull bool
 }
 
-func newDecimalSumAggregate(_ []Type) AggregateFunc {
+func newDecimalSumAggregate(_ []Type, _ *EvalContext) AggregateFunc {
 	return &decimalSumAggregate{}
 }
 
 // Add adds the value of the passed datum to the sum.
-func (a *decimalSumAggregate) Add(_ *EvalContext, datum Datum) {
+func (a *decimalSumAggregate) Add(_ context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 	t := datum.(*DDecimal)
-	// TODO(mjibson): see #13640
 	_, err := ExactCtx.Add(&a.sum, &a.sum, &t.Decimal)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	a.sawNonNull = true
+	return nil
 }
 
 // Result returns the sum.
-func (a *decimalSumAggregate) Result() Datum {
+func (a *decimalSumAggregate) Result() (Datum, error) {
 	if !a.sawNonNull {
-		return DNull
+		return DNull, nil
 	}
 	dd := &DDecimal{}
 	dd.Set(&a.sum)
-	return dd
+	return dd, nil
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *decimalSumAggregate) Close(context.Context) {}
 
 type floatSumAggregate struct {
 	sum        float64
 	sawNonNull bool
 }
 
-func newFloatSumAggregate(_ []Type) AggregateFunc {
+func newFloatSumAggregate(_ []Type, _ *EvalContext) AggregateFunc {
 	return &floatSumAggregate{}
 }
 
 // Add adds the value of the passed datum to the sum.
-func (a *floatSumAggregate) Add(_ *EvalContext, datum Datum) {
+func (a *floatSumAggregate) Add(_ context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 	t := datum.(*DFloat)
 	a.sum += float64(*t)
 	a.sawNonNull = true
+	return nil
 }
 
 // Result returns the sum.
-func (a *floatSumAggregate) Result() Datum {
+func (a *floatSumAggregate) Result() (Datum, error) {
 	if !a.sawNonNull {
-		return DNull
+		return DNull, nil
 	}
-	return NewDFloat(DFloat(a.sum))
+	return NewDFloat(DFloat(a.sum)), nil
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *floatSumAggregate) Close(context.Context) {}
 
 type intervalSumAggregate struct {
 	sum        duration.Duration
 	sawNonNull bool
 }
 
-func newIntervalSumAggregate(_ []Type) AggregateFunc {
+func newIntervalSumAggregate(_ []Type, _ *EvalContext) AggregateFunc {
 	return &intervalSumAggregate{}
 }
 
 // Add adds the value of the passed datum to the sum.
-func (a *intervalSumAggregate) Add(_ *EvalContext, datum Datum) {
+func (a *intervalSumAggregate) Add(_ context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 	t := datum.(*DInterval).Duration
 	a.sum = a.sum.Add(t)
 	a.sawNonNull = true
+	return nil
 }
 
 // Result returns the sum.
-func (a *intervalSumAggregate) Result() Datum {
+func (a *intervalSumAggregate) Result() (Datum, error) {
 	if !a.sawNonNull {
-		return DNull
+		return DNull, nil
 	}
-	return &DInterval{Duration: a.sum}
+	return &DInterval{Duration: a.sum}, nil
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *intervalSumAggregate) Close(context.Context) {}
 
 type intVarianceAggregate struct {
 	agg *decimalVarianceAggregate
@@ -671,24 +771,27 @@ type intVarianceAggregate struct {
 	tmpDec DDecimal
 }
 
-func newIntVarianceAggregate(_ []Type) AggregateFunc {
+func newIntVarianceAggregate(_ []Type, _ *EvalContext) AggregateFunc {
 	return &intVarianceAggregate{
 		agg: newDecimalVariance(),
 	}
 }
 
-func (a *intVarianceAggregate) Add(ctx *EvalContext, datum Datum) {
+func (a *intVarianceAggregate) Add(ctx context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 
 	a.tmpDec.SetCoefficient(int64(MustBeDInt(datum)))
-	a.agg.Add(ctx, &a.tmpDec)
+	return a.agg.Add(ctx, &a.tmpDec)
 }
 
-func (a *intVarianceAggregate) Result() Datum {
+func (a *intVarianceAggregate) Result() (Datum, error) {
 	return a.agg.Result()
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *intVarianceAggregate) Close(context.Context) {}
 
 type floatVarianceAggregate struct {
 	count   int
@@ -696,13 +799,13 @@ type floatVarianceAggregate struct {
 	sqrDiff float64
 }
 
-func newFloatVarianceAggregate(_ []Type) AggregateFunc {
+func newFloatVarianceAggregate(_ []Type, _ *EvalContext) AggregateFunc {
 	return &floatVarianceAggregate{}
 }
 
-func (a *floatVarianceAggregate) Add(_ *EvalContext, datum Datum) {
+func (a *floatVarianceAggregate) Add(_ context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 	f := float64(*datum.(*DFloat))
 
@@ -713,14 +816,18 @@ func (a *floatVarianceAggregate) Add(_ *EvalContext, datum Datum) {
 	delta := f - a.mean
 	a.mean += delta / float64(a.count)
 	a.sqrDiff += delta * (f - a.mean)
+	return nil
 }
 
-func (a *floatVarianceAggregate) Result() Datum {
+func (a *floatVarianceAggregate) Result() (Datum, error) {
 	if a.count < 2 {
-		return DNull
+		return DNull, nil
 	}
-	return NewDFloat(DFloat(a.sqrDiff / (float64(a.count) - 1)))
+	return NewDFloat(DFloat(a.sqrDiff / (float64(a.count) - 1))), nil
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *floatVarianceAggregate) Close(context.Context) {}
 
 type decimalVarianceAggregate struct {
 	// Variables used across iterations.
@@ -746,7 +853,7 @@ func newDecimalVariance() *decimalVarianceAggregate {
 	}
 }
 
-func newDecimalVarianceAggregate(_ []Type) AggregateFunc {
+func newDecimalVarianceAggregate(_ []Type, _ *EvalContext) AggregateFunc {
 	return newDecimalVariance()
 }
 
@@ -756,9 +863,9 @@ var (
 	decimalTwo = apd.New(2, 0)
 )
 
-func (a *decimalVarianceAggregate) Add(_ *EvalContext, datum Datum) {
+func (a *decimalVarianceAggregate) Add(_ context.Context, datum Datum) error {
 	if datum == DNull {
-		return
+		return nil
 	}
 	d := &datum.(*DDecimal).Decimal
 
@@ -771,67 +878,143 @@ func (a *decimalVarianceAggregate) Add(_ *EvalContext, datum Datum) {
 	a.ed.Add(&a.mean, &a.mean, &a.tmp)
 	a.ed.Sub(&a.tmp, d, &a.mean)
 	a.ed.Add(&a.sqrDiff, &a.sqrDiff, a.ed.Mul(&a.delta, &a.delta, &a.tmp))
-	// TODO(mjibson): see #13640
-	if err := a.ed.Err(); err != nil {
-		panic(err)
-	}
+
+	return a.ed.Err()
 }
 
-func (a *decimalVarianceAggregate) Result() Datum {
+func (a *decimalVarianceAggregate) Result() (Datum, error) {
 	if a.count.Cmp(decimalTwo) < 0 {
-		return DNull
+		return DNull, nil
 	}
 	a.ed.Sub(&a.tmp, &a.count, decimalOne)
 	dd := &DDecimal{}
 	a.ed.Ctx = DecimalCtx
 	a.ed.Quo(&dd.Decimal, &a.sqrDiff, &a.tmp)
-	// TODO(mjibson): see #13640
 	if err := a.ed.Err(); err != nil {
-		panic(err)
+		return nil, err
 	}
-	return dd
+	// Remove trailing zeros. Depending on the order in which the input
+	// is processed, some number of trailing zeros could be added to the
+	// output. Remove them so that the results are the same regardless of order.
+	dd.Decimal.Reduce(&dd.Decimal)
+	return dd, nil
 }
+
+// Close is part of the AggregateFunc interface.
+func (a *decimalVarianceAggregate) Close(context.Context) {}
 
 type stdDevAggregate struct {
 	agg AggregateFunc
 }
 
-func newIntStdDevAggregate(params []Type) AggregateFunc {
-	return &stdDevAggregate{agg: newIntVarianceAggregate(params)}
+func newIntStdDevAggregate(params []Type, evalCtx *EvalContext) AggregateFunc {
+	return &stdDevAggregate{agg: newIntVarianceAggregate(params, evalCtx)}
 }
-func newFloatStdDevAggregate(params []Type) AggregateFunc {
-	return &stdDevAggregate{agg: newFloatVarianceAggregate(params)}
+func newFloatStdDevAggregate(params []Type, evalCtx *EvalContext) AggregateFunc {
+	return &stdDevAggregate{agg: newFloatVarianceAggregate(params, evalCtx)}
 }
-func newDecimalStdDevAggregate(params []Type) AggregateFunc {
-	return &stdDevAggregate{agg: newDecimalVarianceAggregate(params)}
+func newDecimalStdDevAggregate(params []Type, evalCtx *EvalContext) AggregateFunc {
+	return &stdDevAggregate{agg: newDecimalVarianceAggregate(params, evalCtx)}
 }
 
 // Add implements the AggregateFunc interface.
-func (a *stdDevAggregate) Add(ctx *EvalContext, datum Datum) {
-	a.agg.Add(ctx, datum)
+func (a *stdDevAggregate) Add(ctx context.Context, datum Datum) error {
+	return a.agg.Add(ctx, datum)
 }
 
 // Result computes the square root of the variance.
-func (a *stdDevAggregate) Result() Datum {
-	variance := a.agg.Result()
+func (a *stdDevAggregate) Result() (Datum, error) {
+	variance, err := a.agg.Result()
+	if err != nil {
+		return nil, err
+	}
 	if variance == DNull {
-		return variance
+		return variance, nil
 	}
 	switch t := variance.(type) {
 	case *DFloat:
-		return NewDFloat(DFloat(math.Sqrt(float64(*t))))
+		return NewDFloat(DFloat(math.Sqrt(float64(*t)))), nil
 	case *DDecimal:
-		// TODO(mjibson): see #13640
 		_, err := DecimalCtx.Sqrt(&t.Decimal, &t.Decimal)
-		if err != nil {
-			panic(err)
-		}
-		return t
+		return t, err
 	}
-	panic(fmt.Sprintf("unexpected variance result type: %s", variance.ResolvedType()))
+	return nil, errors.Errorf("unexpected variance result type: %s", variance.ResolvedType())
 }
 
+// Close is part of the AggregateFunc interface.
+func (a *stdDevAggregate) Close(context.Context) {}
+
 var _ Visitor = &IsAggregateVisitor{}
+
+type bytesXorAggregate struct {
+	sum        []byte
+	sawNonNull bool
+}
+
+func newBytesXorAggregate(_ []Type, _ *EvalContext) AggregateFunc {
+	return &bytesXorAggregate{}
+}
+
+// Add inserts one value into the running xor.
+func (a *bytesXorAggregate) Add(_ context.Context, datum Datum) error {
+	if datum == DNull {
+		return nil
+	}
+	t := []byte(*datum.(*DBytes))
+	if !a.sawNonNull {
+		a.sum = append([]byte(nil), t...)
+	} else if len(a.sum) != len(t) {
+		return fmt.Errorf("arguments to xor must all be the same length %d vs %d", len(a.sum), len(t))
+	} else {
+		for i := range t {
+			a.sum[i] = a.sum[i] ^ t[i]
+		}
+	}
+	a.sawNonNull = true
+	return nil
+}
+
+// Result returns the xor.
+func (a *bytesXorAggregate) Result() (Datum, error) {
+	if !a.sawNonNull {
+		return DNull, nil
+	}
+	return NewDBytes(DBytes(a.sum)), nil
+}
+
+// Close is part of the AggregateFunc interface.
+func (a *bytesXorAggregate) Close(context.Context) {}
+
+type intXorAggregate struct {
+	sum        int64
+	sawNonNull bool
+}
+
+func newIntXorAggregate(_ []Type, _ *EvalContext) AggregateFunc {
+	return &intXorAggregate{}
+}
+
+// Add inserts one value into the running xor.
+func (a *intXorAggregate) Add(_ context.Context, datum Datum) error {
+	if datum == DNull {
+		return nil
+	}
+	x := int64(*datum.(*DInt))
+	a.sum = a.sum ^ x
+	a.sawNonNull = true
+	return nil
+}
+
+// Result returns the xor.
+func (a *intXorAggregate) Result() (Datum, error) {
+	if !a.sawNonNull {
+		return DNull, nil
+	}
+	return NewDInt(DInt(a.sum)), nil
+}
+
+// Close is part of the AggregateFunc interface.
+func (a *intXorAggregate) Close(context.Context) {}
 
 // IsAggregateVisitor checks if walked expressions contain aggregate functions.
 type IsAggregateVisitor struct {
@@ -906,10 +1089,10 @@ func (p *Parser) IsAggregate(n *SelectClause, searchPath SearchPath) bool {
 // aggregate functions or window functions, returning an error in either case.
 func (p *Parser) AssertNoAggregationOrWindowing(expr Expr, op string, searchPath SearchPath) error {
 	if p.AggregateInExpr(expr, searchPath) {
-		return fmt.Errorf("aggregate functions are not allowed in %s", op)
+		return pgerror.NewErrorf(pgerror.CodeGroupingError, "aggregate functions are not allowed in %s", op)
 	}
 	if p.WindowFuncInExpr(expr) {
-		return fmt.Errorf("window functions are not allowed in %s", op)
+		return pgerror.NewErrorf(pgerror.CodeWindowingError, "window functions are not allowed in %s", op)
 	}
 	return nil
 }

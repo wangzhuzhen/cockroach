@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
@@ -86,6 +87,12 @@ func (s *Store) ForceReplicationScanAndProcess() {
 // may need to be GC'd.
 func (s *Store) ForceReplicaGCScanAndProcess() {
 	forceScanAndProcess(s, s.replicaGCQueue.baseQueue)
+}
+
+// ForceSplitScanAndProcess iterates over all ranges and enqueues any that
+// may need to be split.
+func (s *Store) ForceSplitScanAndProcess() {
+	forceScanAndProcess(s, s.splitQueue.baseQueue)
 }
 
 // ForceRaftLogScanAndProcess iterates over all ranges and enqueues any that
@@ -211,7 +218,7 @@ func NewTestStorePool(cfg StoreConfig) *StorePool {
 		func(roachpb.NodeID, time.Time, time.Duration) nodeStatus {
 			return nodeStatusLive
 		},
-		TestTimeUntilStoreDeadOff,
+		settings.TestingDuration(TestTimeUntilStoreDeadOff),
 		/* deterministic */ false,
 	)
 }
@@ -243,15 +250,25 @@ func (r *Replica) GetLastIndex() (uint64, error) {
 // GetLease exposes replica.getLease for tests.
 // If you just need information about the lease holder, consider issuing a
 // LeaseInfoRequest instead of using this internal method.
-func (r *Replica) GetLease() (*roachpb.Lease, *roachpb.Lease) {
+func (r *Replica) GetLease() (roachpb.Lease, *roachpb.Lease) {
 	return r.getLease()
 }
 
 // GetTimestampCacheLowWater returns the timestamp cache low water mark.
 func (r *Replica) GetTimestampCacheLowWater() hlc.Timestamp {
-	r.tsCacheMu.Lock()
-	defer r.tsCacheMu.Unlock()
-	return r.tsCacheMu.cache.lowWater
+	r.store.tsCacheMu.Lock()
+	defer r.store.tsCacheMu.Unlock()
+	t := r.store.tsCacheMu.cache.lowWater
+	// Bump the per-Store low-water mark using the per-range read and write info.
+	start := roachpb.Key(r.Desc().StartKey)
+	end := roachpb.Key(r.Desc().EndKey)
+	if r, _, ok := r.store.tsCacheMu.cache.GetMaxRead(start, end); !ok && t.Less(r) {
+		t = r
+	}
+	if w, _, ok := r.store.tsCacheMu.cache.GetMaxWrite(start, end); !ok && t.Less(w) {
+		t = w
+	}
+	return t
 }
 
 // GetRaftLogSize returns the raft log size.
@@ -265,6 +282,15 @@ func (r *Replica) IsRaftGroupInitialized() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.mu.internalRaftGroup != nil
+}
+
+// HasQuorum returns true iff the range that this replica is part of
+// can achieve quorum.
+func (r *Replica) HasQuorum() bool {
+	desc := r.Desc()
+	liveReplicas, _ := r.store.allocator.storePool.liveAndDeadReplicas(desc.RangeID, desc.Replicas)
+	quorum := computeQuorum(len(desc.Replicas))
+	return len(liveReplicas) >= quorum
 }
 
 // GetStoreList is the same function as GetStoreList exposed for tests only.
@@ -284,6 +310,10 @@ func (r *Replica) IsQuiescent() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.mu.quiescent
+}
+
+func (r *Replica) IsPushTxnQueueEnabled() bool {
+	return r.pushTxnQueue.isEnabled()
 }
 
 // GetQueueLastProcessed returns the last processed timestamp for the

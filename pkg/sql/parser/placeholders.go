@@ -28,7 +28,7 @@ import (
 type PlaceholderTypes map[string]Type
 
 // QueryArguments relates placeholder names to their provided query argument.
-type QueryArguments map[string]Datum
+type QueryArguments map[string]TypedExpr
 
 // PlaceholderInfo defines the interface to SQL placeholders.
 type PlaceholderInfo struct {
@@ -98,7 +98,7 @@ func (p *PlaceholderInfo) Type(name string) (Type, bool) {
 
 // Value returns the known value of a placeholder.  Returns false in
 // the 2nd value if the placeholder does not have a value.
-func (p *PlaceholderInfo) Value(name string) (Datum, bool) {
+func (p *PlaceholderInfo) Value(name string) (TypedExpr, bool) {
 	if v, ok := p.Values[name]; ok {
 		return v, true
 	}
@@ -152,4 +152,40 @@ func (p *PlaceholderInfo) IsUnresolvedPlaceholder(expr Expr) bool {
 		return !res
 	}
 	return false
+}
+
+// placeholdersVisitor is a Visitor implementation used to
+// replace placeholders with their supplied values.
+type placeholdersVisitor struct {
+	placeholders PlaceholderInfo
+}
+
+var _ Visitor = &placeholdersVisitor{}
+
+func (v *placeholdersVisitor) VisitPre(expr Expr) (recurse bool, newNode Expr) {
+	switch t := expr.(type) {
+	case *Placeholder:
+		if e, ok := v.placeholders.Value(t.Name); ok {
+			// Placeholder expressions cannot contain other placeholders, so we do
+			// not need to recurse.
+			return false, e
+		}
+	}
+	return true, expr
+}
+
+func (*placeholdersVisitor) VisitPost(expr Expr) Expr { return expr }
+
+// replacePlaceholders replaces all placeholders in the input expression with
+// their supplied values in the SemaContext's Placeholders map. If there is no
+// available value for a placeholder, it is left alone. A nil ctx makes
+// this a no-op and is supported for tests only.
+func replacePlaceholders(expr Expr, ctx *SemaContext) Expr {
+	if ctx == nil {
+		return expr
+	}
+	v := &placeholdersVisitor{placeholders: ctx.Placeholders}
+
+	expr, _ = WalkExpr(v, expr)
+	return expr
 }

@@ -4,7 +4,7 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/pkg/ccl/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
 
 package engineccl
 
@@ -47,5 +47,19 @@ func TestVerifyBatchRepr(t *testing.T) {
 	// Key is after the range in the request span.
 	if _, err := VerifyBatchRepr(data, keyA, keyB, 0); !testutils.IsError(err, "request range") {
 		t.Fatalf("expected request range error got: %+v", err)
+	}
+
+	// Invalid key/value entry checksum.
+	{
+		var batch engine.RocksDBBatchBuilder
+		key := engine.MVCCKey{Key: []byte("bb"), Timestamp: hlc.Timestamp{WallTime: 1}}
+		value := roachpb.MakeValueFromString("1")
+		value.InitChecksum([]byte("foo"))
+		batch.Put(key, value.RawBytes)
+		data := batch.Finish()
+
+		if _, err := VerifyBatchRepr(data, keyB, keyC, 0); !testutils.IsError(err, "invalid checksum") {
+			t.Fatalf("expected 'invalid checksum' error got: %+v", err)
+		}
 	}
 }

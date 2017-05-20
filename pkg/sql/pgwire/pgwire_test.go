@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -170,7 +171,7 @@ func TestPGWire(t *testing.T) {
 			}
 		}
 
-		s.Stopper().Stop()
+		s.Stopper().Stop(context.TODO())
 	}
 }
 
@@ -180,7 +181,7 @@ func TestPGWireDrainClient(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params := base.TestServerArgs{Insecure: true}
 	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	host, port, err := net.SplitHostPort(s.ServingAddr())
 	if err != nil {
@@ -251,7 +252,7 @@ func TestPGWireDrainOngoingTxns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params := base.TestServerArgs{Insecure: true}
 	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	host, port, err := net.SplitHostPort(s.ServingAddr())
 	if err != nil {
@@ -352,9 +353,9 @@ func TestPGWireDBName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
-	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), "TestPGWireDBName", url.User(security.RootUser))
+	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
 	pgURL.Path = "foo"
 	defer cleanupFn()
 	{
@@ -387,9 +388,9 @@ func TestPGPrepareFail(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
-	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), "TestPGPrepareFail", url.User(security.RootUser))
+	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
 
 	db, err := gosql.Open("postgres", pgURL.String())
@@ -428,6 +429,95 @@ func TestPGPrepareFail(t *testing.T) {
 			}
 		} else if err.Error() != reason {
 			t.Errorf(`%s: got: %q, expected: %q`, query, err, reason)
+		}
+	}
+}
+
+// Run a Prepare referencing a table created or dropped in the same
+// transaction.
+func TestPGPrepareWithCreateDropInTxn(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanupFn()
+
+	db, err := gosql.Open("postgres", pgURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	{
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := tx.Exec(`
+	CREATE DATABASE d;
+	CREATE TABLE d.kv (k CHAR PRIMARY KEY, v CHAR);
+`); err != nil {
+			t.Fatal(err)
+		}
+
+		stmt, err := tx.Prepare(`INSERT INTO d.kv (k,v) VALUES ($1, $2);`)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		res, err := stmt.Exec('a', 'b')
+		if err != nil {
+			t.Fatal(err)
+		}
+		stmt.Close()
+		affected, err := res.RowsAffected()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if affected != 1 {
+			t.Fatalf("unexpected number of rows affected: %d", affected)
+		}
+
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	{
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := tx.Exec(`
+	DROP TABLE d.kv;
+`); err != nil {
+			t.Fatal(err)
+		}
+
+		stmt, err := tx.Prepare(`INSERT INTO d.kv (k,v) VALUES ($1, $2);`)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// INSERT works because it is using a cached descriptor that is leased.
+		res, err := stmt.Exec('c', 'd')
+		if err != nil {
+			t.Fatal(err)
+		}
+		stmt.Close()
+		affected, err := res.RowsAffected()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if affected != 1 {
+			t.Fatalf("unexpected number of rows affected: %d", affected)
+		}
+
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
@@ -578,7 +668,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Results("users", "primary", true, 1, "username", "ASC", false, false),
 		},
 		"SHOW TABLES FROM system": {
-			baseTest.Results("descriptor").Others(8),
+			baseTest.Results("descriptor").Others(9),
 		},
 		"SHOW CONSTRAINTS FROM system.users": {
 			baseTest.Results("users", "primary", "PRIMARY KEY", "username", gosql.NullString{}),
@@ -621,9 +711,6 @@ func TestPGPreparedQuery(t *testing.T) {
 				time.Date(2006, 7, 8, 0, 0, 0, 0, time.FixedZone("", 0)),
 				time.Date(2001, 1, 2, 3, 4, 5, 6000, time.FixedZone("", 0)),
 			),
-		},
-		"SELECT (CASE a WHEN 10 THEN 'one' WHEN 11 THEN (CASE 'en' WHEN 'en' THEN $1 END) END) AS ret FROM d.T ORDER BY ret DESC LIMIT 2": {
-			baseTest.SetArgs("hello").Results("one").Results("hello"),
 		},
 		"INSERT INTO d.ts VALUES($1, $2) RETURNING *": {
 			baseTest.SetArgs("2001-01-02 03:04:05", "2006-07-08").Results(
@@ -731,17 +818,38 @@ func TestPGPreparedQuery(t *testing.T) {
 		"SELECT * FROM d.empty": {
 			baseTest.SetArgs(),
 		},
+		// #14238
+		"EXPLAIN SELECT 1": {
+			baseTest.SetArgs().Results(0, "render", "", "").Results(1, "nullrow", "", ""),
+		},
+		// #14245
+		"SELECT 1::oid = $1": {
+			baseTest.SetArgs(1).Results(true),
+			baseTest.SetArgs(2).Results(false),
+			baseTest.SetArgs("1").Results(true),
+			baseTest.SetArgs("2").Results(false),
+		},
+		"SELECT * FROM pg_catalog.pg_class WHERE relnamespace = $1": {
+			baseTest.SetArgs(1),
+		},
 
-		// TODO(jordan) blocked on #13651
+		// TODO(jordan): blocked on #13651
 		//"SELECT $1::INT[]": {
 		//	baseTest.SetArgs(pq.Array([]int{10})).Results(pq.Array([]int{10})),
+		//},
+
+		// TODO(nvanbenschoten): Same class of limitation as that in logic_test/typing:
+		//   Nested constants are not exposed to the same constant type resolution rules
+		//   as top-level constants, and instead are simply resolved to their natural type.
+		//"SELECT (CASE a WHEN 10 THEN 'one' WHEN 11 THEN (CASE 'en' WHEN 'en' THEN $1 END) END) AS ret FROM d.T ORDER BY ret DESC LIMIT 2": {
+		// 	baseTest.SetArgs("hello").Results("one").Results("hello"),
 		//},
 	}
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
-	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), "TestPGPreparedQuery", url.User(security.RootUser))
+	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
 
 	db, err := gosql.Open("postgres", pgURL.String())
@@ -1029,17 +1137,8 @@ func TestPGPreparedExec(t *testing.T) {
 		},
 	}
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
-
-	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), "TestPGPreparedExec", url.User(security.RootUser))
-	defer cleanupFn()
-
-	db, err := gosql.Open("postgres", pgURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
 
 	runTests := func(query string, tests []preparedExecTest, execFunc func(...interface{}) (gosql.Result, error)) {
 		for _, test := range tests {
@@ -1090,9 +1189,9 @@ func TestPGPreparedExec(t *testing.T) {
 func TestPGPrepareNameQual(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
-	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), "TestPGPrepareNameQual", url.User(security.RootUser))
+	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
 
 	db, err := gosql.Open("postgres", pgURL.String())
@@ -1140,10 +1239,10 @@ func TestPGPrepareNameQual(t *testing.T) {
 func TestCmdCompleteVsEmptyStatements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	pgURL, cleanupFn := sqlutils.PGUrl(
-		t, s.ServingAddr(), "TestCmdCompleteVsEmptyStatements", url.User(security.RootUser))
+		t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
 
 	db, err := gosql.Open("postgres", pgURL.String())
@@ -1184,9 +1283,9 @@ func TestCmdCompleteVsEmptyStatements(t *testing.T) {
 func TestPGCommandTags(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
-	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), "TestPGCommandTags", url.User(security.RootUser))
+	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
 
 	db, err := gosql.Open("postgres", pgURL.String())
@@ -1305,15 +1404,15 @@ func TestSQLNetworkMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// Setup pgwire client.
 	pgURL, cleanupFn := sqlutils.PGUrl(
-		t, s.ServingAddr(), "TestSQLNetworkMetrics", url.User(security.RootUser))
+		t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
 
 	const minbytes = 20
-	const maxbytes = 450
+	const maxbytes = 750
 
 	// Make sure we're starting at 0.
 	if _, _, err := checkSQLNetworkMetrics(s, 0, 0, 0, 0); err != nil {
@@ -1370,66 +1469,36 @@ func TestSQLNetworkMetrics(t *testing.T) {
 	}
 }
 
-func TestPrepareSyntax(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
-
-	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), "TestPrepareSyntax", url.User(security.RootUser))
-	defer cleanupFn()
-
-	db, err := gosql.Open("postgres", pgURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	const strTest = `SELECT """test"""`
-
-	if _, err := db.Exec(`SET SYNTAX = traditional`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Prepare(strTest); err == nil {
-		t.Fatal("expected error")
-	}
-
-	if _, err := db.Exec(`SET SYNTAX = modern`); err != nil {
-		t.Fatal(err)
-	}
-	stmt, err := db.Prepare(strTest)
-	if err != nil {
-		t.Fatalf("unexpected error: %s", err)
-	}
-	var v string
-	if err := stmt.QueryRow().Scan(&v); err != nil {
-		t.Fatalf("unexpected error: %s", err)
-	} else if v != "test" {
-		t.Fatalf("unexpected result: %q", v)
-	}
-}
-
 func TestPGWireOverUnixSocket(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	// We need a temp directory in which we'll create the
-	// unix socket ".s.PGSQL.<port>".
-	// We hard-code "/tmp" as the directory as the osx default can cause
-	// the socket filename length to exceed 104 characters, triggering an error.
-	tempDir, err := ioutil.TempDir("/tmp", "cockroach-unix")
+	if runtime.GOOS == "windows" {
+		t.Skip("unix sockets not support on windows")
+	}
+
+	// We need a temp directory in which we'll create the unix socket.
+	//
+	// On BSD, binding to a socket is limited to a path length of 104 characters
+	// (including the NUL terminator). In glibc, this limit is 108 characters.
+	//
+	// macOS has a tendency to produce very long temporary directory names, so
+	// we are careful to keep all the constants involved short.
+	tempDir, err := ioutil.TempDir("", "PGSQL")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = os.RemoveAll(tempDir) }()
 
-	socketFile := filepath.Join(tempDir, ".s.PGSQL.123456")
+	const port = "6"
+
+	socketFile := filepath.Join(tempDir, ".s.PGSQL."+port)
 
 	params := base.TestServerArgs{
 		Insecure:   true,
 		SocketFile: socketFile,
 	}
 	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// We can't pass socket paths as url.Host to libpq, use ?host=/... instead.
 	options := url.Values{
@@ -1438,10 +1507,9 @@ func TestPGWireOverUnixSocket(t *testing.T) {
 	pgURL := url.URL{
 		Scheme:   "postgres",
 		User:     url.User(security.RootUser),
-		Host:     ":123456",
+		Host:     net.JoinHostPort("", port),
 		RawQuery: options.Encode(),
 	}
-	t.Logf("PGURL: %s", pgURL.String())
 	if err := trivialQuery(pgURL); err != nil {
 		t.Fatal(err)
 	}
@@ -1451,14 +1519,14 @@ func TestPGWireAuth(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	{
-		unicodeUser := "♫"
+		unicodeUser := "Ὀδυσσεύς"
 
 		t.Run("RootUserAuth", func(t *testing.T) {
 			// Authenticate as root with certificate and expect success.
 			rootPgURL, cleanupFn := sqlutils.PGUrl(
-				t, s.ServingAddr(), "TestPGWireAuth", url.User(security.RootUser))
+				t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
 			defer cleanupFn()
 			if err := trivialQuery(rootPgURL); err != nil {
 				t.Fatal(err)
@@ -1508,7 +1576,7 @@ func TestPGWireAuth(t *testing.T) {
 
 	t.Run("TestUserAuth", func(t *testing.T) {
 		testUserPgURL, cleanupFn := sqlutils.PGUrl(
-			t, s.ServingAddr(), "TestPGWireAuth", url.User(server.TestUser))
+			t, s.ServingAddr(), t.Name(), url.User(server.TestUser))
 		defer cleanupFn()
 		// No password supplied but valid certificate should result in
 		// successful authentication.

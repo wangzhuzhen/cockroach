@@ -42,6 +42,12 @@ const (
 	// entries. A stale entry is one which all replicas of the range have
 	// progressed past and thus is no longer needed and can be truncated.
 	RaftLogQueueStaleThreshold = 100
+	// RaftLogQueueStaleSize is the minimum size of the Raft log that we'll
+	// truncate even if there are fewer than RaftLogQueueStaleThreshold entries
+	// to truncate. The value of 64 KB was chosen experimentally by looking at
+	// when Raft log truncation usually occurs when using the number of entries
+	// as the sole criteria.
+	RaftLogQueueStaleSize = 64 << 10
 )
 
 // raftLogMaxSize limits the maximum size of the Raft log.
@@ -74,23 +80,28 @@ func newRaftLogQueue(store *Store, db *client.DB, gossip *gossip.Gossip) *raftLo
 	return rlq
 }
 
-// getTruncatableIndexes returns the number of truncatable indexes and the
-// oldest index that cannot be truncated for the replica.
-// See computeTruncatableIndex.
-func getTruncatableIndexes(ctx context.Context, r *Replica) (uint64, uint64, error) {
+func shouldTruncate(truncatableIndexes uint64, raftLogSize int64) bool {
+	return truncatableIndexes >= RaftLogQueueStaleThreshold ||
+		(truncatableIndexes > 0 && raftLogSize >= RaftLogQueueStaleSize)
+}
+
+// getTruncatableIndexes returns the number of truncatable indexes, the oldest
+// index that cannot be truncated, and the current Raft log size. See
+// computeTruncatableIndex.
+func getTruncatableIndexes(ctx context.Context, r *Replica) (uint64, uint64, int64, error) {
 	rangeID := r.RangeID
 	raftStatus := r.RaftStatus()
 	if raftStatus == nil {
 		if log.V(6) {
 			log.Infof(ctx, "the raft group doesn't exist for r%d", rangeID)
 		}
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 
 	// Is this the raft leader? We only perform log truncation on the raft leader
 	// which has the up to date info on followers.
 	if raftStatus.RaftState != raft.StateLeader {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 
 	r.mu.Lock()
@@ -111,15 +122,16 @@ func getTruncatableIndexes(ctx context.Context, r *Replica) (uint64, uint64, err
 	}
 	firstIndex, err := r.FirstIndex()
 	pendingSnapshotIndex := r.mu.pendingSnapshotIndex
+	lastIndex := r.mu.lastIndex
 	r.mu.Unlock()
 	if err != nil {
-		return 0, 0, errors.Errorf("error retrieving first index for r%d: %s", rangeID, err)
+		return 0, 0, 0, errors.Errorf("error retrieving first index for r%d: %s", rangeID, err)
 	}
 
 	truncatableIndex := computeTruncatableIndex(
-		raftStatus, raftLogSize, targetSize, firstIndex, pendingSnapshotIndex)
+		raftStatus, raftLogSize, targetSize, firstIndex, lastIndex, pendingSnapshotIndex)
 	// Return the number of truncatable indexes.
-	return truncatableIndex - firstIndex, truncatableIndex, nil
+	return truncatableIndex - firstIndex, truncatableIndex, raftLogSize, nil
 }
 
 // computeTruncatableIndex returns the oldest index that cannot be
@@ -140,7 +152,12 @@ func getTruncatableIndexes(ctx context.Context, r *Replica) (uint64, uint64, err
 // and thus require another snapshot, likely entering a never ending loop of
 // snapshots. See #8629.
 func computeTruncatableIndex(
-	raftStatus *raft.Status, raftLogSize, targetSize int64, firstIndex, pendingSnapshotIndex uint64,
+	raftStatus *raft.Status,
+	raftLogSize int64,
+	targetSize int64,
+	firstIndex uint64,
+	lastIndex uint64,
+	pendingSnapshotIndex uint64,
 ) uint64 {
 	quorumIndex := getQuorumIndex(raftStatus, pendingSnapshotIndex)
 	truncatableIndex := quorumIndex
@@ -171,6 +188,14 @@ func computeTruncatableIndex(
 	// firstIndex > quorumIndex).
 	if truncatableIndex > quorumIndex {
 		truncatableIndex = quorumIndex
+	}
+	// Never truncate past the last index. Naively, you would expect lastIndex to
+	// never be smaller than quorumIndex, but RaftStatus.Progress.Match is
+	// updated on the leader when a command is proposed and in a single replica
+	// Raft group this also means that RaftStatus.Commit is updated at propose
+	// time.
+	if truncatableIndex > lastIndex {
+		truncatableIndex = lastIndex
 	}
 	return truncatableIndex
 }
@@ -205,26 +230,26 @@ func getQuorumIndex(raftStatus *raft.Status, pendingSnapshotIndex uint64) uint64
 func (rlq *raftLogQueue) shouldQueue(
 	ctx context.Context, now hlc.Timestamp, r *Replica, _ config.SystemConfig,
 ) (shouldQ bool, priority float64) {
-	truncatableIndexes, _, err := getTruncatableIndexes(ctx, r)
+	truncatableIndexes, _, raftLogSize, err := getTruncatableIndexes(ctx, r)
 	if err != nil {
 		log.Warning(ctx, err)
 		return false, 0
 	}
 
-	return truncatableIndexes >= RaftLogQueueStaleThreshold, float64(truncatableIndexes)
+	return shouldTruncate(truncatableIndexes, raftLogSize), float64(raftLogSize)
 }
 
 // process truncates the raft log of the range if the replica is the raft
 // leader and if the total number of the range's raft log's stale entries
 // exceeds RaftLogQueueStaleThreshold.
 func (rlq *raftLogQueue) process(ctx context.Context, r *Replica, _ config.SystemConfig) error {
-	truncatableIndexes, oldestIndex, err := getTruncatableIndexes(ctx, r)
+	truncatableIndexes, oldestIndex, raftLogSize, err := getTruncatableIndexes(ctx, r)
 	if err != nil {
 		return err
 	}
 
 	// Can and should the raft logs be truncated?
-	if truncatableIndexes >= RaftLogQueueStaleThreshold {
+	if shouldTruncate(truncatableIndexes, raftLogSize) {
 		r.mu.Lock()
 		raftLogSize := r.mu.raftLogSize
 		r.mu.Unlock()

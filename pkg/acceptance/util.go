@@ -49,7 +49,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -127,9 +126,12 @@ var flagCLTWriters = flag.Int("clt.writers", -1,
 var flagCLTMinQPS = flag.Float64("clt.min-qps", 5.0,
 	"fail load tests when queries per second drops below this during a health check interval")
 
-var testFuncRE = regexp.MustCompile("^(Test|Benchmark)")
-
 var stopper = stop.NewStopper()
+
+// GetStopper returns the stopper used by acceptance tests.
+func GetStopper() *stop.Stopper {
+	return stopper
+}
 
 // RunTests runs the tests in a package while gracefully handling interrupts.
 func RunTests(m *testing.M) {
@@ -144,7 +146,7 @@ func RunTests(m *testing.M) {
 		default:
 			// There is a very tiny race here: the cluster might be closing
 			// the stopper simultaneously.
-			stopper.Stop()
+			stopper.Stop(context.TODO())
 		}
 	}()
 	os.Exit(m.Run())
@@ -213,7 +215,11 @@ func MakeFarmer(t testing.TB, prefix string, stopper *stop.Stopper) *terrafarm.F
 		}
 	}
 	if !filepath.IsAbs(logDir) {
-		logDir = filepath.Join(filepath.Clean(os.ExpandEnv("${PWD}")), logDir)
+		pwd, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		logDir = filepath.Join(pwd, logDir)
 	}
 	stores := "--store=/mnt/data0"
 	for j := 1; j < *flagStores; j++ {
@@ -267,10 +273,28 @@ func MakeFarmer(t testing.TB, prefix string, stopper *stop.Stopper) *terrafarm.F
 		t.Fatalf("generated cluster name '%s' must match regex %s", name, prefixRE)
 	}
 
+	// We need to configure a MaxOffset on this clock so that the rpc.Context will
+	// enforce the offset. We're going to initialize the client.Txn using the
+	// Context's clock and send them through the ExternalSender, so the client's
+	// clock needs to be synchronized.
+	//
+	// TODO(andrei): It's unfortunate that this client, which is not part of the
+	// cluster, needs to do offset checks. Also, we igore the env variable that
+	// may control a different acceptable offset for the nodes in the cluster. We
+	// should stop creating transaction outside of the cluster.
+	clientClock := hlc.NewClock(hlc.UnixNano, base.DefaultMaxClockOffset)
 	rpcContext := rpc.NewContext(log.AmbientContext{}, &base.Config{
 		Insecure: true,
 		User:     security.NodeUser,
-	}, hlc.NewClock(hlc.UnixNano, 0), stopper)
+		// Set a bogus address, to be used by the clock skew checks as the ID of
+		// this "node". We can't leave it blank.
+		Addr: "acceptance test client",
+	}, clientClock, stopper)
+	rpcContext.HeartbeatCB = func() {
+		if err := rpcContext.RemoteClocks.VerifyClockOffset(context.Background()); err != nil {
+			log.Fatal(context.Background(), err)
+		}
+	}
 
 	f := &terrafarm.Farmer{
 		Output:      os.Stderr,
@@ -386,15 +410,7 @@ func StartCluster(ctx context.Context, t *testing.T, cfg cluster.TestConfig) (c 
 	} else {
 		logDir := *flagLogDir
 		if logDir != "" {
-			logDir = func(d string) string {
-				for i := 1; i < 100; i++ {
-					_, _, fun := caller.Lookup(i)
-					if testFuncRE.MatchString(fun) {
-						return filepath.Join(d, fun)
-					}
-				}
-				panic("no caller matching Test(.*) in stack trace")
-			}(logDir)
+			logDir = filepath.Join(logDir, filepath.Clean(t.Name()))
 		}
 		l := cluster.CreateLocal(ctx, cfg, logDir, *flagPrivileged, stopper)
 		l.Start(ctx)
@@ -523,7 +539,7 @@ func testDockerSuccess(ctx context.Context, t *testing.T, name string, cmd []str
 const (
 	// Iterating against a locally built version of the docker image can be done
 	// by changing postgresTestImage to the hash of the container.
-	postgresTestImage = "docker.io/cockroachdb/postgres-test:20170308-1644"
+	postgresTestImage = "docker.io/cockroachdb/postgres-test:20170423-1100"
 )
 
 func testDocker(
@@ -542,7 +558,14 @@ func testDocker(
 		containerConfig.Env = append(containerConfig.Env, "PGHOST="+l.Hostname(0))
 	}
 	hostConfig := container.HostConfig{NetworkMode: "host"}
-	return l.OneShot(ctx, postgresTestImage, types.ImagePullOptions{}, containerConfig, hostConfig, "docker-"+name)
+	if err := l.OneShot(
+		ctx, postgresTestImage, types.ImagePullOptions{}, containerConfig, hostConfig, "docker-"+name,
+	); err != nil {
+		return err
+	}
+	// Clean up the log files if the run was successful.
+	l.Cleanup(ctx)
+	return nil
 }
 
 func testDockerSingleNode(

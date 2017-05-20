@@ -22,6 +22,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lib/pq"
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -29,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/lib/pq"
 )
 
 // Test that a connection closed abruptly while a SQL txn is in progress results
@@ -41,7 +43,7 @@ func TestSessionFinishRollsBackTxn(t *testing.T) {
 	params, _ := createTestServerParams()
 	params.Knobs.SQLExecutor = aborter.executorKnobs()
 	s, mainDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(
 			t, s.ServingAddr(), "TestSessionFinishRollsBackTxn", url.User(security.RootUser))

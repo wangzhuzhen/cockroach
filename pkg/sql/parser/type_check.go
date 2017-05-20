@@ -23,6 +23,7 @@ import (
 
 	"golang.org/x/text/language"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/pkg/errors"
 )
@@ -40,13 +41,22 @@ type SemaContext struct {
 	// names. The path elements must be normalized via Name.Normalize()
 	// already.
 	SearchPath []string
+
+	// privileged, if true, enables "unsafe" builtins, e.g. those
+	// from the crdb_internal namespace. Must be set only for
+	// the root user.
+	// TODO(knz): this attribute can be moved to EvalContext pending #15363.
+	privileged bool
 }
 
 // MakeSemaContext initializes a simple SemaContext suitable
 // for "lightweight" type checking such as the one performed for default
 // expressions.
-func MakeSemaContext() SemaContext {
-	return SemaContext{Placeholders: MakePlaceholderInfo()}
+func MakeSemaContext(privileged bool) SemaContext {
+	return SemaContext{
+		Placeholders: MakePlaceholderInfo(),
+		privileged:   privileged,
+	}
 }
 
 // isUnresolvedPlaceholder provides a nil-safe method to determine whether expr is an
@@ -161,9 +171,11 @@ func (expr *CaseExpr) TypeCheck(ctx *SemaContext, desired Type) (TypedExpr, erro
 	} else {
 		// If expr.Expr is nil, the WHEN clauses contain boolean expressions.
 		for i, when := range expr.Whens {
-			if expr.Whens[i].Cond, err = typeCheckAndRequireBoolean(ctx, when.Cond, "condition"); err != nil {
+			typedCond, err := typeCheckAndRequireBoolean(ctx, when.Cond, "condition")
+			if err != nil {
 				return nil, err
 			}
+			expr.Whens[i].Cond = typedCond
 		}
 	}
 
@@ -403,11 +415,11 @@ func (expr *FuncExpr) TypeCheck(ctx *SemaContext, desired Type) (TypedExpr, erro
 	}
 
 	if expr.Filter != nil {
-		var err error
-		expr.Filter, err = typeCheckAndRequireBoolean(ctx, expr.Filter, "FILTER expression")
+		typedFilter, err := typeCheckAndRequireBoolean(ctx, expr.Filter, "FILTER expression")
 		if err != nil {
 			return nil, err
 		}
+		expr.Filter = typedFilter
 	}
 
 	builtin := fn.(Builtin)
@@ -441,6 +453,13 @@ func (expr *FuncExpr) TypeCheck(ctx *SemaContext, desired Type) (TypedExpr, erro
 
 	}
 
+	// Check that the built-in is allowed for the current user.
+	// TODO(knz): this check can be moved to evaluation time pending #15363.
+	if builtin.privileged && !ctx.privileged {
+		return nil, pgerror.NewErrorf(pgerror.CodeInsufficientPrivilegeError,
+			"insufficient privilege to use %s", expr.Func)
+	}
+
 	for i, subExpr := range typedSubExprs {
 		expr.Exprs[i] = subExpr
 	}
@@ -451,8 +470,8 @@ func (expr *FuncExpr) TypeCheck(ctx *SemaContext, desired Type) (TypedExpr, erro
 
 // TypeCheck implements the Expr interface.
 func (expr *IfExpr) TypeCheck(ctx *SemaContext, desired Type) (TypedExpr, error) {
-	var err error
-	if expr.Cond, err = typeCheckAndRequireBoolean(ctx, expr.Cond, "IF condition"); err != nil {
+	typedCond, err := typeCheckAndRequireBoolean(ctx, expr.Cond, "IF condition")
+	if err != nil {
 		return nil, err
 	}
 
@@ -461,6 +480,7 @@ func (expr *IfExpr) TypeCheck(ctx *SemaContext, desired Type) (TypedExpr, error)
 		return nil, decorateTypeCheckError(err, "incompatible IF expressions")
 	}
 
+	expr.Cond = typedCond
 	expr.True, expr.Else = typedSubExprs[0], typedSubExprs[1]
 	expr.typ = retType
 	return expr, nil
@@ -570,12 +590,16 @@ func (expr *AllColumnsSelector) TypeCheck(_ *SemaContext, desired Type) (TypedEx
 
 // TypeCheck implements the Expr interface.
 func (expr *RangeCond) TypeCheck(ctx *SemaContext, desired Type) (TypedExpr, error) {
-	typedSubExprs, _, err := typeCheckSameTypedExprs(ctx, TypeAny, expr.Left, expr.From, expr.To)
+	leftTyped, fromTyped, _, err := typeCheckComparisonOp(ctx, GT, expr.Left, expr.From)
+	if err != nil {
+		return nil, err
+	}
+	_, toTyped, _, err := typeCheckComparisonOp(ctx, LT, expr.Left, expr.To)
 	if err != nil {
 		return nil, err
 	}
 
-	expr.Left, expr.From, expr.To = typedSubExprs[0], typedSubExprs[1], typedSubExprs[2]
+	expr.Left, expr.From, expr.To = leftTyped, fromTyped, toTyped
 	expr.typ = TypeBool
 	return expr, nil
 }
@@ -618,7 +642,7 @@ func (expr *UnaryExpr) TypeCheck(ctx *SemaContext, desired Type) (TypedExpr, err
 	return expr, nil
 }
 
-var errInvalidDefaultUsage = errors.New("DEFAULT can only appear in a VALUES list within INSERT")
+var errInvalidDefaultUsage = errors.New("DEFAULT can only appear in a VALUES list within INSERT or on the right side of a SET within UPDATE")
 
 // TypeCheck implements the Expr interface.
 func (expr DefaultVal) TypeCheck(_ *SemaContext, desired Type) (TypedExpr, error) {
@@ -709,12 +733,10 @@ func (expr *ArrayFlatten) TypeCheck(ctx *SemaContext, desired Type) (TypedExpr, 
 
 // TypeCheck implements the Expr interface.
 func (expr *Placeholder) TypeCheck(ctx *SemaContext, desired Type) (TypedExpr, error) {
-	// If there is a value known already, immediately substitute with it.
-	if v, ok := ctx.Placeholders.Value(expr.Name); ok {
-		return v, nil
-	}
-
-	// Otherwise, perform placeholder typing.
+	// Perform placeholder typing. This function is only called during Prepare,
+	// when there are no available values for the placeholders yet, because
+	// during Execute all placeholders are replaced from the AST before type
+	// checking.
 	if typ, ok := ctx.Placeholders.Type(expr.Name); ok {
 		expr.typ = typ
 		return expr, nil
@@ -950,11 +972,11 @@ func typeCheckComparisonOp(
 			return nil, nil, CmpOp{}, fmt.Errorf(unsupportedCompErrFmtWithTypes, TypeTuple, op, TypeTuple)
 		}
 		// Using non-folded left and right to avoid having to swap later.
-		typedSubExprs, _, err := typeCheckSameTypedTupleExprs(ctx, TypeAny, left, right)
+		typedLeft, typedRight, err := typeCheckTupleComparison(ctx, op, left.(*Tuple), right.(*Tuple))
 		if err != nil {
 			return nil, nil, CmpOp{}, err
 		}
-		return typedSubExprs[0], typedSubExprs[1], fn, nil
+		return typedLeft, typedRight, fn, nil
 	}
 
 	overloads := make([]overloadImpl, len(ops))
@@ -1020,18 +1042,18 @@ func typeCheckSameTypedExprs(
 	}
 
 	// Hold the resolved type expressions of the provided exprs, in order.
-	// TODO(nvanbenschoten) Look into reducing allocations here.
+	// TODO(nvanbenschoten): Look into reducing allocations here.
 	typedExprs := make([]TypedExpr, len(exprs))
 
 	// Split the expressions into three groups of indexed expressions:
 	// - Placeholders
-	// - Numeric constants
+	// - Constants
 	// - All other Exprs
 	var resolvableExprs, constExprs, placeholderExprs []indexedExpr
 	for i, expr := range exprs {
 		idxExpr := indexedExpr{e: expr, i: i}
 		switch {
-		case isNumericConstant(expr):
+		case isConstant(expr):
 			constExprs = append(constExprs, idxExpr)
 		case ctx.isUnresolvedPlaceholder(expr):
 			placeholderExprs = append(placeholderExprs, idxExpr)
@@ -1057,14 +1079,18 @@ func typeCheckSameTypedExprs(
 	// provided to signify the desired shared type, which can be set to the
 	// required shared type using the second parameter.
 	typeCheckSameTypedConsts := func(typ Type, required bool) (Type, error) {
-		setTypeForConsts := func(typ Type) {
+		setTypeForConsts := func(typ Type) (Type, error) {
 			for _, constExpr := range constExprs {
-				typedExpr, err := typeCheckAndRequire(ctx, constExpr.e, typ, "numeric constant")
+				typedExpr, err := typeCheckAndRequire(ctx, constExpr.e, typ, "constant")
 				if err != nil {
-					panic(err)
+					// In this case, even though the constExpr has been shown to be
+					// upcastable to typ based on canConstantBecome, it can't actually be
+					// parsed as typ.
+					return nil, err
 				}
 				typedExprs[constExpr.i] = typedExpr
 			}
+			return typ, nil
 		}
 
 		// If typ is not a wildcard, all consts try to become typ.
@@ -1084,15 +1110,32 @@ func typeCheckSameTypedExprs(
 				}
 			}
 			if all {
-				setTypeForConsts(typ)
-				return typ, nil
+				return setTypeForConsts(typ)
 			}
 		}
 
-		// If all consts could not become typ, use their best shared type.
-		bestType := commonNumericConstantType(constExprs)
-		setTypeForConsts(bestType)
-		return bestType, nil
+		// If not all constExprs could become typ but they have a mutual
+		// resolvable type, use this common type.
+		if bestType, ok := commonConstantType(constExprs); ok {
+			return setTypeForConsts(bestType)
+		}
+
+		// If not, we want to force an error because the constants cannot all
+		// become the same type.
+		reqTyp := typ
+		for _, constExpr := range constExprs {
+			typedExpr, err := constExpr.e.TypeCheck(ctx, reqTyp)
+			if err != nil {
+				return nil, err
+			}
+			if typ := typedExpr.ResolvedType(); !typ.Equivalent(reqTyp) {
+				return nil, unexpectedTypeError{constExpr.e, reqTyp, typ}
+			}
+			if reqTyp == TypeAny {
+				reqTyp = typedExpr.ResolvedType()
+			}
+		}
+		panic("should throw error above")
 	}
 
 	// Used to type check all constants with the optional desired type. The
@@ -1173,6 +1216,34 @@ func typeCheckSameTypedExprs(
 	}
 }
 
+// typeCheckTupleComparison type checks a comparison between two tuples,
+// asserting that the elements of the two tuples are comparable at each index.
+func typeCheckTupleComparison(
+	ctx *SemaContext, op ComparisonOperator, left *Tuple, right *Tuple,
+) (TypedExpr, TypedExpr, error) {
+	// All tuples must have the same length.
+	tupLen := len(left.Exprs)
+	if err := checkTupleHasLength(right, tupLen); err != nil {
+		return nil, nil, err
+	}
+	left.types = make(TTuple, tupLen)
+	right.types = make(TTuple, tupLen)
+	for elemIdx := range left.Exprs {
+		leftSubExpr := left.Exprs[elemIdx]
+		rightSubExpr := right.Exprs[elemIdx]
+		leftSubExprTyped, rightSubExprTyped, _, err := typeCheckComparisonOp(ctx, op, leftSubExpr, rightSubExpr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("tuples %s are not comparable at index %d: %s",
+				Exprs([]Expr{left, right}), elemIdx+1, err)
+		}
+		left.Exprs[elemIdx] = leftSubExprTyped
+		left.types[elemIdx] = leftSubExprTyped.ResolvedType()
+		right.Exprs[elemIdx] = rightSubExprTyped
+		right.types[elemIdx] = rightSubExprTyped.ResolvedType()
+	}
+	return left, right, nil
+}
+
 // typeCheckSameTypedTupleExprs type checks a list of expressions, asserting that all
 // are tuples which have the same type. The function expects the first provided expression
 // to be a tuple, and will panic if it is not. However, it does not expect all other
@@ -1183,7 +1254,7 @@ func typeCheckSameTypedTupleExprs(
 	ctx *SemaContext, desired Type, exprs ...Expr,
 ) ([]TypedExpr, Type, error) {
 	// Hold the resolved type expressions of the provided exprs, in order.
-	// TODO(nvanbenschoten) Look into reducing allocations here.
+	// TODO(nvanbenschoten): Look into reducing allocations here.
 	typedExprs := make([]TypedExpr, len(exprs))
 
 	// All other exprs must be tuples.
@@ -1246,10 +1317,16 @@ func checkAllExprsAreTuples(ctx *SemaContext, exprs []Expr) error {
 
 func checkAllTuplesHaveLength(exprs []Expr, expectedLen int) error {
 	for _, expr := range exprs {
-		t := expr.(*Tuple)
-		if len(t.Exprs) != expectedLen {
-			return fmt.Errorf("expected tuple %v to have a length of %d", t, expectedLen)
+		if err := checkTupleHasLength(expr.(*Tuple), expectedLen); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func checkTupleHasLength(t *Tuple, expectedLen int) error {
+	if len(t.Exprs) != expectedLen {
+		return fmt.Errorf("expected tuple %v to have a length of %d", t, expectedLen)
 	}
 	return nil
 }
@@ -1335,7 +1412,7 @@ func (*placeholderAnnotationVisitor) VisitPost(expr Expr) Expr { return expr }
 //   map, no error will be thrown, and the placeholder will keep it's previously
 //   inferred type.
 //
-// TODO(nvanbenschoten) Can this visitor and map be preallocated (like normalizeVisitor)?
+// TODO(nvanbenschoten): Can this visitor and map be preallocated (like normalizeVisitor)?
 func (p PlaceholderTypes) ProcessPlaceholderAnnotations(stmt Statement) error {
 	v := placeholderAnnotationVisitor{make(map[string]annotationState)}
 

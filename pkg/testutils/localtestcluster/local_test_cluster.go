@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -55,6 +56,7 @@ type LocalTestCluster struct {
 	Gossip                   *gossip.Gossip
 	Eng                      engine.Engine
 	Store                    *storage.Store
+	StoreTestingKnobs        *storage.StoreTestingKnobs
 	DBContext                *client.DBContext
 	DB                       *client.DB
 	RangeRetryOptions        *retry.Options
@@ -97,7 +99,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initSende
 	ltc.Stopper = stop.NewStopper()
 	rpcContext := rpc.NewContext(ambient, baseCtx, ltc.Clock, ltc.Stopper)
 	server := rpc.NewServer(rpcContext) // never started
-	ltc.Gossip = gossip.New(ambient, nc, rpcContext, server, nil, ltc.Stopper, metric.NewRegistry())
+	ltc.Gossip = gossip.New(ambient, nc, rpcContext, server, ltc.Stopper, metric.NewRegistry())
 	ltc.Eng = engine.NewInMem(roachpb.Attributes{}, 50<<20)
 	ltc.Stopper.AddCloser(ltc.Eng)
 
@@ -112,10 +114,14 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initSende
 	ltc.DB = client.NewDBWithContext(ltc.Sender, ltc.Clock, *ltc.DBContext)
 	transport := storage.NewDummyRaftTransport()
 	cfg := storage.TestStoreConfig(ltc.Clock)
-	// Disable the replica scanner and split queue, which confuse tests using
-	// LocalTestCluster.
-	cfg.TestingKnobs.DisableScanner = true
-	cfg.TestingKnobs.DisableSplitQueue = true
+	// By default, disable the replica scanner and split queue, which
+	// confuse tests using LocalTestCluster.
+	if ltc.StoreTestingKnobs == nil {
+		cfg.TestingKnobs.DisableScanner = true
+		cfg.TestingKnobs.DisableSplitQueue = true
+	} else {
+		cfg.TestingKnobs = *ltc.StoreTestingKnobs
+	}
 	if ltc.RangeRetryOptions != nil {
 		cfg.RangeRetryOptions = *ltc.RangeRetryOptions
 	}
@@ -138,7 +144,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initSende
 		cfg.Gossip,
 		cfg.Clock,
 		storage.MakeStorePoolNodeLivenessFunc(cfg.NodeLiveness),
-		storage.TestTimeUntilStoreDead,
+		settings.TestingDuration(storage.TestTimeUntilStoreDead),
 		/* deterministic */ false,
 	)
 	cfg.Transport = transport
@@ -172,5 +178,5 @@ func (ltc *LocalTestCluster) Stop() {
 	if r := recover(); r != nil {
 		panic(r)
 	}
-	ltc.Stopper.Stop()
+	ltc.Stopper.Stop(context.TODO())
 }

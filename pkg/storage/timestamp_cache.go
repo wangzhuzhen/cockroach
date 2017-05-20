@@ -19,24 +19,32 @@ package storage
 import (
 	"fmt"
 	"time"
+	"unsafe"
 
+	"github.com/google/btree"
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/google/btree"
 )
 
 const (
-	// MinTSCacheWindow specifies the minimum duration to hold entries in
-	// the cache before allowing eviction. After this window expires,
-	// transactions writing to this node with timestamps lagging by more
-	// than minCacheWindow will necessarily have to advance their commit
-	// timestamp.
+	// MinTSCacheWindow specifies the minimum duration to hold entries in the
+	// cache before allowing eviction. After this window expires, transactions
+	// writing to this node with timestamps lagging by more than MinTSCacheWindow
+	// will necessarily have to advance their commit timestamp.
 	MinTSCacheWindow = 10 * time.Second
 
-	defaultEvictionSizeThreshold = 512
+	// defaultTimestampCacheSize is the default size in bytes for a store's
+	// timestamp cache. Note that the timestamp cache can use more memory than
+	// this because it holds on to all entries that are younger than
+	// MinTSCacheWindow.
+	defaultTimestampCacheSize = 64 << 20 // 64 MB
 
 	// Max entries in each btree node.
 	// TODO(peter): Not yet tuned.
@@ -48,6 +56,7 @@ const (
 // populate the read/write interval caches if a potential conflict is detected
 // due to an earlier request (based on timestamp) arriving.
 type cacheRequest struct {
+	span      roachpb.RSpan
 	reads     []roachpb.Span
 	writes    []roachpb.Span
 	txn       roachpb.Span
@@ -82,6 +91,40 @@ func (cr *cacheRequest) numSpans() int {
 	return n
 }
 
+func (cr *cacheRequest) size() uint64 {
+	var n uint64
+	for _, s := range cr.reads {
+		n += cacheEntrySize(interval.Comparable(s.Key), interval.Comparable(s.EndKey), cr.txnID)
+	}
+	for _, s := range cr.writes {
+		n += cacheEntrySize(interval.Comparable(s.Key), interval.Comparable(s.EndKey), cr.txnID)
+	}
+	if cr.txn.Key != nil {
+		n += cacheEntrySize(interval.Comparable(cr.txn.Key), nil, nil)
+	}
+	return n
+}
+
+var cacheEntryOverhead = uint64(unsafe.Sizeof(cache.IntervalKey{}) +
+	unsafe.Sizeof(cacheValue{}) + unsafe.Sizeof(cache.Entry{}))
+
+func cacheEntrySize(start, end interval.Comparable, txnID *uuid.UUID) uint64 {
+	n := uint64(cap(start))
+	if end != nil && len(start) > 0 && len(end) > 0 && &end[0] != &start[0] {
+		// If the end key exists and is not sharing memory with the start key,
+		// account for its memory usage.
+		n += uint64(cap(end))
+	}
+	if txnID != nil {
+		// Every entry which references the txn ID is charged for its memory. This
+		// results in counting that memory multiple times with the result that the
+		// cache might not be using as much memory as we've configured it for.
+		n += uint64(unsafe.Sizeof(*txnID))
+	}
+	n += cacheEntryOverhead
+	return n
+}
+
 // A TimestampCache maintains an interval tree FIFO cache of keys or
 // key ranges and the timestamps at which they were most recently read
 // or written. If a timestamp was read or written by a transaction,
@@ -105,15 +148,24 @@ type timestampCache struct {
 	reqIDAlloc int64
 	reqSpans   int
 
-	// evictionSizeThreshold allows old entries to stay in the TimestampCache
-	// indefinitely as long as the number of intervals in the cache doesn't
-	// exceed this value. Once the cache grows beyond it, intervals are
-	// evicted according to the time window. This threshold is intended to
-	// permit transactions to take longer than the eviction window duration
-	// if the size of the cache is not a concern, such as when a user
-	// is using an interactive SQL shell.
-	evictionSizeThreshold int
+	bytes    uint64
+	maxBytes uint64
 }
+
+// lowWaterTxnIDMarker is a special txn ID that identifies a cache entry as a
+// low water mark. It is specified when a lease is acquired to clear the
+// timestamp cache for a range. Also see timestampCache.getMax where this txn
+// ID is checked in order to return whether the max read/write timestamp came
+// from a regular entry or one of these low water mark entries.
+var lowWaterTxnIDMarker = func() *uuid.UUID {
+	// The specific txn ID used here isn't important. We use something that is a)
+	// non-zero and b) obvious.
+	u, err := uuid.FromString("11111111-1111-1111-1111-111111111111")
+	if err != nil {
+		log.Fatal(context.Background(), err)
+	}
+	return &u
+}()
 
 // A cacheValue combines the timestamp with an optional txn ID.
 type cacheValue struct {
@@ -139,13 +191,25 @@ func makeCacheEntry(key cache.IntervalKey, value cacheValue) *cache.Entry {
 // hybrid clock.
 func newTimestampCache(clock *hlc.Clock) *timestampCache {
 	tc := &timestampCache{
-		rCache:                cache.NewIntervalCache(cache.Config{Policy: cache.CacheFIFO}),
-		wCache:                cache.NewIntervalCache(cache.Config{Policy: cache.CacheFIFO}),
-		evictionSizeThreshold: defaultEvictionSizeThreshold,
+		rCache:   cache.NewIntervalCache(cache.Config{Policy: cache.CacheFIFO}),
+		wCache:   cache.NewIntervalCache(cache.Config{Policy: cache.CacheFIFO}),
+		maxBytes: uint64(defaultTimestampCacheSize),
 	}
 	tc.Clear(clock.Now())
 	tc.rCache.Config.ShouldEvict = tc.shouldEvict
 	tc.wCache.Config.ShouldEvict = tc.shouldEvict
+
+	onEvicted := func(k, v interface{}) {
+		ck := k.(*cache.IntervalKey)
+		cv := v.(*cacheValue)
+		reqSize := cacheEntrySize(ck.Start, ck.End, cv.txnID)
+		if tc.bytes < reqSize {
+			panic(fmt.Sprintf("bad reqSize: %d < %d", tc.bytes, reqSize))
+		}
+		tc.bytes -= reqSize
+	}
+	tc.rCache.Config.OnEvicted = onEvicted
+	tc.wCache.Config.OnEvicted = onEvicted
 	return tc
 }
 
@@ -162,14 +226,6 @@ func (tc *timestampCache) Clear(lowWater hlc.Timestamp) {
 // TimestampCache.
 func (tc *timestampCache) len() int {
 	return tc.rCache.Len() + tc.wCache.Len() + tc.reqSpans
-}
-
-// SetLowWater sets the cache's low water mark, which is the minimum
-// value the cache will return from calls to GetMax().
-func (tc *timestampCache) SetLowWater(lowWater hlc.Timestamp) {
-	if tc.lowWater.Less(lowWater) {
-		tc.lowWater = lowWater
-	}
 }
 
 // add the specified timestamp to the cache as covering the range of
@@ -198,8 +254,16 @@ func (tc *timestampCache) add(
 			value := cacheValue{timestamp: timestamp, txnID: txnID}
 			key := tcache.MakeKey(r.Start, r.End)
 			entry := makeCacheEntry(key, value)
+			tc.bytes += cacheEntrySize(r.Start, r.End, txnID)
 			tcache.AddEntry(entry)
 		}
+		addEntryAfter := func(entry, after *cache.Entry) {
+			ck := entry.Key.(*cache.IntervalKey)
+			cv := entry.Value.(*cacheValue)
+			tc.bytes += cacheEntrySize(ck.Start, ck.End, cv.txnID)
+			tcache.AddEntryAfter(entry, after)
+		}
+
 		r := interval.Range{
 			Start: interval.Comparable(start),
 			End:   interval.Comparable(end),
@@ -251,7 +315,7 @@ func (tc *timestampCache) add(
 
 					newKey := tcache.MakeKey(r.End, oldEnd)
 					newEntry := makeCacheEntry(newKey, *cv)
-					tcache.AddEntryAfter(newEntry, entry)
+					addEntryAfter(newEntry, entry)
 				case eCmp >= 0:
 					// Left partial overlap; truncate old end.
 					//
@@ -419,7 +483,7 @@ func (tc *timestampCache) add(
 					cv.txnID = nil
 					newKey := tcache.MakeKey(r.Start, key.Start)
 					newEntry := makeCacheEntry(newKey, cacheValue{timestamp: timestamp, txnID: txnID})
-					tcache.AddEntryAfter(newEntry, entry)
+					addEntryAfter(newEntry, entry)
 					r.Start = key.End
 				case sCmp > 0 && eCmp < 0:
 					// Old contains new; split up old into two. New segment is
@@ -437,7 +501,7 @@ func (tc *timestampCache) add(
 
 					newKey := tcache.MakeKey(r.End, oldEnd)
 					newEntry := makeCacheEntry(newKey, *cv)
-					tcache.AddEntryAfter(newEntry, entry)
+					addEntryAfter(newEntry, entry)
 				case eCmp == 0:
 					// Old contains new, right-aligned; truncate old end and clear
 					// ownership of new segment.
@@ -475,7 +539,7 @@ func (tc *timestampCache) add(
 					newKey := tcache.MakeKey(key.End, r.Start)
 					newCV := cacheValue{timestamp: cv.timestamp, txnID: nil}
 					newEntry := makeCacheEntry(newKey, newCV)
-					tcache.AddEntryAfter(newEntry, entry)
+					addEntryAfter(newEntry, entry)
 				case sCmp < 0:
 					// Right partial overlap; truncate old start and split new into
 					// segments owned by no txn (the overlap) and the new txn.
@@ -490,7 +554,7 @@ func (tc *timestampCache) add(
 					newKey := tcache.MakeKey(r.End, key.Start)
 					newCV := cacheValue{timestamp: cv.timestamp, txnID: nil}
 					newEntry := makeCacheEntry(newKey, newCV)
-					tcache.AddEntryAfter(newEntry, entry)
+					addEntryAfter(newEntry, entry)
 				default:
 					panic(fmt.Sprintf("no overlap between %v and %v", key.Range, r))
 				}
@@ -516,6 +580,7 @@ func (tc *timestampCache) AddRequest(req cacheRequest) {
 	req.uniqueID = tc.reqIDAlloc
 	tc.requests.ReplaceOrInsert(&req)
 	tc.reqSpans += req.numSpans()
+	tc.bytes += req.size()
 
 	// Bump the latest timestamp and evict any requests that are now too old.
 	tc.latest.Forward(req.timestamp)
@@ -524,7 +589,7 @@ func (tc *timestampCache) AddRequest(req cacheRequest) {
 
 	// Evict requests as long as the number of cached spans (both in the requests
 	// queue and the interval caches) is larger than the eviction threshold.
-	for tc.len() > tc.evictionSizeThreshold {
+	for tc.bytes > tc.maxBytes {
 		// TODO(peter): It might be more efficient to gather up the requests to
 		// delete using BTree.AscendLessThan rather than calling Min
 		// repeatedly. Maybe.
@@ -542,22 +607,27 @@ func (tc *timestampCache) AddRequest(req cacheRequest) {
 			panic(fmt.Sprintf("bad reqSpans: %d < %d", tc.reqSpans, minReq.numSpans()))
 		}
 		tc.reqSpans -= minReq.numSpans()
+		minReqSize := minReq.size()
+		if tc.bytes < minReqSize {
+			panic(fmt.Sprintf("bad reqSize: %d < %d", tc.bytes, minReqSize))
+		}
+		tc.bytes -= minReqSize
 	}
 }
 
 // ExpandRequests expands any request that is newer than the specified
-// timestamp.
-func (tc *timestampCache) ExpandRequests(timestamp hlc.Timestamp) {
+// timestamp and which overlaps the specified span.
+func (tc *timestampCache) ExpandRequests(timestamp hlc.Timestamp, span roachpb.RSpan) {
 	// Find all of the requests that have a timestamp greater than or equal to
 	// the specified timestamp. Note that we can't delete the requests during the
 	// btree iteration.
 	var reqs []*cacheRequest
 	tc.tmpReq.timestamp = timestamp
 	tc.requests.AscendGreaterOrEqual(&tc.tmpReq, func(i btree.Item) bool {
-		// TODO(peter): We could be more intelligent about not expanding a request
-		// if there is no possibility of overlap. For example, in workloads where
-		// there are concurrent bulk inserts for completely distinct ranges.
-		reqs = append(reqs, i.(*cacheRequest))
+		cr := i.(*cacheRequest)
+		if cr.span.Overlaps(span) {
+			reqs = append(reqs, cr)
+		}
 		return true
 	})
 
@@ -569,6 +639,11 @@ func (tc *timestampCache) ExpandRequests(timestamp hlc.Timestamp) {
 			panic(fmt.Sprintf("bad reqSpans: %d < %d", tc.reqSpans, req.numSpans()))
 		}
 		tc.reqSpans -= req.numSpans()
+		reqSize := req.size()
+		if tc.bytes < reqSize {
+			panic(fmt.Sprintf("bad reqSize: %d < %d", tc.bytes, reqSize))
+		}
+		tc.bytes -= reqSize
 		for _, sp := range req.reads {
 			tc.add(sp.Key, sp.EndKey, req.timestamp, req.txnID, true /* readTSCache */)
 		}
@@ -576,8 +651,12 @@ func (tc *timestampCache) ExpandRequests(timestamp hlc.Timestamp) {
 			tc.add(sp.Key, sp.EndKey, req.timestamp, req.txnID, false /* !readTSCache */)
 		}
 		if req.txn.Key != nil {
+			// Make the transaction key from the request key. We're guaranteed
+			// req.txnID != nil because we only hit this code path for
+			// EndTransactionRequests.
+			key := keys.TransactionKey(req.txn.Key, *req.txnID)
 			// We set txnID=nil because we want hits for same txn ID.
-			tc.add(req.txn.Key, req.txn.EndKey, req.timestamp, nil, false /* !readTSCache */)
+			tc.add(key, nil, req.timestamp, nil, false /* !readTSCache */)
 		}
 	}
 }
@@ -630,63 +709,16 @@ func (tc *timestampCache) getMax(
 			maxTxnID = nil
 		}
 	}
-	return maxTS, maxTxnID, ok
-}
-
-// MergeInto merges all entries from this timestamp cache into the
-// dest timestamp cache. The clear parameter, if true, copies the
-// values of lowWater and latest and clears the destination cache
-// before merging in the source.
-func (tc *timestampCache) MergeInto(dest *timestampCache, clear bool) {
-	if clear {
-		dest.Clear(tc.lowWater)
-		dest.latest = tc.latest
-		dest.reqIDAlloc = 0
-
-		// Because we just cleared the destination cache, we can directly
-		// insert entries from this cache.
-		hardMerge := func(srcCache, destCache *cache.IntervalCache) {
-			srcCache.Do(func(k, v interface{}) {
-				// Cache entries are mutable (see Add), so we give each cache its own
-				// unique copy.
-				entry := makeCacheEntry(*k.(*cache.IntervalKey), *v.(*cacheValue))
-				destCache.AddEntry(entry)
-			})
-		}
-		hardMerge(tc.rCache, dest.rCache)
-		hardMerge(tc.wCache, dest.wCache)
-	} else {
-		dest.lowWater.Forward(tc.lowWater)
-		dest.latest.Forward(tc.latest)
-
-		// The cache was not cleared before, so we can't just insert entries because
-		// intervals may need to be adjusted or removed to maintain the non-overlapping
-		// guarantee.
-		softMerge := func(srcCache *cache.IntervalCache, readTSCache bool) {
-			srcCache.Do(func(k, v interface{}) {
-				key, val := *k.(*cache.IntervalKey), *v.(*cacheValue)
-				dest.add(roachpb.Key(key.Start), roachpb.Key(key.End), val.timestamp, val.txnID, readTSCache)
-			})
-		}
-		softMerge(tc.rCache, true)
-		softMerge(tc.wCache, false)
+	if maxTxnID == lowWaterTxnIDMarker {
+		ok = false
 	}
-
-	// Copy the requests.
-	tc.requests.Ascend(func(i btree.Item) bool {
-		req := *(i.(*cacheRequest))
-		dest.reqIDAlloc++
-		req.uniqueID = dest.reqIDAlloc
-		dest.requests.ReplaceOrInsert(&req)
-		dest.reqSpans += req.numSpans()
-		return true
-	})
+	return maxTS, maxTxnID, ok
 }
 
 // shouldEvict returns true if the cache entry's timestamp is no
 // longer within the MinTSCacheWindow.
 func (tc *timestampCache) shouldEvict(size int, key, value interface{}) bool {
-	if tc.len() <= tc.evictionSizeThreshold {
+	if tc.bytes <= tc.maxBytes {
 		return false
 	}
 	ce := value.(*cacheValue)

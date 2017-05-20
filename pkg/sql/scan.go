@@ -46,7 +46,7 @@ type scanNode struct {
 	// The table columns, possibly including ones currently in schema changes.
 	cols []sqlbase.ColumnDescriptor
 	// There is a 1-1 correspondence between cols and resultColumns.
-	resultColumns ResultColumns
+	resultColumns sqlbase.ResultColumns
 	// Contains values for the current row. There is a 1-1 correspondence
 	// between resultColumns and values in row.
 	row parser.Datums
@@ -70,7 +70,7 @@ type scanNode struct {
 	ordering         orderingInfo
 
 	explain   explainMode
-	rowIndex  int // the index of the current row
+	rowIndex  int64 // the index of the current row
 	debugVals debugValues
 
 	// filter that can be evaluated using only this table/index; it contains
@@ -105,7 +105,7 @@ func (p *planner) Scan() *scanNode {
 	return &scanNode{p: p}
 }
 
-func (n *scanNode) Columns() ResultColumns {
+func (n *scanNode) Columns() sqlbase.ResultColumns {
 	return n.resultColumns
 }
 
@@ -148,14 +148,6 @@ func (n *scanNode) Close(context.Context) {}
 
 // initScan sets up the rowFetcher and starts a scan.
 func (n *scanNode) initScan(ctx context.Context) error {
-	if len(n.spans) == 0 {
-		// If no spans were specified retrieve all of the keys that start with our
-		// index key prefix. This isn't needed for the fetcher, but it is for
-		// other external users of n.spans.
-		start := roachpb.Key(sqlbase.MakeIndexKeyPrefix(&n.desc, n.index.ID))
-		n.spans = append(n.spans, roachpb.Span{Key: start, EndKey: start.PrefixEnd()})
-	}
-
 	limitHint := n.limitHint()
 	if err := n.fetcher.StartScan(ctx, n.p.txn, n.spans, !n.disableBatchLimits, limitHint); err != nil {
 		return err
@@ -184,8 +176,12 @@ func (n *scanNode) limitHint() int64 {
 
 // debugNext is a helper function used by Next() when in explainDebug mode.
 func (n *scanNode) debugNext(ctx context.Context) (bool, error) {
+	if n.hardLimit > 0 && n.rowIndex >= n.hardLimit {
+		return false, nil
+	}
+
 	// In debug mode, we output a set of debug values for each key.
-	n.debugVals.rowIdx = n.rowIndex
+	n.debugVals.rowIdx = int(n.rowIndex)
 	var err error
 	var encRow sqlbase.EncDatumRow
 	n.debugVals.key, n.debugVals.value, encRow, err = n.fetcher.NextKeyDebug(ctx)
@@ -230,7 +226,7 @@ func (n *scanNode) Next(ctx context.Context) (bool, error) {
 	}
 
 	// We fetch one row at a time until we find one that passes the filter.
-	for {
+	for n.hardLimit == 0 || n.rowIndex < n.hardLimit {
 		var err error
 		n.row, err = n.fetcher.NextRowDecoded(ctx)
 		if err != nil || n.row == nil {
@@ -241,9 +237,11 @@ func (n *scanNode) Next(ctx context.Context) (bool, error) {
 			return false, err
 		}
 		if passesFilter {
+			n.rowIndex++
 			return true, nil
 		}
 	}
+	return false, nil
 }
 
 // Initializes a scanNode with a table descriptor.
@@ -382,7 +380,7 @@ func (n *scanNode) initDescDefaults(
 			}
 		}
 	}
-	n.resultColumns = makeResultColumns(n.cols)
+	n.resultColumns = sqlbase.ResultColumnsFromColDescs(n.cols)
 	n.colIdxMap = make(map[sqlbase.ColumnID]int, len(n.cols))
 	for i, c := range n.cols {
 		n.colIdxMap[c.ID] = i
@@ -434,6 +432,10 @@ func (n *scanNode) computeOrdering(
 	// We included any implicit columns, so the results are unique.
 	ordering.unique = true
 	return ordering
+}
+
+func (n *scanNode) Spans(ctx context.Context) (reads, writes roachpb.Spans, err error) {
+	return n.spans, nil, nil
 }
 
 // scanNode implements parser.IndexedVarContainer.

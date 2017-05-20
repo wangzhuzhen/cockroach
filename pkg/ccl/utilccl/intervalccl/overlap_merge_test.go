@@ -4,7 +4,7 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/pkg/ccl/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
 
 package intervalccl
 
@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 // TODO(dan): Write a simple version of the algorithm that uses the fact that
@@ -20,6 +22,8 @@ import (
 // use it to cross-check the results. This could also be used to generate tests
 // of random inputs.
 func TestOverlapCoveringMerge(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
 	tests := []struct {
 		name string
 		// inputs is a slice of coverings. The inner slice represents a covering

@@ -21,11 +21,12 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/net/context"
+
 	"github.com/chzyer/readline"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -35,7 +36,7 @@ func TestSQLLex(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	pgurl, err := s.(*server.TestServer).Cfg.PGURL(url.User(security.RootUser))
 	if err != nil {
@@ -71,9 +72,7 @@ select '
 select ''''
 ;
 
-set syntax = modern;
-
-select ''''
+select '''
 ;
 ''';
 `,
@@ -83,14 +82,13 @@ select ''''
 | '     |
 +-------+
 (1 row)
-SET
-+------------+
-| e'\'\n;\n' |
-+------------+
-| '␤         |
-| ;␤         |
-|            |
-+------------+
++--------------+
+| e'\'\n;\n\'' |
++--------------+
+| '␤           |
+| ;␤           |
+| '            |
++--------------+
 (1 row)
 `,
 		},
@@ -136,11 +134,9 @@ func TestIsEndOfStatement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	tests := []struct {
-		syntax  parser.Syntax
 		in      string
 		isEnd   bool
 		isEmpty bool
-		hasSet  bool
 	}{
 		{
 			in:    ";",
@@ -157,18 +153,12 @@ func TestIsEndOfStatement(t *testing.T) {
 			in: "SELECT",
 		},
 		{
-			in:     "SET; SELECT 1;",
-			isEnd:  true,
-			hasSet: true,
+			in:    "SET; SELECT 1;",
+			isEnd: true,
 		},
 		{
-			in:     "SELECT ''''; SET;",
-			isEnd:  true,
-			hasSet: true,
-		},
-		{
-			in:     "SELECT ''''; SET;",
-			syntax: parser.Modern,
+			in:    "SELECT ''''; SET;",
+			isEnd: true,
 		},
 		{
 			in:      "  -- hello",
@@ -177,19 +167,12 @@ func TestIsEndOfStatement(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		syntax := test.syntax
-		if syntax == 0 {
-			syntax = parser.Traditional
-		}
-		isEmpty, isEnd, hasSet := isEndOfStatement(test.in, syntax)
+		isEmpty, isEnd := isEndOfStatement(test.in)
 		if isEmpty != test.isEmpty {
 			t.Errorf("%q: isEmpty expected %v, got %v", test.in, test.isEmpty, isEmpty)
 		}
 		if isEnd != test.isEnd {
 			t.Errorf("%q: isEnd expected %v, got %v", test.in, test.isEnd, isEnd)
-		}
-		if hasSet != test.hasSet {
-			t.Errorf("%q: hasSet expected %v, got %v", test.in, test.hasSet, hasSet)
 		}
 	}
 }

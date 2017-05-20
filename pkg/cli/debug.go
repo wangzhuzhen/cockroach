@@ -125,7 +125,7 @@ func printKeyValue(kv engine.MVCCKeyValue) (bool, error) {
 
 func runDebugKeys(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 1 {
 		return errors.New("one argument required: dir")
@@ -157,7 +157,7 @@ state like the raft HardState. With --replicated, only includes data covered by
 
 func runDebugRangeData(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 2 {
 		return errors.New("two arguments required: dir range_id")
@@ -179,7 +179,12 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 	}
 
 	iter := storage.NewReplicaDataIterator(&desc, db, debugCtx.replicated)
-	for ; iter.Valid(); iter.Next() {
+	for ; ; iter.Next() {
+		if ok, err := iter.Valid(); err != nil {
+			return err
+		} else if !ok {
+			break
+		}
 		if _, err := printKeyValue(engine.MVCCKeyValue{
 			Key:   iter.Key(),
 			Value: iter.Value(),
@@ -187,7 +192,7 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	}
-	return iter.Error()
+	return nil
 }
 
 var debugRangeDescriptorsCmd = &cobra.Command{
@@ -390,7 +395,7 @@ func loadRangeDescriptor(
 
 func runDebugRangeDescriptors(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 1 {
 		return errors.New("one argument required: dir")
@@ -429,7 +434,7 @@ func tryRaftLogEntry(kv engine.MVCCKeyValue) (string, error) {
 				return "", err
 			}
 			ent.Data = nil
-			return fmt.Sprintf("%s by %s\n%s\n%s\n", &ent, cmd.ProposerLease, cmd.BatchRequest, &cmd), nil
+			return fmt.Sprintf("%s by %s\n%s\n", &ent, cmd.ProposerLease, &cmd), nil
 		}
 		return fmt.Sprintf("%s: EMPTY\n", &ent), nil
 	} else if ent.Type == raftpb.EntryConfChange {
@@ -462,7 +467,7 @@ func printRaftLogEntry(kv engine.MVCCKeyValue) (bool, error) {
 
 func runDebugRaftLog(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 2 {
 		return errors.New("two arguments required: dir range_id")
@@ -501,7 +506,7 @@ Uses a hard-coded GC policy with a 24 hour TTL for old versions.
 
 func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 1 {
 		return errors.New("one argument required: dir")
@@ -587,7 +592,7 @@ type replicaCheckInfo struct {
 
 func runDebugCheckStoreCmd(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 1 {
 		return errors.New("one required argument: dir")
@@ -709,7 +714,7 @@ Compact the sstables in a store.
 
 func runDebugCompact(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 1 {
 		return errors.New("one argument is required")
@@ -752,7 +757,7 @@ and TiB.
 
 func runDebugSSTables(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 1 {
 		return errors.New("one argument is required")
@@ -781,7 +786,6 @@ var debugCmds = []*cobra.Command{
 	debugRocksDBCmd,
 	debugCompactCmd,
 	debugSSTablesCmd,
-	kvCmd,
 	rangeCmd,
 	debugEnvCmd,
 	debugZipCmd,

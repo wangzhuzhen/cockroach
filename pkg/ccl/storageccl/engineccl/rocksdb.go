@@ -4,24 +4,38 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/pkg/ccl/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
 
 package engineccl
 
 import (
-	"errors"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/pkg/errors"
 )
 
-// #cgo CPPFLAGS: -I../../../../vendor/github.com/cockroachdb/c-protobuf/internal/src
-// #cgo CPPFLAGS: -I../../../../vendor/github.com/cockroachdb/c-rocksdb/internal/include
-// #cgo CXXFLAGS: -std=c++11
-// #cgo !strictld,darwin LDFLAGS: -Wl,-undefined -Wl,dynamic_lookup
-// #cgo !strictld,!darwin LDFLAGS: -Wl,-unresolved-symbols=ignore-all
-// #cgo linux LDFLAGS: -lrt
+// TODO(tamird): why does rocksdb not link jemalloc,snappy statically?
+
+// #cgo CPPFLAGS: -I../../../../c-deps/rocksdb.src/include
+// #cgo LDFLAGS: -lprotobuf
+// #cgo LDFLAGS: -lrocksdb
+// #cgo LDFLAGS: -lsnappy
+// #cgo CXXFLAGS: -std=c++11 -Werror -Wall -Wno-sign-compare
+// #cgo linux LDFLAGS: -lrt -lpthread
+// #cgo windows LDFLAGS: -lrpcrt4
+//
+// // Building this package will trigger "unresolved symbol" errors
+// // because it depends on C symbols defined in pkg/storage/engine,
+// // which aren't linked until the final binary is built. This is the
+// // platform voodoo to make the linker ignore these errors.
+// //
+// // TODO(tamird, #14673): make this package compile on Windows
+// // (and without these flags elsewhere).
+// #cgo darwin LDFLAGS: -Wl,-undefined -Wl,dynamic_lookup
+// #cgo !darwin LDFLAGS: -Wl,-unresolved-symbols=ignore-all
 //
 // #include <stdlib.h>
 // #include "db.h"
@@ -32,6 +46,39 @@ import "C"
 func VerifyBatchRepr(
 	repr []byte, start, end engine.MVCCKey, nowNanos int64,
 ) (enginepb.MVCCStats, error) {
+	// We store a 4 byte checksum of each key/value entry in the value. Make
+	// sure the all ones in this BatchRepr validate.
+	//
+	// TODO(dan): After a number of hours of trying, I was unable to get a
+	// performant c++ implementation of crc32 ieee, so this verifies the
+	// checksums in go and constructs the MVCCStats in c++. It'd be nice to move
+	// one or the other.
+	{
+		r, err := engine.NewRocksDBBatchReader(repr)
+		if err != nil {
+			return enginepb.MVCCStats{}, errors.Wrapf(err, "verifying key/value checksums")
+		}
+		for r.Next() {
+			switch r.BatchType() {
+			case engine.BatchTypeValue:
+				mvccKey, err := engine.DecodeKey(r.UnsafeKey())
+				if err != nil {
+					return enginepb.MVCCStats{}, errors.Wrapf(err, "verifying key/value checksums")
+				}
+				v := roachpb.Value{RawBytes: r.UnsafeValue()}
+				if err := v.Verify(mvccKey.Key); err != nil {
+					return enginepb.MVCCStats{}, err
+				}
+			default:
+				return enginepb.MVCCStats{}, errors.Errorf(
+					"unexpected entry type in batch: %d", r.BatchType())
+			}
+		}
+		if err := r.Error(); err != nil {
+			return enginepb.MVCCStats{}, errors.Wrapf(err, "verifying key/value checksums")
+		}
+	}
+
 	var stats C.MVCCStatsResult
 	if err := statusToError(C.DBBatchReprVerify(
 		goToCSlice(repr), goToCKey(start), goToCKey(end), C.int64_t(nowNanos), &stats,

@@ -19,43 +19,17 @@ package sql
 import (
 	"bytes"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
-
-const (
-	// PgServerVersion is the latest version of postgres that we claim to support.
-	PgServerVersion = "9.5.0"
-)
-
-var varGen = map[string]func(p *planner) string{
-	`application_name`:              func(p *planner) string { return p.session.ApplicationName },
-	`database`:                      func(p *planner) string { return p.session.Database },
-	`default_transaction_isolation`: func(p *planner) string { return p.session.DefaultIsolationLevel.String() },
-	`syntax`:                        func(p *planner) string { return p.session.Syntax.String() },
-	`time zone`:                     func(p *planner) string { return p.session.Location.String() },
-	`transaction isolation level`:   func(p *planner) string { return p.txn.Isolation().String() },
-	`transaction priority`:          func(p *planner) string { return p.txn.UserPriority().String() },
-	`max_index_keys`:                func(_ *planner) string { return "32" },
-	`search_path`:                   func(p *planner) string { return strings.Join(p.session.SearchPath, ", ") },
-	`server_version`:                func(_ *planner) string { return PgServerVersion },
-	`session_user`:                  func(p *planner) string { return p.session.User },
-}
-var varNames = func() []string {
-	res := make([]string, 0, len(varGen))
-	for vName := range varGen {
-		res = append(res, vName)
-	}
-	sort.Strings(res)
-	return res
-}()
 
 const (
 	checkSchemaQuery = `
@@ -141,7 +115,7 @@ func runInDB(p *planner, tempDB string, f func() error) error {
 func queryInfoSchema(
 	ctx context.Context,
 	p *planner,
-	columns ResultColumns,
+	columns sqlbase.ResultColumns,
 	db string,
 	sql string,
 	args ...interface{},
@@ -165,16 +139,93 @@ func queryInfoSchema(
 	return v, nil
 }
 
+func (p *planner) showClusterSetting(name string) (planNode, error) {
+	var columns sqlbase.ResultColumns
+	var populate func(ctx context.Context, v *valuesNode) error
+
+	switch name {
+	case "all":
+		columns = sqlbase.ResultColumns{
+			{Name: "name", Typ: parser.TypeString},
+			{Name: "current_value", Typ: parser.TypeString},
+			{Name: "type", Typ: parser.TypeString},
+			{Name: "description", Typ: parser.TypeString},
+		}
+		populate = func(ctx context.Context, v *valuesNode) error {
+			for _, k := range settings.Keys() {
+				setting, desc, _ := settings.Lookup(k)
+				if _, err := v.rows.AddRow(ctx, parser.Datums{
+					parser.NewDString(k),
+					parser.NewDString(setting.String()),
+					parser.NewDString(setting.Typ()),
+					parser.NewDString(desc),
+				}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+	default:
+		val, _, ok := settings.Lookup(name)
+		if !ok {
+			return nil, errors.Errorf("unknown setting: %q", name)
+		}
+		var d parser.Datum
+		switch s := val.(type) {
+		case *settings.IntSetting:
+			d = parser.NewDInt(parser.DInt(s.Get()))
+		case *settings.StringSetting:
+			d = parser.NewDString(s.String())
+		case *settings.BoolSetting:
+			d = parser.MakeDBool(parser.DBool(s.Get()))
+		case *settings.FloatSetting:
+			d = parser.NewDFloat(parser.DFloat(s.Get()))
+		case *settings.DurationSetting:
+			d = &parser.DInterval{Duration: duration.Duration{Nanos: s.Get().Nanoseconds()}}
+		case *settings.EnumSetting:
+			d = parser.NewDInt(parser.DInt(s.Get()))
+		case *settings.ByteSizeSetting:
+			d = parser.NewDString(s.String())
+		default:
+			return nil, errors.Errorf("unknown setting type for %s: %s", name, val.Typ())
+		}
+		columns = sqlbase.ResultColumns{{Name: name, Typ: d.ResolvedType()}}
+		populate = func(ctx context.Context, v *valuesNode) error {
+			_, err := v.rows.AddRow(ctx, parser.Datums{d})
+			return err
+		}
+	}
+
+	return &delayedNode{
+		name:    "SHOW CLUSTER SETTING " + name,
+		columns: columns,
+		constructor: func(ctx context.Context, p *planner) (planNode, error) {
+			v := p.newContainerValuesNode(columns, 1)
+
+			if err := populate(ctx, v); err != nil {
+				v.rows.Close(ctx)
+				return nil, err
+			}
+			return v, nil
+		},
+	}, nil
+}
+
 // Show a session-local variable name.
 func (p *planner) Show(n *parser.Show) (planNode, error) {
 	origName := n.Name
 	name := strings.ToLower(n.Name)
 
-	var columns ResultColumns
+	if n.ClusterSetting {
+		return p.showClusterSetting(name)
+	}
+
+	var columns sqlbase.ResultColumns
 
 	switch name {
 	case `all`:
-		columns = ResultColumns{
+		columns = sqlbase.ResultColumns{
 			{Name: "Variable", Typ: parser.TypeString},
 			{Name: "Value", Typ: parser.TypeString},
 		}
@@ -182,7 +233,7 @@ func (p *planner) Show(n *parser.Show) (planNode, error) {
 		if _, ok := varGen[name]; !ok {
 			return nil, fmt.Errorf("unknown variable: %q", origName)
 		}
-		columns = ResultColumns{{Name: name, Typ: parser.TypeString}}
+		columns = sqlbase.ResultColumns{{Name: name, Typ: parser.TypeString}}
 	}
 
 	return &delayedNode{
@@ -195,7 +246,7 @@ func (p *planner) Show(n *parser.Show) (planNode, error) {
 			case `all`:
 				for _, vName := range varNames {
 					gen := varGen[vName]
-					value := gen(p)
+					value := gen.Get(p)
 					if _, err := v.rows.AddRow(
 						ctx, parser.Datums{parser.NewDString(vName), parser.NewDString(value)},
 					); err != nil {
@@ -207,7 +258,7 @@ func (p *planner) Show(n *parser.Show) (planNode, error) {
 				// The key in varGen is guaranteed to exist thanks to the
 				// check above.
 				gen := varGen[name]
-				value := gen(p)
+				value := gen.Get(p)
 				if _, err := v.rows.AddRow(ctx, parser.Datums{parser.NewDString(value)}); err != nil {
 					v.rows.Close(ctx)
 					return nil, err
@@ -229,7 +280,7 @@ func (p *planner) ShowColumns(ctx context.Context, n *parser.ShowColumns) (planN
 		return nil, err
 	}
 
-	columns := ResultColumns{
+	columns := sqlbase.ResultColumns{
 		{Name: "Field", Typ: parser.TypeString},
 		{Name: "Type", Typ: parser.TypeString},
 		{Name: "Null", Typ: parser.TypeBool},
@@ -303,16 +354,17 @@ func (p *planner) showCreateInterleave(
 	return s, nil
 }
 
-// ShowCreateTable returns a CREATE TABLE statement for the specified table in
-// Traditional syntax.
+// ShowCreateTable returns a CREATE TABLE statement for the specified table.
 // Privileges: Any privilege on table.
-func (p *planner) ShowCreateTable(ctx context.Context, n *parser.ShowCreateTable) (planNode, error) {
+func (p *planner) ShowCreateTable(
+	ctx context.Context, n *parser.ShowCreateTable,
+) (planNode, error) {
 	tn, err := n.Table.NormalizeWithDatabaseName(p.session.Database)
 	if err != nil {
 		return nil, err
 	}
 
-	desc, err := p.mustGetTableDesc(ctx, tn)
+	desc, err := mustGetTableDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
 	if err != nil {
 		return nil, err
 	}
@@ -320,7 +372,7 @@ func (p *planner) ShowCreateTable(ctx context.Context, n *parser.ShowCreateTable
 		return nil, err
 	}
 
-	columns := ResultColumns{
+	columns := sqlbase.ResultColumns{
 		{Name: "Table", Typ: parser.TypeString},
 		{Name: "CreateTable", Typ: parser.TypeString},
 	}
@@ -388,7 +440,7 @@ func (p *planner) showCreateTable(
 			return "", err
 		}
 		if fk := idx.ForeignKey; fk.IsSet() {
-			fkTable, err := p.getTableLeaseByID(ctx, fk.Table)
+			fkTable, err := p.session.leases.getTableLeaseByID(ctx, p.txn, fk.Table)
 			if err != nil {
 				return "", err
 			}
@@ -457,7 +509,7 @@ func makeIndexColNames(d sqlbase.IndexDescriptor) string {
 
 var isUnique = map[bool]string{true: "UNIQUE "}
 
-// quoteName quotes based on Traditional syntax and adds commas between names.
+// quoteName quotes and adds commas between names.
 func quoteNames(names ...string) string {
 	nameList := make(parser.NameList, len(names))
 	for i, n := range names {
@@ -466,8 +518,7 @@ func quoteNames(names ...string) string {
 	return parser.AsString(nameList)
 }
 
-// ShowCreateView returns a CREATE VIEW statement for the specified view in
-// Traditional syntax.
+// ShowCreateView returns a CREATE VIEW statement for the specified view.
 // Privileges: Any privilege on view.
 func (p *planner) ShowCreateView(ctx context.Context, n *parser.ShowCreateView) (planNode, error) {
 	tn, err := n.View.NormalizeWithDatabaseName(p.session.Database)
@@ -475,7 +526,7 @@ func (p *planner) ShowCreateView(ctx context.Context, n *parser.ShowCreateView) 
 		return nil, err
 	}
 
-	desc, err := p.mustGetViewDesc(ctx, tn)
+	desc, err := mustGetViewDesc(ctx, p.txn, p.getVirtualTabler(), tn)
 	if err != nil {
 		return nil, err
 	}
@@ -483,7 +534,7 @@ func (p *planner) ShowCreateView(ctx context.Context, n *parser.ShowCreateView) 
 		return nil, err
 	}
 
-	columns := ResultColumns{
+	columns := sqlbase.ResultColumns{
 		{Name: "View", Typ: parser.TypeString},
 		{Name: "CreateView", Typ: parser.TypeString},
 	}
@@ -499,7 +550,7 @@ func (p *planner) ShowCreateView(ctx context.Context, n *parser.ShowCreateView) 
 			// Determine whether custom column names were specified when the view
 			// was created, and include them if so.
 			customColNames := false
-			stmt, err := parser.ParseOneTraditional(desc.ViewQuery)
+			stmt, err := parser.ParseOne(desc.ViewQuery)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to parse underlying query from view %q", tn)
 			}
@@ -513,7 +564,7 @@ func (p *planner) ShowCreateView(ctx context.Context, n *parser.ShowCreateView) 
 			p.skipSelectPrivilegeChecks = true
 			defer func() { p.skipSelectPrivilegeChecks = false }()
 
-			sourcePlan, err := p.Select(ctx, sel, []parser.Type{}, false)
+			sourcePlan, err := p.Select(ctx, sel, []parser.Type{})
 			if err != nil {
 				return nil, err
 			}
@@ -551,11 +602,11 @@ func (p *planner) ShowCreateView(ctx context.Context, n *parser.ShowCreateView) 
 func (p *planner) ShowDatabases(ctx context.Context, n *parser.ShowDatabases) (planNode, error) {
 	const getDatabases = `SELECT SCHEMA_NAME AS "Database" FROM information_schema.schemata
 							ORDER BY "Database"`
-	stmt, err := parser.ParseOneTraditional(getDatabases)
+	stmt, err := parser.ParseOne(getDatabases)
 	if err != nil {
 		return nil, err
 	}
-	return p.newPlan(ctx, stmt, nil, true)
+	return p.newPlan(ctx, stmt, nil)
 }
 
 // ShowGrants returns grant details for the specified objects and users.
@@ -573,7 +624,7 @@ func (p *planner) ShowGrants(ctx context.Context, n *parser.ShowGrants) (planNod
 		objectType = "Table"
 	}
 
-	columns := ResultColumns{
+	columns := sqlbase.ResultColumns{
 		{Name: objectType, Typ: parser.TypeString},
 		{Name: "User", Typ: parser.TypeString},
 		{Name: "Privileges", Typ: parser.TypeString},
@@ -646,7 +697,7 @@ func (p *planner) ShowGrants(ctx context.Context, n *parser.ShowGrants) (planNod
 						v.rows.Close(ctx)
 						return nil, err
 					}
-					tables, err := p.expandTableGlob(ctx, tableGlob)
+					tables, err := expandTableGlob(ctx, p.txn, p.getVirtualTabler(), p.session.Database, tableGlob)
 					if err != nil {
 						v.rows.Close(ctx)
 						return nil, err
@@ -663,6 +714,9 @@ func (p *planner) ShowGrants(ctx context.Context, n *parser.ShowGrants) (planNod
 						paramSeq += 2
 
 					}
+				}
+				if len(paramHolders) == 0 {
+					return v, nil
 				}
 				tableGrants := fmt.Sprintf(`SELECT TABLE_NAME, GRANTEE, PRIVILEGE_TYPE FROM information_schema.table_privileges
 									WHERE (TABLE_SCHEMA, TABLE_NAME) IN (%s)`, strings.Join(paramHolders, ","))
@@ -706,7 +760,7 @@ func (p *planner) ShowIndex(ctx context.Context, n *parser.ShowIndex) (planNode,
 		return nil, err
 	}
 
-	columns := ResultColumns{
+	columns := sqlbase.ResultColumns{
 		{Name: "Table", Typ: parser.TypeString},
 		{Name: "Name", Typ: parser.TypeString},
 		{Name: "Unique", Typ: parser.TypeBool},
@@ -757,13 +811,15 @@ func (p *planner) ShowIndex(ctx context.Context, n *parser.ShowIndex) (planNode,
 // Privileges: Any privilege on table.
 //   Notes: postgres does not have a SHOW CONSTRAINTS statement.
 //          mysql requires some privilege for any column.
-func (p *planner) ShowConstraints(ctx context.Context, n *parser.ShowConstraints) (planNode, error) {
+func (p *planner) ShowConstraints(
+	ctx context.Context, n *parser.ShowConstraints,
+) (planNode, error) {
 	tn, err := n.Table.NormalizeWithDatabaseName(p.session.Database)
 	if err != nil {
 		return nil, err
 	}
 
-	desc, err := p.mustGetTableDesc(ctx, tn)
+	desc, err := mustGetTableDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
 	if err != nil {
 		return nil, err
 	}
@@ -771,7 +827,7 @@ func (p *planner) ShowConstraints(ctx context.Context, n *parser.ShowConstraints
 		return nil, err
 	}
 
-	columns := ResultColumns{
+	columns := sqlbase.ResultColumns{
 		{Name: "Table", Typ: parser.TypeString},
 		{Name: "Name", Typ: parser.TypeString},
 		{Name: "Type", Typ: parser.TypeString},
@@ -842,7 +898,7 @@ func (p *planner) ShowTables(ctx context.Context, n *parser.ShowTables) (planNod
 		return nil, errNoDatabase
 	}
 
-	columns := ResultColumns{{Name: "Table", Typ: parser.TypeString}}
+	columns := sqlbase.ResultColumns{{Name: "Table", Typ: parser.TypeString}}
 	return &delayedNode{
 		name:    "SHOW TABLES FROM " + name,
 		columns: columns,
@@ -862,21 +918,28 @@ func (p *planner) ShowTables(ctx context.Context, n *parser.ShowTables) (planNod
 	}, nil
 }
 
+// ShowTransactionStatus implements the plan for SHOW TRANSACTION STATUS.
+// This statement is usually handled as a special case in Executor,
+// but for FROM [SHOW TRANSACTION STATUS] we will arrive here too.
+func (p *planner) ShowTransactionStatus() (planNode, error) {
+	return p.Show(&parser.Show{Name: "transaction status"})
+}
+
 // ShowUsers returns all the users.
 // Privileges: SELECT on system.users.
 func (p *planner) ShowUsers(ctx context.Context, n *parser.ShowUsers) (planNode, error) {
-	stmt, err := parser.ParseOneTraditional(`SELECT username FROM system.users ORDER BY 1`)
+	stmt, err := parser.ParseOne(`SELECT username FROM system.users ORDER BY 1`)
 	if err != nil {
 		return nil, err
 	}
-	return p.newPlan(ctx, stmt, nil, true)
+	return p.newPlan(ctx, stmt, nil)
 }
 
 // Help returns usage information for the builtin functions
 // Privileges: None
 func (p *planner) Help(ctx context.Context, n *parser.Help) (planNode, error) {
-	name := strings.ToLower(n.Name.String())
-	columns := ResultColumns{
+	name := strings.ToLower(string(n.Name))
+	columns := sqlbase.ResultColumns{
 		{Name: "Function", Typ: parser.TypeString},
 		{Name: "Signature", Typ: parser.TypeString},
 		{Name: "Category", Typ: parser.TypeString},

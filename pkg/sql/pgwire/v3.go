@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -254,10 +255,11 @@ var statusReportParams = map[string]string{
 	// determine that the server is new enough.
 	"server_version": sql.PgServerVersion,
 	// The current CockroachDB version string.
-	"crdb_version": func() string {
-		info := build.GetInfo()
-		return fmt.Sprintf("CockroachDB %s %s", info.Distribution, info.Tag)
-	}(),
+	"crdb_version": build.GetInfo().Short(),
+	// If this parameter is not present, some drivers (including Python's psycopg2)
+	// will add redundant backslash escapes for compatibility with non-standard
+	// backslash handling in older versions of postgres.
+	"standard_conforming_strings": "on",
 }
 
 // handleAuthentication should discuss with the client to arrange
@@ -499,7 +501,9 @@ func (c *v3Conn) handleSimpleQuery(buf *readBuffer) error {
 		return err
 	}
 
-	return c.executeStatements(query, nil, nil, true, 0)
+	tracing.AnnotateTrace()
+	results := c.executor.ExecuteStatements(c.session, query, nil)
+	return c.finishExecute(results, nil, true, 0)
 }
 
 func (c *v3Conn) handleParse(buf *readBuffer) error {
@@ -546,7 +550,7 @@ func (c *v3Conn) handleParse(buf *readBuffer) error {
 		sqlTypeHints[strconv.Itoa(i+1)] = v
 	}
 	// Create the new PreparedStatement in the connection's Session.
-	stmt, err := c.session.PreparedStatements.New(c.executor, name, query, sqlTypeHints)
+	stmt, err := c.session.PreparedStatements.NewFromString(c.executor, name, query, sqlTypeHints)
 	if err != nil {
 		return c.sendError(err)
 	}
@@ -590,8 +594,8 @@ func (c *v3Conn) handleParse(buf *readBuffer) error {
 
 // canSendNoData returns true if describing a result of the input statement
 // type should return NoData.
-func canSendNoData(statementType parser.StatementType) bool {
-	return statementType != parser.Rows
+func canSendNoData(stmt parser.Statement) bool {
+	return stmt == nil || stmt.StatementType() != parser.Rows
 }
 
 func (c *v3Conn) handleDescribe(ctx context.Context, buf *readBuffer) error {
@@ -620,7 +624,7 @@ func (c *v3Conn) handleDescribe(ctx context.Context, buf *readBuffer) error {
 			return err
 		}
 
-		return c.sendRowDescription(ctx, stmt.Columns, nil, canSendNoData(stmt.Type))
+		return c.sendRowDescription(ctx, stmt.Columns, nil, canSendNoData(stmt.Statement))
 	case preparePortal:
 		portal, ok := c.session.PreparedPortals.Get(name)
 		if !ok {
@@ -628,7 +632,7 @@ func (c *v3Conn) handleDescribe(ctx context.Context, buf *readBuffer) error {
 		}
 
 		portalMeta := portal.ProtocolMeta.(preparedPortalMeta)
-		return c.sendRowDescription(ctx, portal.Stmt.Columns, portalMeta.outFormats, canSendNoData(portal.Stmt.Type))
+		return c.sendRowDescription(ctx, portal.Stmt.Columns, portalMeta.outFormats, canSendNoData(portal.Stmt.Statement))
 	default:
 		return errors.Errorf("unknown describe type: %s", typ)
 	}
@@ -786,6 +790,11 @@ func (c *v3Conn) handleBind(ctx context.Context, buf *readBuffer) error {
 	if err != nil {
 		return err
 	}
+
+	if log.V(2) {
+		log.Infof(ctx, "portal: %q for %q, args %q, formats %q", portalName, stmt.Statement, qargs, columnFormatCodes)
+	}
+
 	// Attach pgwire-specific metadata to the PreparedPortal.
 	portal.ProtocolMeta = preparedPortalMeta{outFormats: columnFormatCodes}
 	c.writeBuf.initMsg(serverMsgBindComplete)
@@ -808,25 +817,20 @@ func (c *v3Conn) handleExecute(buf *readBuffer) error {
 
 	stmt := portal.Stmt
 	portalMeta := portal.ProtocolMeta.(preparedPortalMeta)
-	pinfo := parser.PlaceholderInfo{
+	pinfo := &parser.PlaceholderInfo{
 		Types:  stmt.SQLTypes,
 		Values: portal.Qargs,
 	}
 
-	return c.executeStatements(stmt.Query, &pinfo, portalMeta.outFormats, false, int(limit))
+	tracing.AnnotateTrace()
+
+	results := c.executor.ExecutePreparedStatement(c.session, stmt, pinfo)
+	return c.finishExecute(results, portalMeta.outFormats, false, int(limit))
 }
 
-func (c *v3Conn) executeStatements(
-	stmts string,
-	pinfo *parser.PlaceholderInfo,
-	formatCodes []formatCode,
-	sendDescription bool,
-	limit int,
+func (c *v3Conn) finishExecute(
+	results sql.StatementResults, formatCodes []formatCode, sendDescription bool, limit int,
 ) error {
-	tracing.AnnotateTrace()
-	// Note: sql.Executor gets its Context from c.session.context, which
-	// has been bound by v3Conn.setupSession().
-	results := c.executor.ExecuteStatements(c.session, stmts, pinfo)
 	// Delay evaluation of c.session.Ctx().
 	defer func() { results.Close(c.session.Ctx()) }()
 
@@ -849,10 +853,7 @@ func (c *v3Conn) sendCommandComplete(tag []byte) error {
 // TODO(andrei): Figure out the correct codes to send for all the errors
 // in this file and remove this function.
 func (c *v3Conn) sendInternalError(errToSend string) error {
-	err := errors.Errorf(errToSend)
-	err = pgerror.WithPGCode(err, pgerror.CodeInternalError)
-	err = pgerror.WithSourceContext(err, 1)
-	return c.sendError(err)
+	return c.sendError(pgerror.NewError(pgerror.CodeInternalError, errToSend))
 }
 
 func (c *v3Conn) sendError(err error) error {
@@ -865,24 +866,29 @@ func (c *v3Conn) sendError(err error) error {
 	c.writeBuf.putErrFieldMsg(serverErrFieldSeverity)
 	c.writeBuf.writeTerminatedString("ERROR")
 
-	code, ok := pgerror.PGCode(err)
-	if !ok {
+	pgErr, ok := pgerror.GetPGCause(err)
+	var code string
+	if ok {
+		code = pgErr.Code
+	} else {
 		code = pgerror.CodeInternalError
 	}
+
 	c.writeBuf.putErrFieldMsg(serverErrFieldSQLState)
 	c.writeBuf.writeTerminatedString(code)
 
-	if detail, ok := pgerror.Detail(err); ok {
+	if ok && pgErr.Detail != "" {
 		c.writeBuf.putErrFieldMsg(serverErrFileldDetail)
-		c.writeBuf.writeTerminatedString(detail)
+		c.writeBuf.writeTerminatedString(pgErr.Detail)
 	}
 
-	if hint, ok := pgerror.Hint(err); ok {
+	if ok && pgErr.Hint != "" {
 		c.writeBuf.putErrFieldMsg(serverErrFileldHint)
-		c.writeBuf.writeTerminatedString(hint)
+		c.writeBuf.writeTerminatedString(pgErr.Hint)
 	}
 
-	if errCtx, ok := pgerror.SourceContext(err); ok {
+	if ok && pgErr.Source != nil {
+		errCtx := pgErr.Source
 		if errCtx.File != "" {
 			c.writeBuf.putErrFieldMsg(serverErrFieldSrcFile)
 			c.writeBuf.writeTerminatedString(errCtx.File)
@@ -890,7 +896,7 @@ func (c *v3Conn) sendError(err error) error {
 
 		if errCtx.Line > 0 {
 			c.writeBuf.putErrFieldMsg(serverErrFieldSrcLine)
-			c.writeBuf.writeTerminatedString(strconv.Itoa(errCtx.Line))
+			c.writeBuf.writeTerminatedString(strconv.Itoa(int(errCtx.Line)))
 		}
 
 		if errCtx.Function != "" {
@@ -993,6 +999,10 @@ func (c *v3Conn) sendResponse(
 			}
 
 		case parser.Ack, parser.DDL:
+			if result.PGTag == "SELECT" {
+				tag = append(tag, ' ')
+				tag = strconv.AppendInt(tag, int64(result.RowsAffected), 10)
+			}
 			if err := c.sendCommandComplete(tag); err != nil {
 				return err
 			}
@@ -1027,7 +1037,7 @@ func (c *v3Conn) sendResponse(
 // Query section of the docs here:
 // https://www.postgresql.org/docs/9.6/static/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
 func (c *v3Conn) sendRowDescription(
-	ctx context.Context, columns []sql.ResultColumn, formatCodes []formatCode, canSendNoData bool,
+	ctx context.Context, columns []sqlbase.ResultColumn, formatCodes []formatCode, canSendNoData bool,
 ) error {
 	if len(columns) == 0 && canSendNoData {
 		c.writeBuf.initMsg(serverMsgNoData)
@@ -1047,7 +1057,16 @@ func (c *v3Conn) sendRowDescription(
 		c.writeBuf.putInt16(0) // Column attribute ID (optional).
 		c.writeBuf.putInt32(int32(typ.oid))
 		c.writeBuf.putInt16(int16(typ.size))
-		c.writeBuf.putInt32(0) // Type modifier (none of our supported types have modifiers).
+		// The type modifier (atttypmod) is used to include various extra information
+		// about the type being sent. -1 is used for values which don't make use of
+		// atttypmod and is generally an acceptable catch-all for those that do.
+		// See https://www.postgresql.org/docs/9.6/static/catalog-pg-attribute.html
+		// for information on atttypmod. In theory we differ from Postgres by never
+		// giving the scale/precision, and by not including the length of a VARCHAR,
+		// but it's not clear if any drivers/ORMs depend on this.
+		//
+		// TODO(justin): It would be good to include this information when possible.
+		c.writeBuf.putInt32(-1)
 		if formatCodes == nil {
 			c.writeBuf.putInt16(int16(formatText))
 		} else {
@@ -1059,7 +1078,7 @@ func (c *v3Conn) sendRowDescription(
 
 // copyIn processes COPY IN data and returns the number of rows inserted.
 // See: https://www.postgresql.org/docs/current/static/protocol-flow.html#PROTOCOL-COPY
-func (c *v3Conn) copyIn(ctx context.Context, columns []sql.ResultColumn) (int64, error) {
+func (c *v3Conn) copyIn(ctx context.Context, columns []sqlbase.ResultColumn) (int64, error) {
 	var rows int64
 	defer c.session.CopyEnd(ctx)
 
@@ -1118,12 +1137,10 @@ func (c *v3Conn) copyIn(ctx context.Context, columns []sql.ResultColumn) (int64,
 }
 
 func newUnrecognizedMsgTypeErr(typ clientMessageType) error {
-	err := errors.Errorf("unrecognized client message type %v", typ)
-	err = pgerror.WithPGCode(err, pgerror.CodeProtocolViolationError)
-	return pgerror.WithSourceContext(err, 1)
+	return pgerror.NewErrorf(
+		pgerror.CodeProtocolViolationError, "unrecognized client message type %v", typ)
 }
 
 func newAdminShutdownErr(err error) error {
-	err = pgerror.WithPGCode(err, pgerror.CodeAdminShutdownError)
-	return pgerror.WithSourceContext(err, 1)
+	return pgerror.NewErrorf(pgerror.CodeAdminShutdownError, err.Error())
 }

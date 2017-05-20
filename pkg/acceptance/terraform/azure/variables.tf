@@ -73,19 +73,19 @@ variable "key_name" {
   default = "azure"
 }
 
-# SHA of the cockroach binary to pull down. If none, the latest is fetched.
+# SHA of the cockroach binary to pull down. If default, the latest is fetched.
 variable "cockroach_sha" {
-  default = ""
+  default = "LATEST"
 }
 
-# SHA of the block_writer binary to pull down. If none, the latest is fetched.
+# SHA of the block_writer binary to pull down. If default, the latest is fetched.
 variable "block_writer_sha" {
-  default = ""
+  default = "LATEST"
 }
 
-# SHA of the photos binary to pull down. If none, the latest is fetched.
+# SHA of the photos binary to pull down. If default, the latest is fetched.
 variable "photos_sha" {
-  default = ""
+  default = "LATEST"
 }
 
 # Prefix to prepend to all GC resource names.
@@ -116,4 +116,9 @@ variable "cockroach_env" {
 # to associate the results (for benchviz) with a specific test.
 variable "benchmark_name" {
   default = "BenchmarkBlockWriter"
+}
+
+# join_all specifies the join behavior.
+variable "join_all" {
+  default = "false"
 }

@@ -26,7 +26,6 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -38,15 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
-
-// newNodeTestContext returns a rpc.Context for testing.
-// It is meant to be used by nodes.
-func newNodeTestContext(clock *hlc.Clock, stopper *stop.Stopper) *rpc.Context {
-	ctx := rpc.NewContext(log.AmbientContext{}, testutils.NewNodeTestBaseContext(), clock, stopper)
-	ctx.HeartbeatInterval = 10 * time.Millisecond
-	ctx.HeartbeatTimeout = 5 * time.Second
-	return ctx
-}
 
 func newTestServer(t *testing.T, ctx *rpc.Context) (*grpc.Server, net.Listener) {
 	s := rpc.NewServer(ctx)
@@ -90,9 +80,14 @@ func TestSendToOneClient(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
-	rpcContext := newNodeTestContext(hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper)
+	rpcContext := rpc.NewContext(
+		log.AmbientContext{},
+		testutils.NewNodeTestBaseContext(),
+		hlc.NewClock(hlc.UnixNano, time.Nanosecond),
+		stopper,
+	)
 	s, ln := newTestServer(t, rpcContext)
 	roachpb.RegisterInternalServer(s, Node(0))
 
@@ -102,43 +97,6 @@ func TestSendToOneClient(t *testing.T) {
 	}
 	if reply == nil {
 		t.Errorf("expected reply")
-	}
-}
-
-// TestRetryableError verifies that Send returns a retryable error
-// when it hits an RPC error.
-func TestRetryableError(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	clientStopper := stop.NewStopper()
-	defer clientStopper.Stop()
-	clientContext := newNodeTestContext(hlc.NewClock(hlc.UnixNano, time.Nanosecond), clientStopper)
-
-	serverStopper := stop.NewStopper()
-	serverContext := newNodeTestContext(hlc.NewClock(hlc.UnixNano, time.Nanosecond), serverStopper)
-
-	s, ln := newTestServer(t, serverContext)
-	roachpb.RegisterInternalServer(s, Node(0))
-
-	addr := ln.Addr().String()
-	if _, err := clientContext.GRPCDial(addr); err != nil {
-		t.Fatal(err)
-	}
-	// Wait until the client becomes healthy and shut down the server.
-	testutils.SucceedsSoon(t, func() error {
-		return clientContext.ConnHealth(addr)
-	})
-	serverStopper.Stop()
-	// Wait until the client becomes unhealthy.
-	testutils.SucceedsSoon(t, func() error {
-		if err := clientContext.ConnHealth(addr); grpc.Code(err) != codes.Unavailable {
-			return errors.Errorf("unexpected error: %v", err)
-		}
-		return nil
-	})
-
-	if _, err := sendBatch(context.Background(), SendOptions{}, []net.Addr{ln.Addr()}, clientContext); err == nil {
-		t.Fatalf("Unexpected success")
 	}
 }
 
@@ -153,9 +111,20 @@ func (c *channelSaveTransport) IsExhausted() bool {
 	return c.remaining <= 0
 }
 
+func (c *channelSaveTransport) SendNextTimeout(defaultTimeout time.Duration) (time.Duration, bool) {
+	if c.IsExhausted() {
+		return 0, false
+	}
+	return defaultTimeout, true
+}
+
 func (c *channelSaveTransport) SendNext(_ context.Context, done chan<- BatchCall) {
 	c.remaining--
 	c.ch <- done
+}
+
+func (*channelSaveTransport) NextReplica() roachpb.ReplicaDescriptor {
+	return roachpb.ReplicaDescriptor{}
 }
 
 func (*channelSaveTransport) MoveToFront(roachpb.ReplicaDescriptor) {
@@ -176,7 +145,12 @@ func (*channelSaveTransport) Close() {
 // distinguishing them and just send a single channel.
 func setupSendNextTest(t *testing.T) ([]chan<- BatchCall, chan BatchCall, *stop.Stopper) {
 	stopper := stop.NewStopper()
-	nodeContext := newNodeTestContext(hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper)
+	nodeContext := rpc.NewContext(
+		log.AmbientContext{},
+		testutils.NewNodeTestBaseContext(),
+		hlc.NewClock(hlc.UnixNano, time.Nanosecond),
+		stopper,
+	)
 
 	addrs := []net.Addr{
 		util.NewUnresolvedAddr("dummy", "1"),
@@ -222,7 +196,7 @@ func TestSendNext_AllSlow(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	doneChans, sendChan, stopper := setupSendNextTest(t)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// Now that all replicas have been contacted, let one finish.
 	doneChans[1] <- BatchCall{
@@ -251,7 +225,7 @@ func TestSendNext_RPCErrorThenSuccess(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	doneChans, sendChan, stopper := setupSendNextTest(t)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// Now that all replicas have been contacted, let two finish with
 	// retryable errors.
@@ -289,7 +263,7 @@ func TestSendNext_AllRPCErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	doneChans, sendChan, stopper := setupSendNextTest(t)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// All replicas finish with RPC errors.
 	for i := 0; i <= 2; i++ {
@@ -310,13 +284,13 @@ func TestSendNext_RetryableApplicationErrorThenSuccess(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	doneChans, sendChan, stopper := setupSendNextTest(t)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// One replica finishes with a retryable error.
 	doneChans[1] <- BatchCall{
 		Reply: &roachpb.BatchResponse{
 			BatchResponse_Header: roachpb.BatchResponse_Header{
-				Error: roachpb.NewError(roachpb.NewRangeNotFoundError(1)),
+				Error: roachpb.NewError(roachpb.NewStoreNotFoundError(1)),
 			},
 		},
 	}
@@ -340,14 +314,14 @@ func TestSendNext_AllRetryableApplicationErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	doneChans, sendChan, stopper := setupSendNextTest(t)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// All replicas finish with a retryable error.
 	for _, ch := range doneChans {
 		ch <- BatchCall{
 			Reply: &roachpb.BatchResponse{
 				BatchResponse_Header: roachpb.BatchResponse_Header{
-					Error: roachpb.NewError(roachpb.NewRangeNotFoundError(1)),
+					Error: roachpb.NewError(roachpb.NewStoreNotFoundError(1)),
 				},
 			},
 		}
@@ -359,7 +333,7 @@ func TestSendNext_AllRetryableApplicationErrors(t *testing.T) {
 		t.Fatalf("expected SendError, got err=nil and reply=%s", bc.Reply)
 	} else if _, ok := bc.Err.(*roachpb.SendError); !ok {
 		t.Fatalf("expected SendError, got err=%s", bc.Err)
-	} else if exp := "range 1 was not found"; !testutils.IsError(bc.Err, exp) {
+	} else if exp := "store 1 was not found"; !testutils.IsError(bc.Err, exp) {
 		t.Errorf("expected SendError to contain %q, but got %v", exp, bc.Err)
 	}
 }
@@ -368,7 +342,7 @@ func TestSendNext_NonRetryableApplicationError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	doneChans, sendChan, stopper := setupSendNextTest(t)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// One replica finishes with a non-retryable error.
 	doneChans[1] <- BatchCall{
@@ -403,6 +377,13 @@ func (f *firstNErrorTransport) IsExhausted() bool {
 	return f.numSent >= len(f.replicas)
 }
 
+func (f *firstNErrorTransport) SendNextTimeout(defaultTimeout time.Duration) (time.Duration, bool) {
+	if f.IsExhausted() {
+		return 0, false
+	}
+	return defaultTimeout, true
+}
+
 func (f *firstNErrorTransport) SendNext(_ context.Context, done chan<- BatchCall) {
 	call := BatchCall{
 		Reply: &roachpb.BatchResponse{},
@@ -412,6 +393,10 @@ func (f *firstNErrorTransport) SendNext(_ context.Context, done chan<- BatchCall
 	}
 	f.numSent++
 	done <- call
+}
+
+func (f *firstNErrorTransport) NextReplica() roachpb.ReplicaDescriptor {
+	return roachpb.ReplicaDescriptor{}
 }
 
 func (*firstNErrorTransport) MoveToFront(roachpb.ReplicaDescriptor) {
@@ -426,9 +411,14 @@ func TestComplexScenarios(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
-	nodeContext := newNodeTestContext(hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper)
+	nodeContext := rpc.NewContext(
+		log.AmbientContext{},
+		testutils.NewNodeTestBaseContext(),
+		hlc.NewClock(hlc.UnixNano, time.Nanosecond),
+		stopper,
+	)
 
 	// TODO(bdarnell): the retryable flag is no longer used for RPC errors.
 	// Rework this test to incorporate application-level errors carried in

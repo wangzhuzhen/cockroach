@@ -22,8 +22,11 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -90,9 +93,6 @@ func TestReadEnvironmentVariables(t *testing.T) {
 		if err := os.Unsetenv("COCKROACH_LINEARIZABLE"); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Unsetenv("COCKROACH_MAX_OFFSET"); err != nil {
-			t.Fatal(err)
-		}
 		if err := os.Unsetenv("COCKROACH_METRICS_SAMPLE_INTERVAL"); err != nil {
 			t.Fatal(err)
 		}
@@ -109,12 +109,6 @@ func TestReadEnvironmentVariables(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := os.Unsetenv("COCKROACH_TIME_UNTIL_STORE_DEAD"); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Unsetenv("COCKROACH_CONSISTENCY_CHECK_INTERVAL"); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Unsetenv("COCKROACH_RESERVATIONS_ENABLED"); err != nil {
 			t.Fatal(err)
 		}
 		envutil.ClearEnvCache()
@@ -137,10 +131,6 @@ func TestReadEnvironmentVariables(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgExpected.Linearizable = true
-	if err := os.Setenv("COCKROACH_MAX_OFFSET", "1s"); err != nil {
-		t.Fatal(err)
-	}
-	cfgExpected.MaxOffset = time.Second
 	if err := os.Setenv("COCKROACH_METRICS_SAMPLE_INTERVAL", "1h10m"); err != nil {
 		t.Fatal(err)
 	}
@@ -161,17 +151,6 @@ func TestReadEnvironmentVariables(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgExpected.ConsistencyCheckPanicOnFailure = true
-	if err := os.Setenv("COCKROACH_TIME_UNTIL_STORE_DEAD", "10ms"); err != nil {
-		t.Fatal(err)
-	}
-	cfgExpected.TimeUntilStoreDead = time.Millisecond * 10
-	if err := os.Setenv("COCKROACH_CONSISTENCY_CHECK_INTERVAL", "10ms"); err != nil {
-		t.Fatal(err)
-	}
-	cfgExpected.ConsistencyCheckInterval = time.Millisecond * 10
-	if err := os.Setenv("COCKROACH_RESERVATIONS_ENABLED", "false"); err != nil {
-		t.Fatal(err)
-	}
 
 	envutil.ClearEnvCache()
 	cfg.readEnvironmentVariables()
@@ -181,15 +160,12 @@ func TestReadEnvironmentVariables(t *testing.T) {
 
 	for _, envVar := range []string{
 		"COCKROACH_LINEARIZABLE",
-		"COCKROACH_MAX_OFFSET",
 		"COCKROACH_METRICS_SAMPLE_INTERVAL",
 		"COCKROACH_SCAN_INTERVAL",
 		"COCKROACH_SCAN_MAX_IDLE_TIME",
 		"COCKROACH_CONSISTENCY_CHECK_INTERVAL",
 		"COCKROACH_CONSISTENCY_CHECK_PANIC_ON_FAILURE",
 		"COCKROACH_TIME_UNTIL_STORE_DEAD",
-		"COCKROACH_CONSISTENCY_CHECK_INTERVAL",
-		"COCKROACH_RESERVATIONS_ENABLED",
 	} {
 		t.Run("invalid", func(t *testing.T) {
 			if err := os.Setenv(envVar, "abcd"); err != nil {
@@ -205,5 +181,34 @@ func TestReadEnvironmentVariables(t *testing.T) {
 
 			cfg.readEnvironmentVariables()
 		})
+	}
+}
+
+func TestFilterGossipBootstrapResolvers(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	resolverSpecs := []string{
+		"127.0.0.1:9000",
+		"127.0.0.1:9001",
+		"localhost:9004",
+	}
+
+	resolvers := []resolver.Resolver{}
+	for _, rs := range resolverSpecs {
+		resolver, err := resolver.NewResolver(rs)
+		if err == nil {
+			resolvers = append(resolvers, resolver)
+		}
+	}
+	cfg := MakeConfig()
+	cfg.GossipBootstrapResolvers = resolvers
+
+	listenAddr := util.MakeUnresolvedAddr("tcp", resolverSpecs[0])
+	advertAddr := util.MakeUnresolvedAddr("tcp", resolverSpecs[2])
+	filtered := cfg.FilterGossipBootstrapResolvers(context.Background(), &listenAddr, &advertAddr)
+	if len(filtered) != 1 {
+		t.Fatalf("expected one resolver; got %+v", filtered)
+	} else if filtered[0].Addr() != resolverSpecs[1] {
+		t.Fatalf("expected resolver to be %q; got %q", resolverSpecs[1], filtered[0].Addr())
 	}
 }

@@ -55,7 +55,7 @@ func processExpression(exprSpec Expression, h *parser.IndexedVarHelper) (parser.
 	if exprSpec.Expr == "" {
 		return nil, nil
 	}
-	expr, err := parser.ParseExprTraditional(exprSpec.Expr)
+	expr, err := parser.ParseExpr(exprSpec.Expr)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +70,7 @@ func processExpression(exprSpec Expression, h *parser.IndexedVarHelper) (parser.
 	// Convert to a fully typed expression.
 	typedExpr, err := parser.TypeCheck(expr, nil, parser.TypeAny)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, expr.String())
 	}
 
 	return typedExpr, nil

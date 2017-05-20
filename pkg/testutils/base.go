@@ -17,9 +17,6 @@
 package testutils
 
 import (
-	"fmt"
-	"path/filepath"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
 )
@@ -33,11 +30,15 @@ func NewNodeTestBaseContext() *base.Config {
 
 // NewTestBaseContext creates a secure base context for user.
 func NewTestBaseContext(user string) *base.Config {
-	return &base.Config{
-		Insecure:   false,
-		SSLCA:      filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert),
-		SSLCert:    filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.crt", user)),
-		SSLCertKey: filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.key", user)),
-		User:       user,
+	cfg := &base.Config{
+		Insecure: false,
+		User:     user,
 	}
+	FillCerts(cfg)
+	return cfg
+}
+
+// FillCerts sets the certs on a base.Config.
+func FillCerts(cfg *base.Config) {
+	cfg.SSLCertsDir = security.EmbeddedCertsDir
 }

@@ -20,21 +20,21 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math"
+	"net"
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/dustin/go-humanize"
 	"github.com/elastic/gosigar"
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -46,11 +46,6 @@ import (
 
 // Context defaults.
 const (
-	// On Azure, clock offsets between 250ms and 500ms are common. On
-	// AWS and GCE, clock offsets generally stay below 250ms.
-	// See comments on Config.MaxOffset for more on this setting.
-	defaultMaxOffset = 500 * time.Millisecond
-
 	defaultCGroupMemPath            = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
 	defaultCacheSize                = 512 << 20 // 512 MB
 	defaultSQLMemoryPoolSize        = 512 << 20 // 512 MB
@@ -58,7 +53,6 @@ const (
 	defaultConsistencyCheckInterval = 24 * time.Hour
 	defaultScanMaxIdleTime          = 200 * time.Millisecond
 	defaultMetricsSampleInterval    = 10 * time.Second
-	defaultTimeUntilStoreDead       = 5 * time.Minute
 	defaultStorePath                = "cockroach-data"
 	defaultEventLogEnabled          = true
 
@@ -67,6 +61,11 @@ const (
 
 	productionSettingsWebpage = "please see https://www.cockroachlabs.com/docs/recommended-production-settings.html for more details"
 )
+
+var timeUntilStoreDead = settings.RegisterNonNegativeDurationSetting(
+	"server.time_until_store_dead",
+	"the time after which if there is no new gossiped information about a store, it is considered dead",
+	5*time.Minute)
 
 // Config holds parameters needed to setup a server.
 type Config struct {
@@ -128,7 +127,6 @@ type Config struct {
 	// Increasing this value will increase time to recovery after
 	// failures, and increase the frequency and impact of
 	// ReadWithinUncertaintyIntervalError.
-	// Environment Variable: COCKROACH_MAX_OFFSET
 	MaxOffset time.Duration
 
 	// RaftTickInterval is the resolution of the Raft timer.
@@ -167,7 +165,12 @@ type Config struct {
 	// TimeUntilStoreDead is the time after which if there is no new gossiped
 	// information about a store, it is considered dead.
 	// Environment Variable: COCKROACH_TIME_UNTIL_STORE_DEAD
-	TimeUntilStoreDead time.Duration
+	TimeUntilStoreDead *settings.DurationSetting
+
+	// SendNextTimeout is the time after which an alternate replica will
+	// be used to attempt sending a KV batch.
+	// Environment Variable: COCKROACH_SEND_NEXT_TIMEOUT
+	SendNextTimeout time.Duration
 
 	// TestingKnobs is used for internal test controls only.
 	TestingKnobs base.TestingKnobs
@@ -183,6 +186,10 @@ type Config struct {
 	// to cluster metadata, such as DDL statements and range rebalancing
 	// actions.
 	EventLogEnabled bool
+
+	// ListeningURLFile indicates the file to which the server writes
+	// its listening URL when it is ready.
+	ListeningURLFile string
 
 	// PIDFile indicates the file to which the server writes its PID when
 	// it is ready.
@@ -221,151 +228,89 @@ func (cfg Config) HistogramWindowInterval() time.Duration {
 // GetTotalMemory returns either the total system memory or if possible the
 // cgroups available memory.
 func GetTotalMemory() (int64, error) {
-	mem := gosigar.Mem{}
-	if err := mem.Get(); err != nil {
+	totalMem, err := func() (int64, error) {
+		mem := gosigar.Mem{}
+		if err := mem.Get(); err != nil {
+			return 0, err
+		}
+		if mem.Total > math.MaxInt64 {
+			return 0, fmt.Errorf("inferred memory size %s exceeds maximum supported memory size %s",
+				humanize.IBytes(mem.Total), humanize.Bytes(math.MaxInt64))
+		}
+		return int64(mem.Total), nil
+	}()
+	if err != nil {
 		return 0, err
 	}
-	if mem.Total > math.MaxInt64 {
-		return 0, fmt.Errorf("inferred memory size %s exceeds maximum supported memory size %s",
-			humanize.IBytes(mem.Total), humanize.Bytes(math.MaxInt64))
+	checkTotal := func(x int64) (int64, error) {
+		if x <= 0 {
+			// https://github.com/elastic/gosigar/issues/72
+			return 0, fmt.Errorf("inferred memory size %d is suspicious, considering invalid", x)
+		}
+		return x, nil
 	}
-	totalMem := int64(mem.Total)
-	if runtime.GOOS == "linux" {
-		var err error
-		var buf []byte
-		if buf, err = ioutil.ReadFile(defaultCGroupMemPath); err != nil {
-			if log.V(1) {
-				log.Infof(context.TODO(), "can't read available memory from cgroups (%s), using system memory %s instead", err,
-					humanizeutil.IBytes(totalMem))
-			}
-			return totalMem, nil
-		}
-		var cgAvlMem uint64
-		if cgAvlMem, err = strconv.ParseUint(strings.TrimSpace(string(buf)), 10, 64); err != nil {
-			if log.V(1) {
-				log.Infof(context.TODO(), "can't parse available memory from cgroups (%s), using system memory %s instead", err,
-					humanizeutil.IBytes(totalMem))
-			}
-			return totalMem, nil
-		}
-		if cgAvlMem > math.MaxInt64 {
-			if log.V(1) {
-				log.Infof(context.TODO(), "available memory from cgroups is too large and unsupported %s using system memory %s instead",
-					humanize.IBytes(cgAvlMem), humanizeutil.IBytes(totalMem))
-
-			}
-			return totalMem, nil
-		}
-		if cgAvlMem > mem.Total {
-			if log.V(1) {
-				log.Infof(context.TODO(), "available memory from cgroups %s exceeds system memory %s, using system memory",
-					humanize.IBytes(cgAvlMem), humanizeutil.IBytes(totalMem))
-			}
-			return totalMem, nil
-		}
-
-		return int64(cgAvlMem), nil
+	if runtime.GOOS != "linux" {
+		return checkTotal(totalMem)
 	}
-	return totalMem, nil
+
+	var buf []byte
+	if buf, err = ioutil.ReadFile(defaultCGroupMemPath); err != nil {
+		if log.V(1) {
+			log.Infof(context.TODO(), "can't read available memory from cgroups (%s), using system memory %s instead", err,
+				humanizeutil.IBytes(totalMem))
+		}
+		return checkTotal(totalMem)
+	}
+
+	cgAvlMem, err := strconv.ParseUint(strings.TrimSpace(string(buf)), 10, 64)
+	if err != nil {
+		if log.V(1) {
+			log.Infof(context.TODO(), "can't parse available memory from cgroups (%s), using system memory %s instead", err,
+				humanizeutil.IBytes(totalMem))
+		}
+		return checkTotal(totalMem)
+	}
+
+	if cgAvlMem == 0 || cgAvlMem > math.MaxInt64 {
+		if log.V(1) {
+			log.Infof(context.TODO(), "available memory from cgroups (%s) is unsupported, using system memory %s instead",
+				humanize.IBytes(cgAvlMem), humanizeutil.IBytes(totalMem))
+
+		}
+		return checkTotal(totalMem)
+	}
+
+	if totalMem > 0 && int64(cgAvlMem) > totalMem {
+		if log.V(1) {
+			log.Infof(context.TODO(), "available memory from cgroups (%s) exceeds system memory %s, using system memory",
+				humanize.IBytes(cgAvlMem), humanizeutil.IBytes(totalMem))
+		}
+		return checkTotal(totalMem)
+	}
+
+	return checkTotal(int64(cgAvlMem))
 }
 
 // setOpenFileLimit sets the soft limit for open file descriptors to the hard
 // limit if needed. Returns an error if the hard limit is too low. Returns the
 // value to set maxOpenFiles to for each store.
+//
 // Minimum - 1700 per store, 256 saved for networking
+//
 // Constrained - 256 saved for networking, rest divided evenly per store
+//
 // Constrained (network only) - 10000 per store, rest saved for networking
+//
 // Recommended - 10000 per store, 5000 for network
-// Also, please note that current and max limits are commonly referred to as
-// the soft and hard limits respectively.
+//
+// Please note that current and max limits are commonly referred to as the soft
+// and hard limits respectively.
+//
+// On Windows there is no need to change the file descriptor, known as handles,
+// limit. This limit cannot be changed and is approximately 16,711,680. See
+// https://blogs.technet.microsoft.com/markrussinovich/2009/09/29/pushing-the-limits-of-windows-handles/
 func setOpenFileLimit(physicalStoreCount int) (int, error) {
-	minimumOpenFileLimit := uint64(physicalStoreCount*engine.MinimumMaxOpenFiles + minimumNetworkFileDescriptors)
-	networkConstrainedFileLimit := uint64(physicalStoreCount*engine.RecommendedMaxOpenFiles + minimumNetworkFileDescriptors)
-	recommendedOpenFileLimit := uint64(physicalStoreCount*engine.RecommendedMaxOpenFiles + recommendedNetworkFileDescriptors)
-	var rLimit syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
-		if log.V(1) {
-			log.Infof(context.TODO(), "could not get rlimit; setting maxOpenFiles to the default value %d - %s", engine.DefaultMaxOpenFiles, err)
-		}
-		return engine.DefaultMaxOpenFiles, nil
-	}
-
-	// The max open file descriptor limit is too low.
-	if rLimit.Max < minimumOpenFileLimit {
-		return 0, fmt.Errorf("hard open file descriptor limit of %d is under the minimum required %d\n%s",
-			rLimit.Max,
-			minimumOpenFileLimit,
-			productionSettingsWebpage)
-	}
-
-	// If current open file descriptor limit is higher than the recommended
-	// value, we can just use the default value.
-	if rLimit.Cur > recommendedOpenFileLimit {
-		return engine.DefaultMaxOpenFiles, nil
-	}
-
-	// If the current limit is less than the recommended limit, set the current
-	// limit to the minimum of the max limit or the recommendedOpenFileLimit.
-	var newCurrent uint64
-	if rLimit.Max > recommendedOpenFileLimit {
-		newCurrent = recommendedOpenFileLimit
-	} else {
-		newCurrent = rLimit.Max
-	}
-	if rLimit.Cur < newCurrent {
-		if log.V(1) {
-			log.Infof(context.TODO(), "setting the soft limit for open file descriptors from %d to %d",
-				rLimit.Cur, newCurrent)
-		}
-		rLimit.Cur = newCurrent
-		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
-			return 0, err
-		}
-		// Sadly, the current limit is not always set as expected, (e.g. OSX)
-		// so fetch the limit again to see the new current limit.
-		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
-			return 0, err
-		}
-		if log.V(1) {
-			log.Infof(context.TODO(), "soft open file descriptor limit is now %d", rLimit.Cur)
-		}
-	}
-
-	// The current open file descriptor limit is still too low.
-	if rLimit.Cur < minimumOpenFileLimit {
-		return 0, fmt.Errorf("soft open file descriptor limit of %d is under the minimum required %d and cannot be increased\n%s",
-			rLimit.Cur,
-			minimumOpenFileLimit,
-			productionSettingsWebpage)
-	}
-
-	// If we have the desired number, just use the default values.
-	if rLimit.Cur >= recommendedOpenFileLimit {
-		return engine.DefaultMaxOpenFiles, nil
-	}
-
-	// We're still below the recommended amount, we should always show a
-	// warning.
-	log.Warningf(context.TODO(), "soft open file descriptor limit %d is under the recommended limit %d; this may decrease performance\n%s",
-		rLimit.Cur,
-		recommendedOpenFileLimit,
-		productionSettingsWebpage)
-
-	// if we have no physical stores, return 0.
-	if physicalStoreCount == 0 {
-		return 0, nil
-	}
-
-	// If we have more than enough file descriptors to hit the recommend number
-	// for each store, than only constrain the network ones by giving the stores
-	// their full recommended number.
-	if rLimit.Cur >= networkConstrainedFileLimit {
-		return engine.DefaultMaxOpenFiles, nil
-	}
-
-	// Always sacrifice all but the minimum needed network descriptors to be
-	// used by the stores.
-	return int(rLimit.Cur-minimumNetworkFileDescriptors) / physicalStoreCount, nil
+	return setOpenFileLimitInner(physicalStoreCount)
 }
 
 // SetOpenFileLimitForOneStore sets the soft limit for open file descriptors
@@ -376,19 +321,24 @@ func SetOpenFileLimitForOneStore() (int, error) {
 
 // MakeConfig returns a Context with default values.
 func MakeConfig() Config {
+	storeSpec, err := base.NewStoreSpec(defaultStorePath)
+	if err != nil {
+		panic(err)
+	}
 	cfg := Config{
 		Config:                   new(base.Config),
-		MaxOffset:                defaultMaxOffset,
+		MaxOffset:                base.DefaultMaxClockOffset,
 		CacheSize:                defaultCacheSize,
 		SQLMemoryPoolSize:        defaultSQLMemoryPoolSize,
 		ScanInterval:             defaultScanInterval,
 		ScanMaxIdleTime:          defaultScanMaxIdleTime,
 		ConsistencyCheckInterval: defaultConsistencyCheckInterval,
 		MetricsSampleInterval:    defaultMetricsSampleInterval,
-		TimeUntilStoreDead:       defaultTimeUntilStoreDead,
+		TimeUntilStoreDead:       timeUntilStoreDead,
+		SendNextTimeout:          base.DefaultSendNextTimeout,
 		EventLogEnabled:          defaultEventLogEnabled,
 		Stores: base.StoreSpecList{
-			Specs: []base.StoreSpec{{Path: defaultStorePath}},
+			Specs: []base.StoreSpec{storeSpec},
 		},
 	}
 	cfg.Config.InitDefaults()
@@ -414,7 +364,7 @@ func (e *Engines) Close() {
 	*e = nil
 }
 
-// CreateEngines creates Engines based on the specs in ctx.Stores.
+// CreateEngines creates Engines based on the specs in cfg.Stores.
 func (cfg *Config) CreateEngines() (Engines, error) {
 	engines := Engines(nil)
 	defer engines.Close()
@@ -516,6 +466,29 @@ func (cfg *Config) InitNode() error {
 	return nil
 }
 
+// FilterGossipBootstrapResolvers removes any gossip bootstrap resolvers which
+// match either this node's listen address or its advertised host address.
+func (cfg *Config) FilterGossipBootstrapResolvers(
+	ctx context.Context, listen, advert net.Addr,
+) []resolver.Resolver {
+	filtered := make([]resolver.Resolver, 0, len(cfg.GossipBootstrapResolvers))
+	addrs := make([]string, 0, len(cfg.GossipBootstrapResolvers))
+	for _, r := range cfg.GossipBootstrapResolvers {
+		if r.Addr() == advert.String() || r.Addr() == listen.String() {
+			if log.V(1) {
+				log.Infof(ctx, "skipping -join address %q, because a node cannot join itself", r.Addr())
+			}
+		} else {
+			filtered = append(filtered, r)
+			addrs = append(addrs, r.Addr())
+		}
+	}
+	if log.V(1) {
+		log.Infof(ctx, "initial resolvers: %v", addrs)
+	}
+	return filtered
+}
+
 // readEnvironmentVariables populates all context values that are environment
 // variable based. Note that this only happens when initializing a node and not
 // when NewContext is called.
@@ -523,11 +496,10 @@ func (cfg *Config) readEnvironmentVariables() {
 	// cockroach-linearizable
 	cfg.Linearizable = envutil.EnvOrDefaultBool("COCKROACH_LINEARIZABLE", cfg.Linearizable)
 	cfg.ConsistencyCheckPanicOnFailure = envutil.EnvOrDefaultBool("COCKROACH_CONSISTENCY_CHECK_PANIC_ON_FAILURE", cfg.ConsistencyCheckPanicOnFailure)
-	cfg.MaxOffset = envutil.EnvOrDefaultDuration("COCKROACH_MAX_OFFSET", cfg.MaxOffset)
 	cfg.MetricsSampleInterval = envutil.EnvOrDefaultDuration("COCKROACH_METRICS_SAMPLE_INTERVAL", cfg.MetricsSampleInterval)
 	cfg.ScanInterval = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_INTERVAL", cfg.ScanInterval)
 	cfg.ScanMaxIdleTime = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_MAX_IDLE_TIME", cfg.ScanMaxIdleTime)
-	cfg.TimeUntilStoreDead = envutil.EnvOrDefaultDuration("COCKROACH_TIME_UNTIL_STORE_DEAD", cfg.TimeUntilStoreDead)
+	cfg.SendNextTimeout = envutil.EnvOrDefaultDuration("COCKROACH_SEND_NEXT_TIMEOUT", cfg.SendNextTimeout)
 	cfg.ConsistencyCheckInterval = envutil.EnvOrDefaultDuration("COCKROACH_CONSISTENCY_CHECK_INTERVAL", cfg.ConsistencyCheckInterval)
 }
 

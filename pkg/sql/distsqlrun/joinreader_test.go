@@ -17,11 +17,13 @@
 package distsqlrun
 
 import (
+	"errors"
 	"testing"
 
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -34,7 +36,7 @@ func TestJoinReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// Create a table where each row is:
 	//
@@ -66,6 +68,7 @@ func TestJoinReader(t *testing.T) {
 	}{
 		{
 			post: PostProcessSpec{
+				Projection:    true,
 				OutputColumns: []uint32{0, 1, 2},
 			},
 			input: [][]parser.Datum{
@@ -79,6 +82,7 @@ func TestJoinReader(t *testing.T) {
 		{
 			post: PostProcessSpec{
 				Filter:        Expression{Expr: "@3 <= 5"}, // sum <= 5
+				Projection:    true,
 				OutputColumns: []uint32{3},
 			},
 			input: [][]parser.Datum{
@@ -98,7 +102,8 @@ func TestJoinReader(t *testing.T) {
 		flowCtx := FlowCtx{
 			evalCtx:  parser.EvalContext{},
 			txnProto: &roachpb.Transaction{},
-			clientDB: kvDB,
+			// Pass a DB without a TxnCoordSender.
+			remoteTxnDB: client.NewDB(s.DistSender(), s.Clock()),
 		}
 
 		in := &RowBuffer{}
@@ -121,7 +126,7 @@ func TestJoinReader(t *testing.T) {
 		jr.Run(context.Background(), nil)
 
 		if !in.Done {
-			t.Fatal("joinReader didn't consumer all the rows")
+			t.Fatal("joinReader didn't consume all the rows")
 		}
 		if !out.ProducerClosed {
 			t.Fatalf("output RowReceiver not closed")
@@ -143,4 +148,81 @@ func TestJoinReader(t *testing.T) {
 			t.Errorf("invalid results: %s, expected %s'", result, c.expected)
 		}
 	}
+}
+
+// TestJoinReaderDrain tests various scenarios in which a joinReader's consumer
+// is closed.
+func TestJoinReaderDrain(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	sqlutils.CreateTable(
+		t,
+		sqlDB,
+		"t",
+		"a INT, PRIMARY KEY (a)",
+		1, /* numRows */
+		sqlutils.ToRowFn(sqlutils.RowIdxFn),
+	)
+	td := sqlbase.GetTableDescriptor(kvDB, "test", "t")
+
+	flowCtx := FlowCtx{
+		evalCtx:  parser.EvalContext{},
+		txnProto: &roachpb.Transaction{},
+		// Pass a DB without a TxnCoordSender.
+		remoteTxnDB: client.NewDB(s.DistSender(), s.Clock()),
+	}
+
+	encRow := make(sqlbase.EncDatumRow, 1)
+	encRow[0] = sqlbase.DatumToEncDatum(
+		sqlbase.ColumnType{Kind: sqlbase.ColumnType_INT},
+		parser.NewDInt(1),
+	)
+
+	ctx := context.Background()
+
+	// ConsumerClosed verifies that when a joinReader's consumer is closed, the
+	// joinReader finishes gracefully.
+	t.Run("ConsumerClosed", func(t *testing.T) {
+		in := &RowBuffer{}
+		if status := in.Push(encRow, ProducerMetadata{}); status != NeedMoreRows {
+			t.Fatalf("unexpected response: %d", status)
+		}
+
+		out := &RowBuffer{}
+		out.ConsumerClosed()
+		jr, err := newJoinReader(&flowCtx, &JoinReaderSpec{Table: *td}, in, &PostProcessSpec{}, out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jr.Run(ctx, nil)
+	})
+
+	// ConsumerDone verifies that the producer drains properly by checking that
+	// metadata coming from the producer is still read when ConsumerDone is
+	// called on the consumer.
+	t.Run("ConsumerDone", func(t *testing.T) {
+		expectedMetaErr := errors.New("dummy")
+		in := &RowBuffer{}
+		if status := in.Push(encRow, ProducerMetadata{Err: expectedMetaErr}); status != NeedMoreRows {
+			t.Fatalf("unexpected response: %d", status)
+		}
+
+		out := &RowBuffer{}
+		out.ConsumerDone()
+		jr, err := newJoinReader(&flowCtx, &JoinReaderSpec{Table: *td}, in, &PostProcessSpec{}, out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jr.Run(ctx, nil)
+		row, meta := out.Next()
+		if row != nil {
+			t.Fatalf("row was pushed unexpectedly: %s", row)
+		}
+		if meta.Err != expectedMetaErr {
+			t.Fatalf("unexpected error in metadata: %v", meta.Err)
+		}
+	})
 }

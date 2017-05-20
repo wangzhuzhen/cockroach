@@ -28,8 +28,8 @@ package main
 // this file is build-tagged +glide to prevent attempting to build it.
 
 import (
+	_ "github.com/Masterminds/glide"
 	_ "github.com/client9/misspell/cmd/misspell"
-	_ "github.com/cockroachdb/c-protobuf/cmd/protoc"
 	_ "github.com/cockroachdb/crlfmt"
 	_ "github.com/cockroachdb/stress"
 	_ "github.com/golang/lint/golint"
@@ -40,9 +40,15 @@ import (
 	_ "github.com/mattn/goveralls"
 	_ "github.com/mdempsky/unconvert"
 	_ "github.com/mibk/dupl"
-	_ "github.com/robfig/glock"
 	_ "github.com/wadey/gocovmerge"
+	_ "golang.org/x/perf/cmd/benchstat"
 	_ "golang.org/x/tools/cmd/goimports"
 	_ "golang.org/x/tools/cmd/goyacc"
 	_ "golang.org/x/tools/cmd/stringer"
+
+	// These dev-only tools would not normally be included in this list, but
+	// they happen to live in the same repository as tools used in CI. We
+	// include them here for the sake of reducing necessary $GOPATH pollution.
+	_ "golang.org/x/tools/cmd/gorename"
+	_ "golang.org/x/tools/cmd/guru"
 )

@@ -23,6 +23,7 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -44,7 +45,7 @@ func (p *planner) AlterTable(ctx context.Context, n *parser.AlterTable) (planNod
 		return nil, err
 	}
 
-	tableDesc, err := p.getTableDesc(ctx, tn)
+	tableDesc, err := getTableDesc(ctx, p.txn, p.getVirtualTabler(), tn)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +80,7 @@ func (n *alterTableNode) Start(ctx context.Context) error {
 			if d.HasFKConstraint() {
 				return errors.Errorf("adding a REFERENCES constraint via ALTER not supported")
 			}
-			col, idx, err := sqlbase.MakeColumnDefDescs(d, n.p.session.SearchPath)
+			col, idx, err := sqlbase.MakeColumnDefDescs(d, n.p.session.SearchPath, &n.p.evalCtx)
 			if err != nil {
 				return err
 			}
@@ -253,6 +254,14 @@ func (n *alterTableNode) Start(ctx context.Context) error {
 							// sufficient reason to reject the DROP.
 							continue
 						}
+						if id == col.ID {
+							containsThisColumn = true
+						}
+					}
+					// The loop above this comment is for the old STORING encoding. The
+					// loop below is for the new encoding (where the STORING columns are
+					// always in the value part of a KV).
+					for _, id := range idx.StoreColumnIDs {
 						if id == col.ID {
 							containsThisColumn = true
 						}
@@ -450,7 +459,7 @@ func (n *alterTableNode) Start(ctx context.Context) error {
 	// Record this table alteration in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	if err := MakeEventLogger(n.p.session.leaseMgr).InsertEventRecord(
+	if err := MakeEventLogger(n.p.LeaseMgr()).InsertEventRecord(
 		ctx,
 		n.p.txn,
 		EventLogAlterTable,
@@ -472,13 +481,14 @@ func (n *alterTableNode) Start(ctx context.Context) error {
 	return nil
 }
 
-func (n *alterTableNode) Next(context.Context) (bool, error) { return false, nil }
-func (n *alterTableNode) Close(context.Context)              {}
-func (n *alterTableNode) Columns() ResultColumns             { return make(ResultColumns, 0) }
-func (n *alterTableNode) Ordering() orderingInfo             { return orderingInfo{} }
-func (n *alterTableNode) Values() parser.Datums              { return parser.Datums{} }
-func (n *alterTableNode) DebugValues() debugValues           { return debugValues{} }
-func (n *alterTableNode) MarkDebug(mode explainMode)         {}
+func (n *alterTableNode) Next(context.Context) (bool, error)                  { return false, nil }
+func (n *alterTableNode) Close(context.Context)                               {}
+func (n *alterTableNode) Columns() sqlbase.ResultColumns                      { return make(sqlbase.ResultColumns, 0) }
+func (n *alterTableNode) Ordering() orderingInfo                              { return orderingInfo{} }
+func (n *alterTableNode) Values() parser.Datums                               { return parser.Datums{} }
+func (n *alterTableNode) DebugValues() debugValues                            { return debugValues{} }
+func (n *alterTableNode) MarkDebug(mode explainMode)                          {}
+func (n *alterTableNode) Spans(context.Context) (_, _ roachpb.Spans, _ error) { panic("unimplemented") }
 
 func applyColumnMutation(
 	col *sqlbase.ColumnDescriptor, mut parser.ColumnMutationCmd, searchPath parser.SearchPath,
@@ -489,7 +499,7 @@ func applyColumnMutation(
 			col.DefaultExpr = nil
 		} else {
 			colDatumType := col.Type.ToDatumType()
-			if err := sqlbase.SanitizeVarFreeExpr(
+			if _, err := sqlbase.SanitizeVarFreeExpr(
 				t.Default, colDatumType, "DEFAULT", searchPath,
 			); err != nil {
 				return err

@@ -56,7 +56,8 @@ data "template_file" "supervisor" {
     # The value of the --join flag must be empty for the first node,
     # and a running node for all others. We build a list of addresses
     # shifted by one (first element is empty), then take the value at index "instance.index".
-    join_address = "${element(concat(split(",", ""), google_compute_instance.cockroach.*.network_interface.0.access_config.0.assigned_nat_ip), count.index == 0 ? 0 : 1)}"
+    # If join_all is true, --join is instead all nodes.
+    join_address = "${var.join_all == "true" ? join(",", google_compute_instance.cockroach.*.network_interface.0.access_config.0.assigned_nat_ip) : element(concat(split(",", ""), google_compute_instance.cockroach.*.network_interface.0.access_config.0.assigned_nat_ip), count.index == 0 ? 0 : 1)}"
     cockroach_flags = "${var.cockroach_flags}"
     # If the following changes, (*terrafarm.Farmer).Add() must change too.
     cockroach_env = "${var.cockroach_env}"
@@ -71,11 +72,6 @@ resource "null_resource" "cockroach-runner" {
     user = "ubuntu"
     private_key = "${file(format("~/.ssh/%s", var.key_name))}"
     host = "${element(google_compute_instance.cockroach.*.network_interface.0.access_config.0.assigned_nat_ip, count.index)}"
-  }
-
-  provisioner "file" {
-    source = "../common/download_binary.sh"
-    destination = "/home/ubuntu/download_binary.sh"
   }
 
   provisioner "file" {
@@ -120,12 +116,15 @@ FILE
       "mkdir /mnt/data0/logs",
       "ln -sf /mnt/data0/logs logs",
       "chmod 755 cockroach nodectl",
-      "[ $(stat --format=%s cockroach) -ne 0 ] || bash download_binary.sh cockroach/cockroach ${var.cockroach_sha}",
+      "[ $(stat --format=%s cockroach) -ne 0 ] || curl -sfSL https://edge-binaries.cockroachdb.com/cockroach/cockroach.linux-gnu-amd64.${var.cockroach_sha} -o cockroach",
+      "chmod +x cockroach",
       "if [ ! -e supervisor.pid ]; then supervisord -c supervisor.conf; fi",
       "supervisorctl -c supervisor.conf start cockroach",
       # Install load generators.
-      "bash download_binary.sh examples-go/block_writer ${var.block_writer_sha}",
-      "bash download_binary.sh examples-go/photos ${var.photos_sha}",
+      "curl -sfSL https://edge-binaries.cockroachdb.com/examples-go/block_writer.${var.block_writer_sha} -o block_writer",
+      "chmod +x block_writer",
+      "curl -sfSL https://edge-binaries.cockroachdb.com/examples-go/photos.${var.photos_sha} -o photos",
+      "chmod +x photos",
     ]
   }
 }

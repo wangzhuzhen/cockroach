@@ -27,16 +27,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/opentracing/opentracing-go"
 )
-
-// Allow local calls to be dispatched directly to the local server without
-// sending an RPC.
-var enableLocalCalls = envutil.EnvOrDefaultBool("COCKROACH_ENABLE_LOCAL_CALLS", true)
 
 // A SendOptions structure describes the algorithm for sending RPCs to one or
 // more replicas, depending on error conditions and how many successful
@@ -57,8 +54,9 @@ type batchClient struct {
 	client     roachpb.InternalClient
 	args       roachpb.BatchRequest
 	healthy    bool
-	retried    bool
 	pending    bool
+	retryable  bool
+	deadline   time.Time
 }
 
 // BatchCall contains a response and an RPC error (note that the
@@ -91,11 +89,22 @@ type Transport interface {
 	// IsExhausted returns true if there are no more replicas to try.
 	IsExhausted() bool
 
+	// SendNextTimeout returns the timeout after which the next untried,
+	// or retryable, replica may be attempted. Returns a duration
+	// indicating when another replica should be tried, and a bool
+	// indicating whether one should be (if false, duration will be 0).
+	SendNextTimeout(time.Duration) (time.Duration, bool)
+
 	// SendNext sends the rpc (captured at creation time) to the next
 	// replica. May panic if the transport is exhausted. Should not
 	// block; the transport is responsible for starting other goroutines
 	// as needed.
 	SendNext(context.Context, chan<- BatchCall)
+
+	// NextReplica returns the replica descriptor of the replica to be tried in
+	// the next call to SendNext. MoveToFront will cause the return value to
+	// change. Returns a zero value if the transport is exhausted.
+	NextReplica() roachpb.ReplicaDescriptor
 
 	// MoveToFront locates the specified replica and moves it to the
 	// front of the ordering of replicas to try. If the replica has
@@ -152,8 +161,60 @@ type grpcTransport struct {
 	clientPendingMu syncutil.Mutex // protects access to all batchClient pending flags
 }
 
+// IsExhausted returns false if there are any untried replicas
+// remaining. If there are none, it attempts to resurrect replicas
+// which were tried but failed with a retryable error and have a
+// deadline set which has elapsed. If any where resurrected, returns
+// false; true otherwise.
 func (gt *grpcTransport) IsExhausted() bool {
-	return gt.clientIndex == len(gt.orderedClients)
+	gt.clientPendingMu.Lock()
+	defer gt.clientPendingMu.Unlock()
+	if gt.clientIndex < len(gt.orderedClients) {
+		return false
+	}
+	return !gt.maybeResurrectRetryables()
+}
+
+// maybeResurrectRetryables moves already-tried replicas which
+// experienced a retryable error (currently this means a
+// NotLeaseHolderError) into a newly-active state so that they can be
+// retried. Returns true if any replicas were moved to active.
+func (gt *grpcTransport) maybeResurrectRetryables() bool {
+	var resurrect []batchClient
+	for i := 0; i < gt.clientIndex; i++ {
+		if c := gt.orderedClients[i]; !c.pending && c.retryable && timeutil.Since(c.deadline) >= 0 {
+			resurrect = append(resurrect, c)
+		}
+	}
+	for _, c := range resurrect {
+		gt.moveToFrontLocked(c.args.Replica)
+	}
+	return len(resurrect) > 0
+}
+
+// SendNextTimeout returns the default SendOpts.SendNextTimeout if
+// there are any untried replicas in the transport. Otherwise, it
+// returns the earliest deadline of any replicas which experienced
+// retryable errors.
+func (gt *grpcTransport) SendNextTimeout(defaultTimeout time.Duration) (time.Duration, bool) {
+	gt.clientPendingMu.Lock()
+	defer gt.clientPendingMu.Unlock()
+	if gt.clientIndex < len(gt.orderedClients) {
+		return defaultTimeout, true
+	}
+	var deadline time.Time
+	for i := 0; i < gt.clientIndex; i++ {
+		if c := gt.orderedClients[i]; !c.pending && c.retryable {
+			if (deadline == time.Time{}) || c.deadline.Before(deadline) {
+				deadline = c.deadline
+			}
+		}
+	}
+	if (deadline == time.Time{}) {
+		return 0, false
+	}
+	// Returning a negative duration is legal.
+	return deadline.Sub(timeutil.Now()), true
 }
 
 // SendNext invokes the specified RPC on the supplied client when the
@@ -162,7 +223,7 @@ func (gt *grpcTransport) IsExhausted() bool {
 func (gt *grpcTransport) SendNext(ctx context.Context, done chan<- BatchCall) {
 	client := gt.orderedClients[gt.clientIndex]
 	gt.clientIndex++
-	gt.setPending(client.args.Replica, true)
+	gt.setState(client.args.Replica, true /* pending */, false /* retryable */)
 
 	// Fork the original context as this async send may outlast the
 	// caller's context.
@@ -174,23 +235,26 @@ func (gt *grpcTransport) SendNext(ctx context.Context, done chan<- BatchCall) {
 	go func() {
 		gt.opts.metrics.SentCount.Inc(1)
 		reply, err := func() (*roachpb.BatchResponse, error) {
-			if enableLocalCalls {
-				if localServer := gt.rpcContext.GetLocalInternalServerForAddr(client.remoteAddr); localServer != nil {
-					// Clone the request. At the time of writing, Replica may mutate it
-					// during command execution which can lead to data races.
-					//
-					// TODO(tamird): we should clone all of client.args.Header, but the
-					// assertions in protoutil.Clone fire and there seems to be no
-					// reasonable workaround.
-					origTxn := client.args.Txn
-					if origTxn != nil {
-						clonedTxn := origTxn.Clone()
-						client.args.Txn = &clonedTxn
-					}
-					gt.opts.metrics.LocalSentCount.Inc(1)
-					log.VEvent(ctx, 2, "sending request to local server")
-					return localServer.Batch(ctx, &client.args)
+			if localServer := gt.rpcContext.GetLocalInternalServerForAddr(client.remoteAddr); localServer != nil {
+				// Clone the request. At the time of writing, Replica may mutate it
+				// during command execution which can lead to data races.
+				//
+				// TODO(tamird): we should clone all of client.args.Header, but the
+				// assertions in protoutil.Clone fire and there seems to be no
+				// reasonable workaround.
+				origTxn := client.args.Txn
+				if origTxn != nil {
+					clonedTxn := origTxn.Clone()
+					client.args.Txn = &clonedTxn
 				}
+
+				// Create a new context from the existing one with the "local request" field set.
+				// This tells the handler that this is an in-procress request, bypassing ctx.Peer checks.
+				localCtx := grpcutil.NewLocalRequestContext(ctx)
+
+				gt.opts.metrics.LocalSentCount.Inc(1)
+				log.VEvent(localCtx, 2, "sending request to local server")
+				return localServer.Batch(localCtx, &client.args)
 			}
 
 			log.VEventf(ctx, 2, "sending request to %s", client.remoteAddr)
@@ -204,25 +268,47 @@ func (gt *grpcTransport) SendNext(ctx context.Context, done chan<- BatchCall) {
 			}
 			return reply, err
 		}()
-		gt.setPending(client.args.Replica, false)
+		// NotLeaseHolderErrors can be retried.
+		var retryable bool
+		if reply != nil && reply.Error != nil {
+			// TODO(spencer): pass the lease expiration when setting the state to
+			// set a more efficient deadline for retrying this replica.
+			if _, ok := reply.Error.GetDetail().(*roachpb.NotLeaseHolderError); ok {
+				retryable = true
+			}
+		}
+		gt.setState(client.args.Replica, false /* pending */, retryable)
 		tracing.FinishSpan(sp)
 		done <- BatchCall{Reply: reply, Err: err}
 	}()
 }
 
+func (gt *grpcTransport) NextReplica() roachpb.ReplicaDescriptor {
+	if gt.IsExhausted() {
+		return roachpb.ReplicaDescriptor{}
+	}
+	return gt.orderedClients[gt.clientIndex].args.Replica
+}
+
 func (gt *grpcTransport) MoveToFront(replica roachpb.ReplicaDescriptor) {
 	gt.clientPendingMu.Lock()
 	defer gt.clientPendingMu.Unlock()
+	gt.moveToFrontLocked(replica)
+}
+
+func (gt *grpcTransport) moveToFrontLocked(replica roachpb.ReplicaDescriptor) {
 	for i := range gt.orderedClients {
 		if gt.orderedClients[i].args.Replica == replica {
-			// If a call to this replica is active or retried, don't move it.
-			if gt.orderedClients[i].pending || gt.orderedClients[i].retried {
+			// If a call to this replica is active, don't move it.
+			if gt.orderedClients[i].pending {
 				return
 			}
+			// Clear the retryable bit and deadline, as this replica is being made available.
+			gt.orderedClients[i].retryable = false
+			gt.orderedClients[i].deadline = time.Time{}
 			// If we've already processed the replica, decrement the current
 			// index before we swap.
 			if i < gt.clientIndex {
-				gt.orderedClients[i].retried = true
 				gt.clientIndex--
 			}
 			// Swap the client representing this replica to the front.
@@ -243,12 +329,16 @@ func (*grpcTransport) Close() {
 // mutate, but the clients reside in a slice which is shuffled via
 // MoveToFront, making it unsafe to mutate the client through a reference to
 // the slice.
-func (gt *grpcTransport) setPending(replica roachpb.ReplicaDescriptor, pending bool) {
+func (gt *grpcTransport) setState(replica roachpb.ReplicaDescriptor, pending, retryable bool) {
 	gt.clientPendingMu.Lock()
 	defer gt.clientPendingMu.Unlock()
 	for i := range gt.orderedClients {
 		if gt.orderedClients[i].args.Replica == replica {
 			gt.orderedClients[i].pending = pending
+			gt.orderedClients[i].retryable = retryable
+			if retryable {
+				gt.orderedClients[i].deadline = timeutil.Now().Add(gt.opts.SendNextTimeout)
+			}
 			return
 		}
 	}
@@ -300,6 +390,13 @@ func (s *senderTransport) IsExhausted() bool {
 	return s.called
 }
 
+func (s *senderTransport) SendNextTimeout(defaultTimeout time.Duration) (time.Duration, bool) {
+	if s.IsExhausted() {
+		return 0, false
+	}
+	return defaultTimeout, true
+}
+
 func (s *senderTransport) SendNext(ctx context.Context, done chan<- BatchCall) {
 	if s.called {
 		panic("called an exhausted transport")
@@ -321,6 +418,13 @@ func (s *senderTransport) SendNext(ctx context.Context, done chan<- BatchCall) {
 		log.Event(ctx, "error: "+pErr.String())
 	}
 	done <- BatchCall{Reply: br}
+}
+
+func (s *senderTransport) NextReplica() roachpb.ReplicaDescriptor {
+	if s.IsExhausted() {
+		return roachpb.ReplicaDescriptor{}
+	}
+	return s.args.Replica
 }
 
 func (s *senderTransport) MoveToFront(replica roachpb.ReplicaDescriptor) {

@@ -66,7 +66,7 @@ func startGossipAtAddr(
 ) *Gossip {
 	rpcContext := newInsecureRPCContext(stopper)
 	server := rpc.NewServer(rpcContext)
-	g := NewTest(nodeID, rpcContext, server, nil, stopper, registry)
+	g := NewTest(nodeID, rpcContext, server, stopper, registry)
 	ln, err := netutil.ListenAndServeGRPC(stopper, server, addr)
 	if err != nil {
 		t.Fatal(err)
@@ -126,7 +126,7 @@ func startFakeServerGossips(
 	lRPCContext := newInsecureRPCContext(stopper)
 
 	lserver := rpc.NewServer(lRPCContext)
-	local := NewTest(localNodeID, lRPCContext, lserver, nil, stopper, metric.NewRegistry())
+	local := NewTest(localNodeID, lRPCContext, lserver, stopper, metric.NewRegistry())
 	lln, err := netutil.ListenAndServeGRPC(stopper, lserver, util.IsolatedTestAddr)
 	if err != nil {
 		t.Fatal(err)
@@ -185,7 +185,7 @@ func TestClientGossip(t *testing.T) {
 	c := newClient(log.AmbientContext{}, remote.GetNodeAddr(), makeMetrics())
 
 	defer func() {
-		stopper.Stop()
+		stopper.Stop(context.TODO())
 		if c != <-disconnected {
 			t.Errorf("expected client disconnect after remote close")
 		}
@@ -215,7 +215,7 @@ func TestClientGossip(t *testing.T) {
 func TestClientGossipMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	local := startGossip(1, stopper, t, metric.NewRegistry())
 	remote := startGossip(2, stopper, t, metric.NewRegistry())
 
@@ -284,7 +284,7 @@ func TestClientNodeID(t *testing.T) {
 	disconnected <- c
 
 	defer func() {
-		stopper.Stop()
+		stopper.Stop(context.TODO())
 		if c != <-disconnected {
 			t.Errorf("expected client disconnect after remote close")
 		}
@@ -322,7 +322,7 @@ func verifyServerMaps(g *Gossip, expCount int) bool {
 func TestClientDisconnectLoopback(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	local := startGossip(1, stopper, t, metric.NewRegistry())
 	local.mu.Lock()
 	lAddr := local.mu.is.NodeAddr
@@ -344,7 +344,7 @@ func TestClientDisconnectLoopback(t *testing.T) {
 func TestClientDisconnectRedundant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	local := startGossip(1, stopper, t, metric.NewRegistry())
 	remote := startGossip(2, stopper, t, metric.NewRegistry())
 	local.mu.Lock()
@@ -381,7 +381,7 @@ func TestClientDisconnectRedundant(t *testing.T) {
 func TestClientDisallowMultipleConns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	local := startGossip(1, stopper, t, metric.NewRegistry())
 	remote := startGossip(2, stopper, t, metric.NewRegistry())
 	local.mu.Lock()
@@ -417,7 +417,7 @@ func TestClientDisallowMultipleConns(t *testing.T) {
 func TestClientRegisterWithInitNodeID(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// Create three gossip nodes, and connect to the first with NodeID 0.
 	var g []*Gossip
@@ -444,10 +444,10 @@ func TestClientRegisterWithInitNodeID(t *testing.T) {
 		resolvers = append(resolvers, resolver)
 		// node ID must be non-zero
 		gnode := NewTest(
-			roachpb.NodeID(i+1), RPCContext, server, resolvers, stopper, metric.NewRegistry(),
+			roachpb.NodeID(i+1), RPCContext, server, stopper, metric.NewRegistry(),
 		)
 		g = append(g, gnode)
-		gnode.Start(ln.Addr())
+		gnode.Start(ln.Addr(), resolvers)
 	}
 
 	testutils.SucceedsSoon(t, func() error {
@@ -488,7 +488,7 @@ func (tr *testResolver) GetAddress() (net.Addr, error) {
 func TestClientRetryBootstrap(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	local := startGossip(1, stopper, t, metric.NewRegistry())
 	remote := startGossip(2, stopper, t, metric.NewRegistry())
 
@@ -497,9 +497,10 @@ func TestClientRetryBootstrap(t *testing.T) {
 	}
 
 	local.SetBootstrapInterval(10 * time.Millisecond)
-	local.SetResolvers([]resolver.Resolver{
+	resolvers := []resolver.Resolver{
 		&testResolver{addr: remote.GetNodeAddr().String(), numFails: 3, numSuccesses: 1},
-	})
+	}
+	local.setResolvers(resolvers)
 	local.bootstrap()
 	local.manage()
 
@@ -514,7 +515,7 @@ func TestClientRetryBootstrap(t *testing.T) {
 func TestClientForwardUnresolved(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	const nodeID = 1
 	local := startGossip(nodeID, stopper, t, metric.NewRegistry())
 	addr := local.GetNodeAddr()

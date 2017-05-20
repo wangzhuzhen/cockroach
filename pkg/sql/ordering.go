@@ -57,7 +57,7 @@ type orderingInfo struct {
 
 // Format pretty-prints the orderingInfo to a stream.
 // If columns is not nil, column names are printed instead of column indexes.
-func (ord orderingInfo) Format(buf *bytes.Buffer, columns ResultColumns) {
+func (ord orderingInfo) Format(buf *bytes.Buffer, columns sqlbase.ResultColumns) {
 	sep := ""
 
 	// Print the exact match columns. We sort them to ensure
@@ -76,7 +76,7 @@ func (ord orderingInfo) Format(buf *bytes.Buffer, columns ResultColumns) {
 		if columns == nil || i >= len(columns) {
 			fmt.Fprintf(buf, "%d", i)
 		} else {
-			parser.Name(columns[i].Name).Format(buf, parser.FmtSimple)
+			parser.FormatNode(buf, parser.FmtSimple, parser.Name(columns[i].Name))
 		}
 	}
 
@@ -91,7 +91,7 @@ func (ord orderingInfo) Format(buf *bytes.Buffer, columns ResultColumns) {
 		}
 		buf.WriteByte(prefix)
 		if columns != nil && o.ColIdx < len(columns) {
-			parser.Name(columns[o.ColIdx].Name).Format(buf, parser.FmtSimple)
+			parser.FormatNode(buf, parser.FmtSimple, parser.Name(columns[o.ColIdx].Name))
 		} else {
 			fmt.Fprintf(buf, "@%d", o.ColIdx+1)
 		}
@@ -104,7 +104,7 @@ func (ord orderingInfo) Format(buf *bytes.Buffer, columns ResultColumns) {
 }
 
 // AsString pretty-prints the orderingInfo to a string.
-func (ord orderingInfo) AsString(columns ResultColumns) string {
+func (ord orderingInfo) AsString(columns sqlbase.ResultColumns) string {
 	var buf bytes.Buffer
 	ord.Format(&buf, columns)
 	return buf.String()

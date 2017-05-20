@@ -110,7 +110,7 @@ func TestTypeCheckOverloadedExprs(t *testing.T) {
 		{nil, nil, []Expr{strConst("PT12H2M")}, []overloadImpl{unaryIntervalFn, unaryTimestampFn}, nil}, // Limitation.
 		{nil, nil, []Expr{}, []overloadImpl{unaryIntFn, unaryIntFnPref}, unaryIntFnPref},
 		{nil, nil, []Expr{}, []overloadImpl{unaryIntFnPref, unaryIntFnPref}, nil},
-		{nil, nil, []Expr{strConst("PT12H2M")}, []overloadImpl{unaryIntervalFn, unaryIntFn}, nil}, // Limitation.
+		{nil, nil, []Expr{strConst("PT12H2M")}, []overloadImpl{unaryIntervalFn, unaryIntFn}, unaryIntervalFn},
 		// Unary unresolved Placeholders.
 		{nil, nil, []Expr{NewPlaceholder("a")}, []overloadImpl{unaryStringFn, unaryIntFn}, nil},
 		{nil, nil, []Expr{NewPlaceholder("a")}, []overloadImpl{unaryStringFn, binaryIntFn}, unaryStringFn},
@@ -126,7 +126,7 @@ func TestTypeCheckOverloadedExprs(t *testing.T) {
 		{nil, nil, []Expr{intConst("1"), decConst("1.0")}, []overloadImpl{binaryIntFn, binaryDecimalFn, unaryDecimalFn}, binaryDecimalFn},
 		{nil, nil, []Expr{strConst("2010-09-28"), strConst("2010-09-29")}, []overloadImpl{binaryTimestampFn}, binaryTimestampFn},
 		{nil, nil, []Expr{strConst("2010-09-28"), strConst("2010-09-29")}, []overloadImpl{binaryTimestampFn, binaryStringFn}, binaryStringFn},
-		{nil, nil, []Expr{strConst("2010-09-28"), strConst("2010-09-29")}, []overloadImpl{binaryTimestampFn, binaryIntFn}, nil}, // Limitation.
+		{nil, nil, []Expr{strConst("2010-09-28"), strConst("2010-09-29")}, []overloadImpl{binaryTimestampFn, binaryIntFn}, binaryTimestampFn},
 		// Binary unresolved Placeholders.
 		{nil, nil, []Expr{NewPlaceholder("a"), NewPlaceholder("b")}, []overloadImpl{binaryIntFn, binaryFloatFn}, nil},
 		{nil, nil, []Expr{NewPlaceholder("a"), NewPlaceholder("b")}, []overloadImpl{binaryIntFn, unaryStringFn}, binaryIntFn},
@@ -166,7 +166,7 @@ func TestTypeCheckOverloadedExprs(t *testing.T) {
 		{nil, TypeDate, []Expr{decConst("1.0"), NewPlaceholder("b")}, []overloadImpl{binaryIntFn, binaryIntDateFn}, binaryIntDateFn},
 	}
 	for i, d := range testData {
-		ctx := MakeSemaContext()
+		ctx := MakeSemaContext(false)
 		ctx.Placeholders.SetTypes(d.ptypes)
 		desired := TypeAny
 		if d.desired != nil {

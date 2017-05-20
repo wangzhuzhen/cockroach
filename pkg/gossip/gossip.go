@@ -124,13 +124,27 @@ const (
 
 // Gossip metrics counter names.
 var (
-	MetaConnectionsIncomingGauge = metric.Metadata{Name: "gossip.connections.incoming"}
-	MetaConnectionsOutgoingGauge = metric.Metadata{Name: "gossip.connections.outgoing"}
-	MetaConnectionsRefusedRates  = metric.Metadata{Name: "gossip.connections.refused"}
-	MetaInfosSentRates           = metric.Metadata{Name: "gossip.infos.sent"}
-	MetaInfosReceivedRates       = metric.Metadata{Name: "gossip.infos.received"}
-	MetaBytesSentRates           = metric.Metadata{Name: "gossip.bytes.sent"}
-	MetaBytesReceivedRates       = metric.Metadata{Name: "gossip.bytes.received"}
+	MetaConnectionsIncomingGauge = metric.Metadata{
+		Name: "gossip.connections.incoming",
+		Help: "Number of active incoming gossip connections"}
+	MetaConnectionsOutgoingGauge = metric.Metadata{
+		Name: "gossip.connections.outgoing",
+		Help: "Number of active outgoing gossip connections"}
+	MetaConnectionsRefused = metric.Metadata{
+		Name: "gossip.connections.refused",
+		Help: "Number of refused incoming gossip connections"}
+	MetaInfosSent = metric.Metadata{
+		Name: "gossip.infos.sent",
+		Help: "Number of sent gossip Info objects"}
+	MetaInfosReceived = metric.Metadata{
+		Name: "gossip.infos.received",
+		Help: "Number of received gossip Info objects"}
+	MetaBytesSent = metric.Metadata{
+		Name: "gossip.bytes.sent",
+		Help: "Number of sent gossip bytes"}
+	MetaBytesReceived = metric.Metadata{
+		Name: "gossip.bytes.received",
+		Help: "Number of received gossip bytes"}
 )
 
 var (
@@ -217,7 +231,6 @@ func New(
 	nodeID *base.NodeIDContainer,
 	rpcContext *rpc.Context,
 	grpcServer *grpc.Server,
-	resolvers []resolver.Resolver,
 	stopper *stop.Stopper,
 	registry *metric.Registry,
 ) *Gossip {
@@ -233,6 +246,7 @@ func New(
 		stallInterval:     defaultStallInterval,
 		bootstrapInterval: defaultBootstrapInterval,
 		cullInterval:      defaultCullInterval,
+		resolversTried:    map[int]struct{}{},
 		nodeDescs:         map[roachpb.NodeID]*roachpb.NodeDescriptor{},
 		resolverAddrs:     map[util.UnresolvedAddr]resolver.Resolver{},
 		bootstrapAddrs:    map[util.UnresolvedAddr]roachpb.NodeID{},
@@ -241,15 +255,6 @@ func New(
 
 	registry.AddMetric(g.outgoing.gauge)
 	g.clientsMu.breakers = map[string]*circuit.Breaker{}
-	resolverAddrs := make([]string, len(resolvers))
-	for i, resolver := range resolvers {
-		resolverAddrs[i] = resolver.Addr()
-	}
-	ctx := g.AnnotateCtx(context.Background())
-	if log.V(1) {
-		log.Infof(ctx, "initial resolvers: %v", resolverAddrs)
-	}
-	g.SetResolvers(resolvers)
 
 	g.mu.Lock()
 	// Add ourselves as a SystemConfig watcher.
@@ -268,14 +273,13 @@ func NewTest(
 	nodeID roachpb.NodeID,
 	rpcContext *rpc.Context,
 	grpcServer *grpc.Server,
-	resolvers []resolver.Resolver,
 	stopper *stop.Stopper,
 	registry *metric.Registry,
 ) *Gossip {
 	n := &base.NodeIDContainer{}
 	var ac log.AmbientContext
 	ac.AddLogTag("n", n)
-	gossip := New(ac, n, rpcContext, grpcServer, resolvers, stopper, registry)
+	gossip := New(ac, n, rpcContext, grpcServer, stopper, registry)
 	if nodeID != 0 {
 		n.Set(context.TODO(), nodeID)
 	}
@@ -386,15 +390,21 @@ func (g *Gossip) SetStorage(storage Storage) error {
 	return nil
 }
 
-// SetResolvers initializes the set of gossip resolvers used to
-// find nodes to bootstrap the gossip network.
-func (g *Gossip) SetResolvers(resolvers []resolver.Resolver) {
+// setResolvers initializes the set of gossip resolvers used to find
+// nodes to bootstrap the gossip network.
+func (g *Gossip) setResolvers(resolvers []resolver.Resolver) {
+	if resolvers == nil {
+		return
+	}
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
 	// Start index at end because get next address loop logic increments as first step.
 	g.resolverIdx = len(resolvers) - 1
 	g.resolvers = resolvers
 	g.resolversTried = map[int]struct{}{}
+
 	// Start new bootstrapping immediately instead of waiting for next bootstrap interval.
 	g.maybeSignalStatusChangeLocked()
 }
@@ -586,7 +596,7 @@ func maxPeers(nodeCount int) int {
 }
 
 // updateNodeAddress is a gossip callback which fires with each
-// update to the node address. This allows us to compute the
+// update to a node descriptor. This allows us to compute the
 // total size of the gossip network (for determining max peers
 // each gossip node is allowed to have), as well as to create
 // new resolvers for each encountered host and to write the
@@ -598,6 +608,9 @@ func (g *Gossip) updateNodeAddress(key string, content roachpb.Value) {
 	if err := content.GetProto(&desc); err != nil {
 		log.Error(ctx, err)
 		return
+	}
+	if log.V(1) {
+		log.Infof(ctx, "updateNodeAddress called on %q with desc %+v", key, desc)
 	}
 
 	g.mu.Lock()
@@ -619,11 +632,15 @@ func (g *Gossip) updateNodeAddress(key string, content roachpb.Value) {
 		return
 	}
 
-	// Skip if the node has already been seen.
-	if _, ok := g.nodeDescs[desc.NodeID]; ok {
+	existingDesc, ok := g.nodeDescs[desc.NodeID]
+	if !ok || !proto.Equal(existingDesc, &desc) {
+		g.nodeDescs[desc.NodeID] = &desc
+	}
+	// Skip all remaining logic if the address hasn't changed, since that's all
+	// the logic cares about.
+	if ok && existingDesc.Address == desc.Address {
 		return
 	}
-	g.nodeDescs[desc.NodeID] = &desc
 	g.recomputeMaxPeersLocked()
 
 	// Skip if it's our own address.
@@ -655,7 +672,7 @@ func (g *Gossip) updateNodeAddress(key string, content roachpb.Value) {
 		// Deleting the local copy isn't enough to remove the node from the gossip
 		// network. We also have to clear it out in the infoStore by overwriting
 		// it with an empty descriptor, which can be represented as just an empty
-		// byte array due to how protocol buffers are serialied.
+		// byte array due to how protocol buffers are serialized.
 		// Calling addInfoLocked here is somewhat recursive since
 		// updateNodeAddress is typically called in response to the infoStore
 		// being updated but won't lead to deadlock because it's called
@@ -921,18 +938,19 @@ func (g *Gossip) MaxHops() uint32 {
 // Start launches the gossip instance, which commences joining the
 // gossip network using the supplied rpc server and previously known
 // peer addresses in addition to any bootstrap addresses specified via
-// --join.
+// --join and passed to this method via the resolvers parameter.
 //
-// The supplied address is used to identify the gossip instance in the
-// gossip network; it will be used by other instances to connect to
-// this instance.
+// The supplied advertised address is used to identify the gossip
+// instance in the gossip network; it will be used by other instances
+// to connect to this instance.
 //
 // This method starts bootstrap loop, gossip server, and client
 // management in separate goroutines and returns.
-func (g *Gossip) Start(addr net.Addr) {
-	g.server.start(addr) // serve gossip protocol
-	g.bootstrap()        // bootstrap gossip client
-	g.manage()           // manage gossip clients
+func (g *Gossip) Start(advertAddr net.Addr, resolvers []resolver.Resolver) {
+	g.setResolvers(resolvers)
+	g.server.start(advertAddr) // serve gossip protocol
+	g.bootstrap()              // bootstrap gossip client
+	g.manage()                 // manage gossip clients
 }
 
 // hasIncomingLocked returns whether the server has an incoming gossip
@@ -1000,13 +1018,13 @@ func (g *Gossip) getNextBootstrapAddressLocked() net.Addr {
 // receives notifications that gossip network connectivity has been
 // lost and requires re-bootstrapping.
 func (g *Gossip) bootstrap() {
-	g.server.stopper.RunWorker(func() {
-		ctx := g.AnnotateCtx(context.Background())
+	ctx := g.AnnotateCtx(context.Background())
+	g.server.stopper.RunWorker(ctx, func(ctx context.Context) {
 		ctx = log.WithLogTag(ctx, "bootstrap", nil)
 		var bootstrapTimer timeutil.Timer
 		defer bootstrapTimer.Stop()
 		for {
-			if g.server.stopper.RunTask(func() {
+			if g.server.stopper.RunTask(ctx, func(ctx context.Context) {
 				g.mu.Lock()
 				defer g.mu.Unlock()
 				haveClients := g.outgoing.len() > 0
@@ -1065,8 +1083,8 @@ func (g *Gossip) bootstrap() {
 // connections or the sentinel gossip is unavailable, the bootstrapper
 // is notified via the stalled conditional variable.
 func (g *Gossip) manage() {
-	g.server.stopper.RunWorker(func() {
-		ctx := g.AnnotateCtx(context.Background())
+	ctx := g.AnnotateCtx(context.Background())
+	g.server.stopper.RunWorker(ctx, func(ctx context.Context) {
 		cullTicker := time.NewTicker(g.jitteredInterval(g.cullInterval))
 		stallTicker := time.NewTicker(g.jitteredInterval(g.stallInterval))
 		defer cullTicker.Stop()
@@ -1292,10 +1310,10 @@ func (m Metrics) String() string {
 
 func makeMetrics() Metrics {
 	return Metrics{
-		ConnectionsRefused: metric.NewCounter(MetaConnectionsRefusedRates),
-		BytesReceived:      metric.NewCounter(MetaBytesReceivedRates),
-		BytesSent:          metric.NewCounter(MetaBytesSentRates),
-		InfosReceived:      metric.NewCounter(MetaInfosReceivedRates),
-		InfosSent:          metric.NewCounter(MetaInfosSentRates),
+		ConnectionsRefused: metric.NewCounter(MetaConnectionsRefused),
+		BytesReceived:      metric.NewCounter(MetaBytesReceived),
+		BytesSent:          metric.NewCounter(MetaBytesSent),
+		InfosReceived:      metric.NewCounter(MetaInfosReceived),
+		InfosSent:          metric.NewCounter(MetaInfosSent),
 	}
 }

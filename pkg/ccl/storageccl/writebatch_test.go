@@ -4,7 +4,7 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/pkg/ccl/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
 
 package storageccl
 
@@ -35,13 +35,10 @@ import (
 
 func TestDBWriteBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	if !storage.ProposerEvaluatedKVEnabled() {
-		t.Skip("command WriteBatch is not allowed without proposer evaluated KV")
-	}
 
 	s, _, db := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
-	defer s.Stopper().Stop()
 	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
 
 	// Key range in request spans multiple ranges.
 	if err := db.WriteBatch(
@@ -101,13 +98,24 @@ func TestDBWriteBatch(t *testing.T) {
 			t.Errorf("expected nil, got \"%s\"", result)
 		}
 	}
+
+	// Invalid key/value entry checksum.
+	{
+		var batch engine.RocksDBBatchBuilder
+		key := engine.MVCCKey{Key: []byte("bb"), Timestamp: hlc.Timestamp{WallTime: 1}}
+		value := roachpb.MakeValueFromString("1")
+		value.InitChecksum([]byte("foo"))
+		batch.Put(key, value.RawBytes)
+		data := batch.Finish()
+
+		if err := db.WriteBatch(ctx, "b", "c", data); !testutils.IsError(err, "invalid checksum") {
+			t.Fatalf("expected 'invalid checksum' error got: %+v", err)
+		}
+	}
 }
 
 func TestWriteBatchMVCCStats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	if !storage.ProposerEvaluatedKVEnabled() {
-		t.Skip("command WriteBatch is not allowed without proposer evaluated KV")
-	}
 
 	ctx := context.Background()
 	e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
@@ -174,9 +182,6 @@ func TestWriteBatchMVCCStats(t *testing.T) {
 }
 
 func BenchmarkWriteBatch(b *testing.B) {
-	if !storage.ProposerEvaluatedKVEnabled() {
-		b.Skip("command WriteBatch is not allowed without proposer evaluated KV")
-	}
 	rng, _ := randutil.NewPseudoRand()
 	const payloadSize = 100
 	v := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, payloadSize))
@@ -186,7 +191,7 @@ func BenchmarkWriteBatch(b *testing.B) {
 		b.Run(strconv.Itoa(numEntries), func(b *testing.B) {
 			ctx := context.Background()
 			tc := testcluster.StartTestCluster(b, 3, base.TestClusterArgs{})
-			defer tc.Stopper().Stop()
+			defer tc.Stopper().Stop(ctx)
 			kvDB := tc.Server(0).KVClient().(*client.DB)
 
 			id := keys.MaxReservedDescID + 1

@@ -32,9 +32,9 @@ import (
 // all return expected available type sets, and that attempting to resolve the NumVals
 // as each of these types will all succeed with an expected Datum result.
 func TestNumericConstantVerifyAndResolveAvailableTypes(t *testing.T) {
-	wantInt := numValAvailIntFloatDec
-	wantDecButCanBeInt := numValAvailDecFloatInt
-	wantDec := numValAvailDecFloat
+	wantInt := numValAvailInteger
+	wantDecButCanBeInt := numValAvailDecimalNoFraction
+	wantDec := numValAvailDecimalWithFraction
 
 	testCases := []struct {
 		str   string
@@ -337,7 +337,7 @@ type constantLiteralFoldingTestCase struct {
 
 func testConstantLiteralFolding(t *testing.T, testData []constantLiteralFoldingTestCase) {
 	for _, d := range testData {
-		expr, err := ParseExprTraditional(d.expr)
+		expr, err := ParseExpr(d.expr)
 		if err != nil {
 			t.Fatalf("%s: %v", d.expr, err)
 		}
@@ -404,8 +404,10 @@ func TestFoldNumericConstants(t *testing.T) {
 		{`1.3 & 3.2`, `1.3 & 3.2`}, // Will be caught during type checking.
 		{`1 | 2`, `3`},
 		{`1.3 | 2.8`, `1.3 | 2.8`}, // Will be caught during type checking.
-		{`1 ^ 3`, `2`},
-		{`1.3 ^ 3.9`, `1.3 ^ 3.9`}, // Will be caught during type checking.
+		{`1 # 3`, `2`},
+		{`1.3 # 3.9`, `1.3 # 3.9`}, // Will be caught during type checking.
+		{`2 ^ 3`, `2 ^ 3`},         // Constant folding won't fold power.
+		{`1.3 ^ 3.9`, `1.3 ^ 3.9`},
 		// Shift ops (int only).
 		{`1 << 2`, `4`},
 		{`1 << -2`, `1 << -2`},                                                     // Should be caught during evaluation.

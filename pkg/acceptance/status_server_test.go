@@ -43,7 +43,7 @@ var retryOptions = retry.Options{
 
 // get performs an HTTPS GET to the specified path for a specific node.
 func get(ctx context.Context, t *testing.T, base, rel string) []byte {
-	// TODO(bram) #2059: Remove retry logic.
+	// TODO(bram): #2059: Remove retry logic.
 	url := base + rel
 	for r := retry.Start(retryOptions); r.Next(); {
 		resp, err := cluster.HTTPClient.Get(url)
@@ -105,7 +105,7 @@ func checkNode(
 // TestStatusServer starts up an N node cluster and tests the status server on
 // each node.
 func TestStatusServer(t *testing.T) {
-	s := log.Scope(t, "")
+	s := log.Scope(t)
 	defer s.Close(t)
 
 	runTestOnConfigs(t, testStatusServerInner)

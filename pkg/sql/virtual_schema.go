@@ -101,10 +101,12 @@ type virtualTableEntry struct {
 // valuesNode for the virtual table. We use deferred construction here
 // so as to avoid populating a RowContainer during query preparation,
 // where we can't guarantee it will be Close()d in case of error.
-func (e virtualTableEntry) getPlanInfo(ctx context.Context) (ResultColumns, nodeConstructor) {
-	var columns ResultColumns
+func (e virtualTableEntry) getPlanInfo(
+	ctx context.Context,
+) (sqlbase.ResultColumns, nodeConstructor) {
+	var columns sqlbase.ResultColumns
 	for _, col := range e.desc.Columns {
-		columns = append(columns, ResultColumn{
+		columns = append(columns, sqlbase.ResultColumn{
 			Name: col.Name,
 			Typ:  col.Type.ToDatumType(),
 		})
@@ -188,7 +190,7 @@ func initVirtualDatabaseDesc(name string) *sqlbase.DatabaseDescriptor {
 func initVirtualTableDesc(
 	ctx context.Context, p *planner, t virtualSchemaTable,
 ) (sqlbase.TableDescriptor, error) {
-	stmt, err := parser.ParseOneTraditional(t.schema)
+	stmt, err := parser.ParseOne(t.schema)
 	if err != nil {
 		return sqlbase.TableDescriptor{}, err
 	}
@@ -246,6 +248,7 @@ func (vs *virtualSchemaHolder) getVirtualTableEntry(
 type VirtualTabler interface {
 	getVirtualTableDesc(tn *parser.TableName) (*sqlbase.TableDescriptor, error)
 	getVirtualDatabaseDesc(name string) *sqlbase.DatabaseDescriptor
+	getVirtualSchemaEntry(name string) (virtualSchemaEntry, bool)
 }
 
 // getVirtualTableDesc checks if the provided name matches a virtual database/table
@@ -271,10 +274,18 @@ var NilVirtualTabler nilVirtualTabler
 
 type nilVirtualTabler struct{}
 
-func (nilVirtualTabler) getVirtualTableDesc(tn *parser.TableName) (*sqlbase.TableDescriptor, error) {
+var _ VirtualTabler = nilVirtualTabler{}
+
+func (nilVirtualTabler) getVirtualTableDesc(
+	tn *parser.TableName,
+) (*sqlbase.TableDescriptor, error) {
 	return nil, nil
 }
 
 func (nilVirtualTabler) getVirtualDatabaseDesc(name string) *sqlbase.DatabaseDescriptor {
 	return nil
+}
+
+func (nilVirtualTabler) getVirtualSchemaEntry(name string) (virtualSchemaEntry, bool) {
+	return virtualSchemaEntry{}, false
 }

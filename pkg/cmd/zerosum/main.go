@@ -30,6 +30,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/cmd/internal/localcluster"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -38,15 +40,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-
-	"golang.org/x/net/context"
 )
 
 var workers = flag.Int("w", 2*runtime.NumCPU(), "number of workers")
 var monkeys = flag.Int("m", 3, "number of monkeys")
 var numNodes = flag.Int("n", 4, "number of nodes")
 var numAccounts = flag.Int("a", 1e5, "number of accounts")
-var chaosType = flag.String("c", "simple", "chaos type [none|simple|flappy|freeze]")
+var chaosType = flag.String("c", "simple", "chaos type [none|simple|flappy]")
 var verify = flag.Bool("verify", true, "verify range and account consistency")
 
 func newRand() *rand.Rand {
@@ -226,9 +226,6 @@ func (z *zeroSum) monkey(tableID uint32, d time.Duration) {
 		switch r.Intn(2) {
 		case 0:
 			if err := z.Split(z.RandNode(r.Intn), key); err != nil {
-				if strings.Contains(err.Error(), "range is already split at key") {
-					continue
-				}
 				z.maybeLogError(err)
 			} else {
 				atomic.AddUint64(&z.stats.splits, 1)
@@ -281,26 +278,6 @@ func (z *zeroSum) chaosFlappy() {
 	}
 }
 
-func (z *zeroSum) chaosFreeze() {
-	r := newRand()
-	d := time.Duration(10+r.Intn(10)) * time.Second
-	fmt.Printf("chaos(freeze): first event in %s\n", d)
-
-	for i := 1; true; i++ {
-		time.Sleep(d)
-
-		d = time.Duration(10+r.Intn(10)) * time.Second
-		fmt.Printf("chaos %d: freezing cluster for %s\n", i, d)
-		z.Freeze(z.RandNode(rand.Intn), true)
-
-		time.Sleep(d)
-
-		d = time.Duration(10+r.Intn(10)) * time.Second
-		fmt.Printf("chaos %d: thawing cluster, next event in %s\n", i, d)
-		z.Freeze(z.RandNode(rand.Intn), false)
-	}
-}
-
 func (z *zeroSum) chaos() {
 	switch z.chaosType {
 	case "none":
@@ -309,8 +286,6 @@ func (z *zeroSum) chaos() {
 		go z.chaosSimple()
 	case "flappy":
 		go z.chaosFlappy()
-	case "freeze":
-		go z.chaosFreeze()
 	default:
 		log.Fatalf(context.Background(), "unknown chaos type: %s", z.chaosType)
 	}

@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"testing"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
@@ -44,12 +46,14 @@ type queryCounter struct {
 
 func TestQueryCounts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
 	params, _ := createTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	var testcases = []queryCounter{
 		// The counts are deltas for each query.
+		{query: "SET DISTSQL = 'off'", miscCount: 1},
 		{query: "BEGIN; END", txnBeginCount: 1, txnCommitCount: 1},
 		{query: "SELECT 1", selectCount: 1, txnCommitCount: 1},
 		{query: "CREATE DATABASE mt", ddlCount: 1},
@@ -73,7 +77,10 @@ func TestQueryCounts(t *testing.T) {
 
 	// Initialize accum while accounting for system migrations that may have run
 	// DDL statements.
-	accum := queryCounter{ddlCount: s.MustGetSQLCounter(sql.MetaDdl.Name)}
+	accum := queryCounter{
+		ddlCount:  s.MustGetSQLCounter(sql.MetaDdl.Name),
+		miscCount: s.MustGetSQLCounter(sql.MetaMisc.Name),
+	}
 
 	for _, tc := range testcases {
 		t.Run(tc.query, func(t *testing.T) {
@@ -126,7 +133,7 @@ func TestAbortCountConflictingWrites(t *testing.T) {
 
 	params, cmdFilters := createTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	if _, err := sqlDB.Exec("CREATE DATABASE db"); err != nil {
 		t.Fatal(err)
@@ -186,7 +193,7 @@ func TestAbortCountErrorDuringTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := createTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	txn, err := sqlDB.Begin()
 	if err != nil {

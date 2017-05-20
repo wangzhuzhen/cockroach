@@ -518,7 +518,10 @@ func TestMakeSpans(t *testing.T) {
 				}
 				desc, index := makeTestIndex(t, columns, dirs)
 				constraints, _ := makeConstraints(t, evalCtx, d.expr, desc, index, sel)
-				spans := makeSpans(constraints, desc, index)
+				spans, err := makeSpans(constraints, desc, index)
+				if err != nil {
+					t.Fatal(err)
+				}
 				s := sqlbase.PrettySpans(spans, 2)
 				s = keys.MassagePrettyPrintedSpanForTest(s, indexToDirs(index))
 				if expected != s {
@@ -558,7 +561,10 @@ func TestMakeSpans(t *testing.T) {
 			sel := makeSelectNode(t)
 			desc, index := makeTestIndexFromStr(t, d.columns)
 			constraints, _ := makeConstraints(t, evalCtx, d.expr, desc, index, sel)
-			spans := makeSpans(constraints, desc, index)
+			spans, err := makeSpans(constraints, desc, index)
+			if err != nil {
+				t.Fatal(err)
+			}
 			var got string
 			raw := false
 			if strings.HasPrefix(d.expected, "raw:") {
@@ -700,7 +706,7 @@ func TestApplyConstraints(t *testing.T) {
 		// doesn't decompose further.
 		{`a < 3 AND (b < 2 OR a IN (0,1,2))`, `a`, `(b < 2) OR (a IN (0, 1, 2))`},
 		{`a < 3 AND (b < 2 OR a NOT IN (0,1,2))`, `a`, `(b < 2) OR (a NOT IN (0, 1, 2))`},
-		{`a < 3 AND (b < 2 OR a = ANY ARRAY[0,1,2])`, `a`, `(b < 2) OR (a = ANY {0,1,2})`},
+		{`a < 3 AND (b < 2 OR a = ANY ARRAY[0,1,2])`, `a`, `(b < 2) OR (a = ANY ARRAY[0,1,2])`},
 		{`a IN (0, 2, 3) AND (b < 2 OR a <= 4)`, `a`, `(b < 2) OR (a <= 4)`},
 		{`a IN (0, 2, 3) AND (b < 2 OR a = 2)`, `a`, `(b < 2) OR (a = 2)`},
 	}

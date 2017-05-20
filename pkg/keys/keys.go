@@ -74,13 +74,6 @@ func NodeStatusKey(nodeID roachpb.NodeID) roachpb.Key {
 	return key
 }
 
-// NodeLastUsageReportKey returns the key for accessing last usage report time
-// for a given node.
-func NodeLastUsageReportKey(nodeID roachpb.NodeID) roachpb.Key {
-	prefix := append([]byte(nil), ReportUsagePrefix...)
-	return encoding.EncodeUvarintAscending(prefix, uint64(nodeID))
-}
-
 func makePrefixWithRangeID(prefix []byte, rangeID roachpb.RangeID, infix roachpb.RKey) roachpb.Key {
 	// Size the key buffer so that it is large enough for most callers.
 	key := make(roachpb.Key, 0, 32)
@@ -627,7 +620,7 @@ func EnsureSafeSplitKey(key roachpb.Key) (roachpb.Key, error) {
 		// then we bail. Note that we don't consider this an error because
 		// EnsureSafeSplitKey can be called on keys that look like table
 		// keys but which do not have a column ID length suffix (e.g
-		// SystemConfig.ComputeSplitKeys).
+		// by SystemConfig.ComputeSplitKey).
 		return nil, errors.Errorf("%s: malformed table key", key)
 	}
 	return key[:len(key)-int(colIDLen)-1], nil

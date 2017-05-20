@@ -18,10 +18,10 @@ package client
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 
 	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -75,7 +75,7 @@ func (kv *KeyValue) PrettyValue() string {
 		if err != nil {
 			return fmt.Sprintf("%v", err)
 		}
-		return fmt.Sprintf("%s", v)
+		return v.String()
 	}
 	return fmt.Sprintf("%x", kv.Value.RawBytes)
 }
@@ -391,6 +391,18 @@ func (db *DB) AdminTransferLease(
 	return getOneErr(db.Run(ctx, b), b)
 }
 
+// AdminChangeReplicas adds or removes a set of replicas for a range.
+func (db *DB) AdminChangeReplicas(
+	ctx context.Context,
+	key interface{},
+	changeType roachpb.ReplicaChangeType,
+	targets []roachpb.ReplicationTarget,
+) error {
+	b := &Batch{}
+	b.adminChangeReplicas(key, changeType, targets)
+	return getOneErr(db.Run(ctx, b), b)
+}
+
 // CheckConsistency runs a consistency check on all the ranges containing
 // the key span. It logs a diff of all the keys that are inconsistent
 // when withDiff is set to true.
@@ -480,11 +492,11 @@ func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) err
 	if err != nil {
 		txn.CleanupOnError(ctx, err)
 	}
-	// Terminate RetryableTxnError here, so it doesn't cause a higher-level txn to
-	// be retried. We don't do this in any of the other functions in DB; I guess
-	// we should.
-	if _, ok := err.(*roachpb.RetryableTxnError); ok {
-		return errors.New(err.Error())
+	// Terminate HandledRetryableTxnError here, so it doesn't cause a higher-level
+	// txn to be retried. We don't do this in any of the other functions in DB; I
+	// guess we should.
+	if _, ok := err.(*roachpb.HandledRetryableTxnError); ok {
+		return errors.Wrapf(err, "terminated retryable error")
 	}
 	return err
 }

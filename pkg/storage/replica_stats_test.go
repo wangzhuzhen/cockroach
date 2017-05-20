@@ -26,10 +26,27 @@ import (
 	"github.com/kr/pretty"
 )
 
+func floatMapsEqual(expected, actual map[string]float64) bool {
+	if len(expected) != len(actual) {
+		return false
+	}
+	for k, v1 := range expected {
+		v2, ok := actual[k]
+		if !ok {
+			return false
+		}
+		if diff := math.Abs(v2 - v1); diff > 0.00000001 {
+			return false
+		}
+	}
+	return true
+}
+
 func TestReplicaStats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	manual := hlc.NewManualClock(123)
+	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
 
 	gceLocalities := map[roachpb.NodeID]string{
 		1: "region=us-east1,zone=us-east1-a",
@@ -156,16 +173,12 @@ func TestReplicaStats(t *testing.T) {
 		for _, req := range tc.reqs {
 			rs.record(req)
 		}
-		actual, dur := rs.getRequestCounts()
-		if dur == 0 {
-			t.Errorf("%d: expected non-zero measurement duration, got: %v", i, dur)
-		}
-		if !reflect.DeepEqual(tc.expected, actual) {
+		if actual, _ := rs.getRequestCounts(); !reflect.DeepEqual(tc.expected, actual) {
 			t.Errorf("%d: incorrect per-locality request counts: %s", i, pretty.Diff(tc.expected, actual))
 		}
 		rs.resetRequestCounts()
 		if actual, _ := rs.getRequestCounts(); len(actual) != 0 {
-			t.Errorf("%d: unexpected non-zero request counts after resetting: %+v", i, actual)
+			t.Errorf("%d: unexpected no request counts after resetting: %+v", i, actual)
 		}
 	}
 }
@@ -175,22 +188,6 @@ func TestReplicaStatsDecay(t *testing.T) {
 
 	manual := hlc.NewManualClock(123)
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
-
-	floatMapsEqual := func(expected, actual map[string]float64) bool {
-		if len(expected) != len(actual) {
-			return false
-		}
-		for k, v1 := range expected {
-			v2, ok := actual[k]
-			if !ok {
-				return false
-			}
-			if diff := math.Abs(v2 - v1); diff > 0.00000001 {
-				return false
-			}
-		}
-		return true
-	}
 
 	awsLocalities := map[roachpb.NodeID]string{
 		1: "region=us-east-1,zone=us-east-1a",
@@ -235,12 +232,12 @@ func TestReplicaStatsDecay(t *testing.T) {
 		}
 
 		for i := 0; i < len(rs.mu.requests)-1; i++ {
-			manual.Increment(int64(rotateInterval))
+			manual.Increment(int64(replStatsRotateInterval))
 			for k, v := range expected {
 				expected[k] = v * decayFactor
 			}
 			actual, dur = rs.getRequestCounts()
-			if expectedDur := rotateInterval * time.Duration(i+1); dur != expectedDur {
+			if expectedDur := replStatsRotateInterval * time.Duration(i+1); dur != expectedDur {
 				t.Errorf("expected duration = %v, got %v", expectedDur, dur)
 			}
 			// We can't just use DeepEqual to compare these due to the float
@@ -250,7 +247,7 @@ func TestReplicaStatsDecay(t *testing.T) {
 			}
 		}
 
-		manual.Increment(int64(rotateInterval))
+		manual.Increment(int64(replStatsRotateInterval))
 		expected = make(perLocalityCounts)
 		if actual, _ := rs.getRequestCounts(); !reflect.DeepEqual(expected, actual) {
 			t.Errorf("incorrect per-locality request counts: %s", pretty.Diff(expected, actual))
@@ -262,7 +259,7 @@ func TestReplicaStatsDecay(t *testing.T) {
 		for _, req := range []roachpb.NodeID{1, 1, 2, 2, 3} {
 			rs.record(req)
 		}
-		manual.Increment(int64(rotateInterval))
+		manual.Increment(int64(replStatsRotateInterval))
 		for _, req := range []roachpb.NodeID{2, 2, 3, 3, 3} {
 			rs.record(req)
 		}
@@ -273,6 +270,74 @@ func TestReplicaStatsDecay(t *testing.T) {
 		}
 		if actual, _ := rs.getRequestCounts(); !reflect.DeepEqual(expected, actual) {
 			t.Errorf("incorrect per-locality request counts: %s", pretty.Diff(expected, actual))
+		}
+	}
+}
+
+// TestReplicaStatsDecaySmoothing verifies that there is a smooth decrease
+// in request counts over time rather than a massive drop when the count
+// windows get rotated.
+func TestReplicaStatsDecaySmoothing(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	manual := hlc.NewManualClock(123)
+	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	awsLocalities := map[roachpb.NodeID]string{
+		1: "region=us-east-1,zone=us-east-1a",
+		2: "region=us-east-1,zone=us-east-1b",
+		3: "region=us-west-1,zone=us-west-1a",
+	}
+	rs := newReplicaStats(clock, func(nodeID roachpb.NodeID) string {
+		return awsLocalities[nodeID]
+	})
+	rs.record(1)
+	rs.record(1)
+	rs.record(2)
+	rs.record(2)
+	rs.record(3)
+	expected := perLocalityCounts{
+		awsLocalities[1]: 2,
+		awsLocalities[2]: 2,
+		awsLocalities[3]: 1,
+	}
+	if actual, _ := rs.getRequestCounts(); !reflect.DeepEqual(expected, actual) {
+		t.Errorf("incorrect per-locality request counts: %s", pretty.Diff(expected, actual))
+	}
+
+	increment := replStatsRotateInterval / 2
+	manual.Increment(int64(increment))
+	actual1, dur := rs.getRequestCounts()
+	if dur != increment {
+		t.Errorf("expected duration = %v; got %v", increment, dur)
+	}
+	for k := range expected {
+		expected[k] *= math.Pow(decayFactor, 0.5)
+	}
+	if !floatMapsEqual(expected, actual1) {
+		t.Errorf("incorrect per-locality request counts: %s", pretty.Diff(expected, actual1))
+	}
+
+	// Verify that all values decrease as time advances if no requests come in.
+	manual.Increment(1)
+	actual2, _ := rs.getRequestCounts()
+	if len(actual1) != len(actual2) {
+		t.Fatalf("unexpected different results sizes (expected %d, got %d)", len(actual1), len(actual2))
+	}
+	for k := range actual1 {
+		if actual2[k] >= actual1[k] {
+			t.Errorf("expected newer count %f to be smaller than older count %f", actual2[k], actual2[k])
+		}
+	}
+
+	// Ditto for passing a window boundary.
+	manual.Increment(int64(increment))
+	actual3, _ := rs.getRequestCounts()
+	if len(actual2) != len(actual3) {
+		t.Fatalf("unexpected different results sizes (expected %d, got %d)", len(actual2), len(actual3))
+	}
+	for k := range actual2 {
+		if actual3[k] >= actual2[k] {
+			t.Errorf("expected newer count %f to be smaller than older count %f", actual3[k], actual3[k])
 		}
 	}
 }

@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -54,7 +53,7 @@ func (p *planner) DropDatabase(ctx context.Context, n *parser.DropDatabase) (pla
 	}
 
 	// Check that the database exists.
-	dbDesc, err := p.getDatabaseDesc(ctx, string(n.Name))
+	dbDesc, err := getDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), string(n.Name))
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +69,7 @@ func (p *planner) DropDatabase(ctx context.Context, n *parser.DropDatabase) (pla
 		return nil, err
 	}
 
-	tbNames, err := p.getTableNames(ctx, dbDesc)
+	tbNames, err := getTableNames(ctx, p.txn, p.getVirtualTabler(), dbDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +175,7 @@ func (n *dropDatabaseNode) Start(ctx context.Context) error {
 	// Delete the zone config entry for this database.
 	b.Del(zoneKey)
 
-	n.p.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
+	n.p.session.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
 		for _, key := range [...]roachpb.Key{descKey, nameKey, zoneKey} {
 			if err := expectDeleted(systemConfig, key); err != nil {
 				return err
@@ -191,7 +190,7 @@ func (n *dropDatabaseNode) Start(ctx context.Context) error {
 
 	// Log Drop Database event. This is an auditable log event and is recorded
 	// in the same transaction as the table descriptor update.
-	if err := MakeEventLogger(n.p.session.leaseMgr).InsertEventRecord(
+	if err := MakeEventLogger(n.p.LeaseMgr()).InsertEventRecord(
 		ctx,
 		n.p.txn,
 		EventLogDropDatabase,
@@ -209,13 +208,17 @@ func (n *dropDatabaseNode) Start(ctx context.Context) error {
 	return nil
 }
 
-func (n *dropDatabaseNode) Next(context.Context) (bool, error) { return false, nil }
-func (n *dropDatabaseNode) Close(context.Context)              {}
-func (n *dropDatabaseNode) Columns() ResultColumns             { return make(ResultColumns, 0) }
-func (n *dropDatabaseNode) Ordering() orderingInfo             { return orderingInfo{} }
-func (n *dropDatabaseNode) Values() parser.Datums              { return parser.Datums{} }
-func (n *dropDatabaseNode) DebugValues() debugValues           { return debugValues{} }
-func (n *dropDatabaseNode) MarkDebug(mode explainMode)         {}
+func (*dropDatabaseNode) Next(context.Context) (bool, error) { return false, nil }
+func (*dropDatabaseNode) Close(context.Context)              {}
+func (*dropDatabaseNode) Columns() sqlbase.ResultColumns     { return make(sqlbase.ResultColumns, 0) }
+func (*dropDatabaseNode) Ordering() orderingInfo             { return orderingInfo{} }
+func (*dropDatabaseNode) Values() parser.Datums              { return parser.Datums{} }
+func (*dropDatabaseNode) DebugValues() debugValues           { return debugValues{} }
+func (*dropDatabaseNode) MarkDebug(mode explainMode)         {}
+
+func (*dropDatabaseNode) Spans(context.Context) (_, _ roachpb.Spans, _ error) {
+	panic("unimplemented")
+}
 
 type dropIndexNode struct {
 	p        *planner
@@ -240,7 +243,7 @@ func (p *planner) DropIndex(ctx context.Context, n *parser.DropIndex) (planNode,
 			return nil, err
 		}
 
-		tableDesc, err := p.mustGetTableDesc(ctx, tn)
+		tableDesc, err := mustGetTableDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
 		if err != nil {
 			return nil, err
 		}
@@ -261,7 +264,7 @@ func (n *dropIndexNode) Start(ctx context.Context) error {
 		// the list: when two or more index names refer to the same table,
 		// the mutation list and new version number created by the first
 		// drop need to be visible to the second drop.
-		tableDesc, err := n.p.getTableDesc(ctx, index.tn)
+		tableDesc, err := getTableDesc(ctx, n.p.txn, n.p.getVirtualTabler(), index.tn)
 		if err != nil || tableDesc == nil {
 			// newPlan() and Start() ultimately run within the same
 			// transaction. If we got a descriptor during newPlan(), we
@@ -378,7 +381,7 @@ func (p *planner) dropIndexByName(
 	// Record index drop in the event log. This is an auditable log event
 	// and is recorded in the same transaction as the table descriptor
 	// update.
-	if err := MakeEventLogger(p.session.leaseMgr).InsertEventRecord(
+	if err := MakeEventLogger(p.LeaseMgr()).InsertEventRecord(
 		ctx,
 		p.txn,
 		EventLogDropIndex,
@@ -401,13 +404,17 @@ func (p *planner) dropIndexByName(
 	return nil
 }
 
-func (n *dropIndexNode) Next(context.Context) (bool, error) { return false, nil }
-func (n *dropIndexNode) Close(context.Context)              {}
-func (n *dropIndexNode) Columns() ResultColumns             { return make(ResultColumns, 0) }
-func (n *dropIndexNode) Ordering() orderingInfo             { return orderingInfo{} }
-func (n *dropIndexNode) Values() parser.Datums              { return parser.Datums{} }
-func (n *dropIndexNode) DebugValues() debugValues           { return debugValues{} }
-func (n *dropIndexNode) MarkDebug(mode explainMode)         {}
+func (*dropIndexNode) Next(context.Context) (bool, error) { return false, nil }
+func (*dropIndexNode) Close(context.Context)              {}
+func (*dropIndexNode) Columns() sqlbase.ResultColumns     { return make(sqlbase.ResultColumns, 0) }
+func (*dropIndexNode) Ordering() orderingInfo             { return orderingInfo{} }
+func (*dropIndexNode) Values() parser.Datums              { return parser.Datums{} }
+func (*dropIndexNode) DebugValues() debugValues           { return debugValues{} }
+func (*dropIndexNode) MarkDebug(mode explainMode)         {}
+
+func (*dropIndexNode) Spans(context.Context) (_, _ roachpb.Spans, _ error) {
+	panic("unimplemented")
+}
 
 type dropViewNode struct {
 	p  *planner
@@ -491,7 +498,7 @@ func (n *dropViewNode) Start(ctx context.Context) error {
 		// Log a Drop View event for this table. This is an auditable log event
 		// and is recorded in the same transaction as the table descriptor
 		// update.
-		if err := MakeEventLogger(n.p.session.leaseMgr).InsertEventRecord(
+		if err := MakeEventLogger(n.p.LeaseMgr()).InsertEventRecord(
 			ctx,
 			n.p.txn,
 			EventLogDropView,
@@ -510,13 +517,17 @@ func (n *dropViewNode) Start(ctx context.Context) error {
 	return nil
 }
 
-func (n *dropViewNode) Next(context.Context) (bool, error) { return false, nil }
-func (n *dropViewNode) Close(context.Context)              {}
-func (n *dropViewNode) Columns() ResultColumns             { return make(ResultColumns, 0) }
-func (n *dropViewNode) Ordering() orderingInfo             { return orderingInfo{} }
-func (n *dropViewNode) Values() parser.Datums              { return parser.Datums{} }
-func (n *dropViewNode) DebugValues() debugValues           { return debugValues{} }
-func (n *dropViewNode) MarkDebug(mode explainMode)         {}
+func (*dropViewNode) Next(context.Context) (bool, error) { return false, nil }
+func (*dropViewNode) Close(context.Context)              {}
+func (*dropViewNode) Columns() sqlbase.ResultColumns     { return make(sqlbase.ResultColumns, 0) }
+func (*dropViewNode) Ordering() orderingInfo             { return orderingInfo{} }
+func (*dropViewNode) Values() parser.Datums              { return parser.Datums{} }
+func (*dropViewNode) DebugValues() debugValues           { return debugValues{} }
+func (*dropViewNode) MarkDebug(mode explainMode)         {}
+
+func (*dropViewNode) Spans(context.Context) (_, _ roachpb.Spans, _ error) {
+	panic("unimplemented")
+}
 
 type dropTableNode struct {
 	p  *planner
@@ -729,7 +740,7 @@ func (n *dropTableNode) Start(ctx context.Context) error {
 		// Log a Drop Table event for this table. This is an auditable log event
 		// and is recorded in the same transaction as the table descriptor
 		// update.
-		if err := MakeEventLogger(n.p.session.leaseMgr).InsertEventRecord(
+		if err := MakeEventLogger(n.p.LeaseMgr()).InsertEventRecord(
 			ctx,
 			n.p.txn,
 			EventLogDropTable,
@@ -748,13 +759,17 @@ func (n *dropTableNode) Start(ctx context.Context) error {
 	return nil
 }
 
-func (n *dropTableNode) Next(context.Context) (bool, error) { return false, nil }
-func (n *dropTableNode) Close(context.Context)              {}
-func (n *dropTableNode) Columns() ResultColumns             { return make(ResultColumns, 0) }
-func (n *dropTableNode) Ordering() orderingInfo             { return orderingInfo{} }
-func (n *dropTableNode) Values() parser.Datums              { return parser.Datums{} }
-func (n *dropTableNode) DebugValues() debugValues           { return debugValues{} }
-func (n *dropTableNode) MarkDebug(mode explainMode)         {}
+func (*dropTableNode) Next(context.Context) (bool, error) { return false, nil }
+func (*dropTableNode) Close(context.Context)              {}
+func (*dropTableNode) Columns() sqlbase.ResultColumns     { return make(sqlbase.ResultColumns, 0) }
+func (*dropTableNode) Ordering() orderingInfo             { return orderingInfo{} }
+func (*dropTableNode) Values() parser.Datums              { return parser.Datums{} }
+func (*dropTableNode) DebugValues() debugValues           { return debugValues{} }
+func (*dropTableNode) MarkDebug(mode explainMode)         {}
+
+func (*dropTableNode) Spans(context.Context) (_, _ roachpb.Spans, _ error) {
+	panic("unimplemented")
+}
 
 // dropTableOrViewPrepare/dropTableImpl is used to drop a single table by
 // name, which can result from either a DROP TABLE or DROP DATABASE
@@ -771,7 +786,7 @@ func (n *dropTableNode) MarkDebug(mode explainMode)         {}
 func (p *planner) dropTableOrViewPrepare(
 	ctx context.Context, name *parser.TableName,
 ) (*sqlbase.TableDescriptor, error) {
-	tableDesc, err := p.getTableOrViewDesc(ctx, name)
+	tableDesc, err := getTableOrViewDesc(ctx, p.txn, p.getVirtualTabler(), name)
 	if err != nil {
 		return nil, err
 	}
@@ -827,6 +842,10 @@ func (p *planner) dropTableImpl(
 		if err != nil {
 			return droppedViews, err
 		}
+		// This view is already getting dropped. Don't do it twice.
+		if viewDesc.Dropped() {
+			continue
+		}
 		cascadedViews, err := p.dropViewImpl(ctx, viewDesc, parser.DropCascade)
 		if err != nil {
 			return droppedViews, err
@@ -839,7 +858,7 @@ func (p *planner) dropTableImpl(
 		return droppedViews, err
 	}
 
-	p.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
+	p.session.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
 		return verifyDropTableMetadata(systemConfig, tableDesc.ID, "table")
 	})
 	return droppedViews, nil
@@ -971,7 +990,7 @@ func (p *planner) dropViewImpl(
 		return cascadeDroppedViews, err
 	}
 
-	p.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
+	p.session.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
 		return verifyDropTableMetadata(systemConfig, viewDesc.ID, "view")
 	})
 	return cascadeDroppedViews, nil
@@ -1000,7 +1019,9 @@ func truncateAndDropTable(
 		b := &client.Batch{}
 		// Use CPut because we want to remove a specific name -> id map.
 		b.CPut(nameKey, nil, tableDesc.ID)
-		txn.SetSystemConfigTrigger()
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
 		err := txn.Run(ctx, b)
 		if _, ok := err.(*roachpb.ConditionFailedError); ok {
 			return nil
@@ -1027,7 +1048,9 @@ func truncateAndDropTable(
 		b.Del(descKey)
 		// Delete the zone config entry for this table.
 		b.Del(zoneKey)
-		txn.SetSystemConfigTrigger()
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
 		return txn.Run(ctx, b)
 	})
 }
@@ -1072,7 +1095,7 @@ func (p *planner) getViewDescForCascade(
 		msg := fmt.Sprintf("cannot drop %s %q because view %q depends on it",
 			typeName, objName, viewName)
 		hint := fmt.Sprintf("you can drop %s instead.", viewName)
-		return nil, pgerror.WithHint(sqlbase.NewDependentObjectError(msg), hint)
+		return nil, sqlbase.NewDependentObjectErrorWithHint(msg, hint)
 	}
 	return viewDesc, nil
 }

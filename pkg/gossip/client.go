@@ -87,8 +87,8 @@ func (c *client) startLocked(
 	// (*client).handleResponse once we know the ID.
 	g.outgoing.addPlaceholder()
 
-	stopper.RunWorker(func() {
-		ctx, cancel := context.WithCancel(c.AnnotateCtx(context.Background()))
+	ctx, cancel := context.WithCancel(c.AnnotateCtx(context.Background()))
+	stopper.RunWorker(ctx, func(ctx context.Context) {
 		var wg sync.WaitGroup
 		defer func() {
 			// This closes the outgoing stream, causing any attempt to send or
@@ -161,6 +161,7 @@ func (c *client) requestGossip(g *Gossip, stream Gossip_GossipClient) error {
 		NodeID:          g.NodeID.Get(),
 		Addr:            g.mu.is.NodeAddr,
 		HighWaterStamps: g.mu.is.getHighWaterStamps(),
+		ClusterID:       g.mu.clusterID,
 	}
 	g.mu.Unlock()
 
@@ -181,6 +182,7 @@ func (c *client) sendGossip(g *Gossip, stream Gossip_GossipClient) error {
 			Addr:            g.mu.is.NodeAddr,
 			Delta:           delta,
 			HighWaterStamps: g.mu.is.getHighWaterStamps(),
+			ClusterID:       g.mu.clusterID,
 		}
 
 		bytesSent := int64(args.Size())
@@ -303,7 +305,7 @@ func (c *client) gossip(
 	// This wait group is used to allow the caller to wait until gossip
 	// processing is terminated.
 	wg.Add(1)
-	stopper.RunWorker(func() {
+	stopper.RunWorker(ctx, func(ctx context.Context) {
 		defer wg.Done()
 
 		errCh <- func() error {

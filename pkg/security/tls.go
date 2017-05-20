@@ -22,7 +22,6 @@ package security
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"io/ioutil"
 
 	"github.com/pkg/errors"
 )
@@ -35,26 +34,11 @@ const (
 	EmbeddedCAKey        = "ca.key"
 	EmbeddedNodeCert     = "node.crt"
 	EmbeddedNodeKey      = "node.key"
-	EmbeddedRootCert     = "root.crt"
-	EmbeddedRootKey      = "root.key"
-	EmbeddedTestUserCert = "testuser.crt"
-	EmbeddedTestUserKey  = "testuser.key"
+	EmbeddedRootCert     = "client.root.crt"
+	EmbeddedRootKey      = "client.root.key"
+	EmbeddedTestUserCert = "client.testuser.crt"
+	EmbeddedTestUserKey  = "client.testuser.key"
 )
-
-// readFileFn is used to mock out file system access during tests.
-var readFileFn = ioutil.ReadFile
-
-// SetReadFileFn allows to switch out ioutil.ReadFile by a mock
-// for testing purposes.
-func SetReadFileFn(f func(string) ([]byte, error)) {
-	readFileFn = f
-}
-
-// ResetReadFileFn is the counterpart to SetReadFileFn, restoring the
-// original behaviour for loading certificate related data from disk.
-func ResetReadFileFn() {
-	readFileFn = ioutil.ReadFile
-}
 
 // LoadServerTLSConfig creates a server TLSConfig by loading the CA and server certs.
 // The following paths must be passed:
@@ -63,15 +47,15 @@ func ResetReadFileFn() {
 // - sslCertKey: path to the server key
 // If the path is prefixed with "embedded=", load the embedded certs.
 func LoadServerTLSConfig(sslCA, sslCert, sslCertKey string) (*tls.Config, error) {
-	certPEM, err := readFileFn(sslCert)
+	certPEM, err := assetLoaderImpl.ReadFile(sslCert)
 	if err != nil {
 		return nil, err
 	}
-	keyPEM, err := readFileFn(sslCertKey)
+	keyPEM, err := assetLoaderImpl.ReadFile(sslCertKey)
 	if err != nil {
 		return nil, err
 	}
-	caPEM, err := readFileFn(sslCA)
+	caPEM, err := assetLoaderImpl.ReadFile(sslCA)
 	if err != nil {
 		return nil, err
 	}
@@ -120,15 +104,15 @@ func newServerTLSConfig(certPEM, keyPEM, caPEM []byte) (*tls.Config, error) {
 // - sslCertKey: path to the client key
 // If the path is prefixed with "embedded=", load the embedded certs.
 func LoadClientTLSConfig(sslCA, sslCert, sslCertKey string) (*tls.Config, error) {
-	certPEM, err := readFileFn(sslCert)
+	certPEM, err := assetLoaderImpl.ReadFile(sslCert)
 	if err != nil {
 		return nil, err
 	}
-	keyPEM, err := readFileFn(sslCertKey)
+	keyPEM, err := assetLoaderImpl.ReadFile(sslCertKey)
 	if err != nil {
 		return nil, err
 	}
-	caPEM, err := readFileFn(sslCA)
+	caPEM, err := assetLoaderImpl.ReadFile(sslCA)
 	if err != nil {
 		return nil, err
 	}

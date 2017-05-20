@@ -4,7 +4,7 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/pkg/ccl/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
 
 package sqlccl
 
@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -42,10 +41,6 @@ type kvWriteBatch struct {
 }
 
 func newKVWriteBatch(b *testing.B) kvInterface {
-	if !storage.ProposerEvaluatedKVEnabled() {
-		b.Skip("command WriteBatch is not allowed without proposer evaluated KV")
-	}
-
 	enableTracing := tracing.Disable()
 	s, _, _ := serverutils.StartServer(b, base.TestServerArgs{})
 
@@ -62,7 +57,7 @@ func newKVWriteBatch(b *testing.B) kvInterface {
 	return &kvWriteBatch{
 		db: client.NewDB(client.NewSender(conn), rpcContext.LocalClock),
 		doneFn: func() {
-			s.Stopper().Stop()
+			s.Stopper().Stop(context.TODO())
 			enableTracing()
 		},
 	}

@@ -21,7 +21,9 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // explainer represents the run-time state of the EXPLAIN logic.
@@ -68,7 +70,7 @@ type explainer struct {
 func (p *planner) makeExplainPlanNode(
 	explainer explainer, expanded, optimized bool, plan planNode,
 ) planNode {
-	columns := ResultColumns{
+	columns := sqlbase.ResultColumns{
 		// Level is the depth of the node in the tree.
 		{Name: "Level", Typ: parser.TypeInt},
 		// Type is the node type.
@@ -80,9 +82,9 @@ func (p *planner) makeExplainPlanNode(
 	}
 	if explainer.showMetadata {
 		// Columns is the type signature of the data source.
-		columns = append(columns, ResultColumn{Name: "Columns", Typ: parser.TypeString})
+		columns = append(columns, sqlbase.ResultColumn{Name: "Columns", Typ: parser.TypeString})
 		// Ordering indicates the known ordering of the data from this source.
-		columns = append(columns, ResultColumn{Name: "Ordering", Typ: parser.TypeString})
+		columns = append(columns, sqlbase.ResultColumn{Name: "Ordering", Typ: parser.TypeString})
 	}
 
 	explainer.fmtFlags = parser.FmtExpr(
@@ -215,14 +217,14 @@ func (e *explainer) leaveNode(name string) {
 // formatColumns converts a column signature for a data source /
 // planNode to a string. The column types are printed iff the 2nd
 // argument specifies so.
-func formatColumns(cols ResultColumns, printTypes bool) string {
+func formatColumns(cols sqlbase.ResultColumns, printTypes bool) string {
 	var buf bytes.Buffer
 	buf.WriteByte('(')
 	for i, rCol := range cols {
 		if i > 0 {
 			buf.WriteString(", ")
 		}
-		parser.Name(rCol.Name).Format(&buf, parser.FmtSimple)
+		parser.FormatNode(&buf, parser.FmtSimple, parser.Name(rCol.Name))
 		// Output extra properties like [hidden,omitted].
 		hasProps := false
 		outputProp := func(prop string) {
@@ -234,10 +236,10 @@ func formatColumns(cols ResultColumns, printTypes bool) string {
 			hasProps = true
 			buf.WriteString(prop)
 		}
-		if rCol.hidden {
+		if rCol.Hidden {
 			outputProp("hidden")
 		}
-		if rCol.omitted {
+		if rCol.Omitted {
 			outputProp("omitted")
 		}
 		if hasProps {
@@ -272,11 +274,16 @@ type explainPlanNode struct {
 }
 
 func (e *explainPlanNode) Next(ctx context.Context) (bool, error) { return e.results.Next(ctx) }
-func (e *explainPlanNode) Columns() ResultColumns                 { return e.results.Columns() }
+func (e *explainPlanNode) Columns() sqlbase.ResultColumns         { return e.results.Columns() }
 func (e *explainPlanNode) Ordering() orderingInfo                 { return e.results.Ordering() }
 func (e *explainPlanNode) Values() parser.Datums                  { return e.results.Values() }
 func (e *explainPlanNode) DebugValues() debugValues               { return debugValues{} }
 func (e *explainPlanNode) MarkDebug(mode explainMode)             {}
+
+func (e *explainPlanNode) Spans(ctx context.Context) (_, _ roachpb.Spans, _ error) {
+	return e.plan.Spans(ctx)
+}
+
 func (e *explainPlanNode) Start(ctx context.Context) error {
 	// Note that we don't call start on e.plan. That's on purpose, Start() can
 	// have side effects. And it's supposed to not be needed for the way in which

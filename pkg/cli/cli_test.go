@@ -32,9 +32,8 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
-
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
@@ -45,7 +44,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/spf13/cobra"
 )
 
 type cliTest struct {
@@ -58,13 +56,14 @@ type cliTest struct {
 	t *testing.T
 	// logScope binds the lifetime of the log files to this test, when t
 	// is not nil
-	logScope log.TestLogScope
+	logScope *log.TestLogScope
 }
 
 type cliTestParams struct {
-	t        *testing.T
-	insecure bool
-	noServer bool
+	t          *testing.T
+	insecure   bool
+	noServer   bool
+	storeSpecs []base.StoreSpec
 }
 
 func newCLITest(params cliTestParams) cliTest {
@@ -92,24 +91,18 @@ func newCLITest(params cliTestParams) cliTest {
 	InitCLIDefaults()
 
 	if c.t != nil {
-		c.logScope = log.Scope(c.t, "")
+		c.logScope = log.Scope(c.t)
 	}
 
 	c.cleanupFunc = func() error { return nil }
 
 	if !params.noServer {
-		s, err := serverutils.StartServerRaw(base.TestServerArgs{Insecure: params.insecure})
-		if err != nil {
-			fail(err)
-		}
-		c.TestServer = s.(*server.TestServer)
-
 		if !params.insecure {
 			// Copy these assets to disk from embedded strings, so this test can
 			// run from a standalone binary.
 			// Disable embedded certs, or the security library will try to load
 			// our real files as embedded assets.
-			security.ResetReadFileFn()
+			security.ResetAssetLoader()
 
 			assets := []string{
 				filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert),
@@ -123,16 +116,30 @@ func newCLITest(params cliTestParams) cliTest {
 			for _, a := range assets {
 				securitytest.RestrictedCopy(nil, a, certsDir, filepath.Base(a))
 			}
+			baseCfg.SSLCertsDir = certsDir
 
 			c.cleanupFunc = func() error {
-				security.SetReadFileFn(securitytest.Asset)
+				security.SetAssetLoader(securitytest.EmbeddedAssets)
 				return os.RemoveAll(certsDir)
 			}
 		}
+
+		s, err := serverutils.StartServerRaw(base.TestServerArgs{
+			Insecure:    params.insecure,
+			SSLCertsDir: certsDir,
+			StoreSpecs:  params.storeSpecs,
+		})
+		if err != nil {
+			fail(err)
+		}
+		c.TestServer = s.(*server.TestServer)
 	}
 
-	// Ensure that CLI error messages are logged to stdout, where they
-	// can be captured.
+	baseCfg.User = security.NodeUser
+
+	// Ensure that CLI error messages and anything meant for the
+	// original stderr is redirected to stdout, where it can be
+	// captured.
 	stderr = os.Stdout
 
 	return c
@@ -146,7 +153,7 @@ func (c cliTest) cleanup() {
 	}
 
 	// Restore stderr.
-	stderr = os.Stderr
+	stderr = log.OrigStderr
 
 	if c.TestServer != nil {
 		select {
@@ -155,7 +162,7 @@ func (c cliTest) cleanup() {
 			// called Stop(). We just need to wait.
 			<-c.Stopper().IsStopped()
 		default:
-			c.Stopper().Stop()
+			c.Stopper().Stop(context.TODO())
 		}
 	}
 
@@ -244,12 +251,32 @@ func (c cliTest) RunWithArgs(origArgs []string) {
 				args = append(args, "--insecure")
 			} else {
 				args = append(args, "--insecure=false")
-				args = append(args, fmt.Sprintf("--ca-cert=%s", filepath.Join(c.certsDir, security.EmbeddedCACert)))
-				args = append(args, fmt.Sprintf("--cert=%s", filepath.Join(c.certsDir, security.EmbeddedNodeCert)))
-				args = append(args, fmt.Sprintf("--key=%s", filepath.Join(c.certsDir, security.EmbeddedNodeKey)))
+				args = append(args, fmt.Sprintf("--certs-dir=%s", c.certsDir))
 			}
 			args = append(args, fmt.Sprintf("--host=%s", h))
 			args = append(args, fmt.Sprintf("--port=%s", p))
+		}
+		args = append(args, origArgs[1:]...)
+
+		fmt.Fprintf(os.Stderr, "%s\n", args)
+		fmt.Println(strings.Join(origArgs, " "))
+
+		return Run(args)
+	}(); err != nil {
+		fmt.Println(err)
+	}
+}
+
+func (c cliTest) RunWithCAArgs(origArgs []string) {
+	sqlCtx.execStmts = nil
+	zoneConfig = ""
+	zoneDisableReplication = false
+
+	if err := func() error {
+		args := append([]string(nil), origArgs[:1]...)
+		if c.TestServer != nil {
+			args = append(args, fmt.Sprintf("--ca-key=%s", filepath.Join(c.certsDir, security.EmbeddedCAKey)))
+			args = append(args, fmt.Sprintf("--certs-dir=%s", c.certsDir))
 		}
 		args = append(args, origArgs[1:]...)
 
@@ -291,217 +318,85 @@ communicate with a secure cluster\).
 		return preamble + s
 	}
 
-	for i, test := range []struct {
+	for _, test := range []struct {
 		cmd, expOutPattern string
 	}{
 		// Error returned from GRPC to internal/client (which has to pass it
 		// up the stack as a roachpb.NewError(roachpb.NewSendError(.)).
-		{`debug kv inc a`, styled(
-			`increment failed: failed to send RPC: rpc error: code = 14 desc = grpc: the connection is unavailable`),
-		},
 		// Error returned directly from GRPC.
 		{`quit`, styled(
-			`rpc error: code = 14 desc = grpc: the connection is unavailable`),
+			`Failed to connect to the node: error sending drain request: rpc error: code = Unavailable desc = grpc: the connection is unavailable`),
 		},
 		// Going through the SQL client libraries gives a *net.OpError which
 		// we also handle.
+		//
+		// On *nix, this error is:
+		//
+		// dial tcp 127.0.0.1:65054: getsockopt: connection refused
+		//
+		// On Windows, this error is:
+		//
+		// dial tcp 127.0.0.1:59951: connectex: No connection could be made because the target machine actively refused it.
+		//
+		// So we look for the common bit.
 		{`zone ls`, styled(
-			`dial tcp .*: getsockopt: connection refused`),
+			`dial tcp .*: .* refused`),
 		},
-		// A real error before we hit any networking ones.
-		{`debug kv scan b a`, `start key must be smaller than end key`},
-		{`debug kv inc`, `invalid arguments`},
 	} {
-		out, err := c.RunWithCapture(test.cmd)
-		if err != nil {
-			t.Fatal(errors.Wrap(err, strconv.Itoa(i)))
-		}
-		exp := test.cmd + "\n" + test.expOutPattern
-		re := regexp.MustCompile(exp)
-		if !re.MatchString(out) {
-			t.Errorf("expected '%s' to match pattern\n%s\ngot:\n%s", test.cmd, exp, out)
-		}
+		t.Run(test.cmd, func(t *testing.T) {
+			out, err := c.RunWithCapture(test.cmd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			exp := test.cmd + "\n" + test.expOutPattern
+			re := regexp.MustCompile(exp)
+			if !re.MatchString(out) {
+				t.Errorf("expected '%s' to match pattern:\n%s\ngot:\n%s", test.cmd, exp, out)
+			}
+		})
 	}
-}
-
-func Example_basic() {
-	c := newCLITest(cliTestParams{})
-	defer c.cleanup()
-
-	c.Run("debug kv put basic1 1 basic2 2 basic3 3")
-	c.Run("debug kv scan")
-	c.Run("debug kv revscan")
-	c.Run("debug kv del basic1 basic3")
-	c.Run("debug kv get basic1")
-	c.Run("debug kv get basic2")
-	c.Run("debug kv inc basic3 1")
-	c.Run("debug kv inc basic3 10")
-	c.Run("debug kv inc basic3 100")
-	c.Run("debug kv inc basic3 -- -60")
-	c.Run("debug kv inc basic3 -- -9")
-	c.Run("debug kv scan")
-	c.Run("debug kv revscan")
-	c.Run("debug kv inc basic3 b")
-
-	// Output:
-	// debug kv put basic1 1 basic2 2 basic3 3
-	// debug kv scan
-	// "basic1"	"1"
-	// "basic2"	"2"
-	// "basic3"	"3"
-	// 3 result(s)
-	// debug kv revscan
-	// "basic3"	"3"
-	// "basic2"	"2"
-	// "basic1"	"1"
-	// 3 result(s)
-	// debug kv del basic1 basic3
-	// debug kv get basic1
-	// "basic1" not found
-	// debug kv get basic2
-	// "2"
-	// debug kv inc basic3 1
-	// 1
-	// debug kv inc basic3 10
-	// 11
-	// debug kv inc basic3 100
-	// 111
-	// debug kv inc basic3 -- -60
-	// 51
-	// debug kv inc basic3 -- -9
-	// 42
-	// debug kv scan
-	// "basic2"	"2"
-	// "basic3"	42
-	// 2 result(s)
-	// debug kv revscan
-	// "basic3"	42
-	// "basic2"	"2"
-	// 2 result(s)
-	// debug kv inc basic3 b
-	// invalid increment: strconv.ParseInt: parsing "b": invalid syntax
-}
-
-func Example_quoted() {
-	c := newCLITest(cliTestParams{})
-	defer c.cleanup()
-
-	c.Run(`debug kv put quoted\x00 日本語`)                                  // UTF-8 input text
-	c.Run(`debug kv put quoted\x01 \u65e5\u672c\u8a9e`)                   // explicit Unicode code points
-	c.Run(`debug kv put quoted\x02 \U000065e5\U0000672c\U00008a9e`)       // explicit Unicode code points
-	c.Run(`debug kv put quoted\x03 \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e`) // explicit UTF-8 bytes
-	c.Run(`debug kv scan`)
-	c.Run(`debug kv get quoted\x00`)
-	c.Run(`debug kv del quoted\x00`)
-	c.Run(`debug kv inc quoted\x04`)
-	c.Run(`debug kv get quoted\x04`)
-
-	// Output:
-	// debug kv put quoted\x00 日本語
-	// debug kv put quoted\x01 \u65e5\u672c\u8a9e
-	// debug kv put quoted\x02 \U000065e5\U0000672c\U00008a9e
-	// debug kv put quoted\x03 \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e
-	// debug kv scan
-	// "quoted\x00"	"日本語"
-	// "quoted\x01"	"日本語"
-	// "quoted\x02"	"日本語"
-	// "quoted\x03"	"日本語"
-	// 4 result(s)
-	// debug kv get quoted\x00
-	// "日本語"
-	// debug kv del quoted\x00
-	// debug kv inc quoted\x04
-	// 1
-	// debug kv get quoted\x04
-	// 1
-}
-
-func Example_insecure() {
-	c := newCLITest(cliTestParams{insecure: true})
-	defer c.cleanup()
-
-	c.Run("debug kv put insecure1 1 insecure2 2")
-	c.Run("debug kv scan")
-
-	// Output:
-	// debug kv put insecure1 1 insecure2 2
-	// debug kv scan
-	// "insecure1"	"1"
-	// "insecure2"	"2"
-	// 2 result(s)
 }
 
 func Example_ranges() {
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
 
-	c.Run("debug kv put ranges1 1 ranges2 2 ranges3 3 ranges4 4")
-	c.Run("debug kv scan")
-	c.Run("debug kv revscan")
 	c.Run("debug range split ranges3")
 	c.Run("debug range ls")
-	c.Run("debug kv scan")
-	c.Run("debug kv revscan")
-	c.Run("debug kv delrange ranges1 ranges3")
-	c.Run("debug kv scan")
 
 	// Output:
-	// debug kv put ranges1 1 ranges2 2 ranges3 3 ranges4 4
-	// debug kv scan
-	// "ranges1"	"1"
-	// "ranges2"	"2"
-	// "ranges3"	"3"
-	// "ranges4"	"4"
-	// 4 result(s)
-	// debug kv revscan
-	// "ranges4"	"4"
-	// "ranges3"	"3"
-	// "ranges2"	"2"
-	// "ranges1"	"1"
-	// 4 result(s)
 	// debug range split ranges3
 	// debug range ls
-	// /Min-"ranges3" [1]
+	// /Min-/System/"" [1]
 	// 	0: node-id=1 store-id=1
-	// "ranges3"-/Table/0 [8]
+	// /System/""-/System/tsd [2]
 	// 	0: node-id=1 store-id=1
-	// /Table/0-/Table/11 [2]
+	// /System/tsd-/System/"tse" [3]
 	// 	0: node-id=1 store-id=1
-	// /Table/11-/Table/12 [3]
+	// /System/"tse"-"ranges3" [4]
 	// 	0: node-id=1 store-id=1
-	// /Table/12-/Table/13 [4]
+	// "ranges3"-/Table/0 [11]
 	// 	0: node-id=1 store-id=1
-	// /Table/13-/Table/14 [5]
+	// /Table/0-/Table/11 [5]
 	// 	0: node-id=1 store-id=1
-	// /Table/14-/Table/15 [6]
+	// /Table/11-/Table/12 [6]
 	// 	0: node-id=1 store-id=1
-	// /Table/15-/Max [7]
+	// /Table/12-/Table/13 [7]
 	// 	0: node-id=1 store-id=1
-	// 8 result(s)
-	// debug kv scan
-	// "ranges1"	"1"
-	// "ranges2"	"2"
-	// "ranges3"	"3"
-	// "ranges4"	"4"
-	// 4 result(s)
-	// debug kv revscan
-	// "ranges4"	"4"
-	// "ranges3"	"3"
-	// "ranges2"	"2"
-	// "ranges1"	"1"
-	// 4 result(s)
-	// debug kv delrange ranges1 ranges3
-	// debug kv scan
-	// "ranges3"	"3"
-	// "ranges4"	"4"
-	// 2 result(s)
+	// /Table/13-/Table/14 [8]
+	// 	0: node-id=1 store-id=1
+	// /Table/14-/Table/15 [9]
+	// 	0: node-id=1 store-id=1
+	// /Table/15-/Max [10]
+	// 	0: node-id=1 store-id=1
+	// 11 result(s)
 }
 
 func Example_logging() {
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
 
-	c.RunWithArgs([]string{"sql", "--alsologtostderr=false", "-e", "select 1"})
+	c.RunWithArgs([]string{"sql", "--logtostderr=false", "-e", "select 1"})
 	c.RunWithArgs([]string{"sql", "--log-backtrace-at=foo.go:1", "-e", "select 1"})
 	c.RunWithArgs([]string{"sql", "--log-dir=", "-e", "select 1"})
 	c.RunWithArgs([]string{"sql", "--logtostderr=true", "-e", "select 1"})
@@ -509,7 +404,7 @@ func Example_logging() {
 	c.RunWithArgs([]string{"sql", "--vmodule=foo=1", "-e", "select 1"})
 
 	// Output:
-	// sql --alsologtostderr=false -e select 1
+	// sql --logtostderr=false -e select 1
 	// 1 row
 	// 1
 	// 1
@@ -535,65 +430,29 @@ func Example_logging() {
 	// 1
 }
 
-func Example_cput() {
-	c := newCLITest(cliTestParams{})
-	defer c.cleanup()
-
-	c.Run("debug kv put cput1 1 cput2 2 cput3 3 cput4 4")
-	c.Run("debug kv scan")
-	c.Run("debug kv cput cput5 5")
-	c.Run("debug kv cput cput2 3 2")
-	c.Run("debug kv scan")
-
-	// Output:
-	// debug kv put cput1 1 cput2 2 cput3 3 cput4 4
-	// debug kv scan
-	// "cput1"	"1"
-	// "cput2"	"2"
-	// "cput3"	"3"
-	// "cput4"	"4"
-	// 4 result(s)
-	// debug kv cput cput5 5
-	// debug kv cput cput2 3 2
-	// debug kv scan
-	// "cput1"	"1"
-	// "cput2"	"3"
-	// "cput3"	"3"
-	// "cput4"	"4"
-	// "cput5"	"5"
-	// 5 result(s)
-}
-
 func Example_max_results() {
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
 
-	c.Run("debug kv put max_results1 1 max_results2 2 max_results3 3 max_results4 4")
-	c.Run("debug kv scan --max-results=3")
-	c.Run("debug kv revscan --max-results=2")
 	c.Run("debug range split max_results3")
 	c.Run("debug range split max_results4")
-	c.Run("debug range ls --max-results=2")
+	c.Run("debug range ls --max-results=5")
 
 	// Output:
-	// debug kv put max_results1 1 max_results2 2 max_results3 3 max_results4 4
-	// debug kv scan --max-results=3
-	// "max_results1"	"1"
-	// "max_results2"	"2"
-	// "max_results3"	"3"
-	// 3 result(s)
-	// debug kv revscan --max-results=2
-	// "max_results4"	"4"
-	// "max_results3"	"3"
-	// 2 result(s)
 	// debug range split max_results3
 	// debug range split max_results4
-	// debug range ls --max-results=2
-	// /Min-"max_results3" [1]
+	// debug range ls --max-results=5
+	// /Min-/System/"" [1]
 	// 	0: node-id=1 store-id=1
-	// "max_results3"-"max_results4" [8]
+	// /System/""-/System/tsd [2]
 	// 	0: node-id=1 store-id=1
-	// 2 result(s)
+	// /System/tsd-/System/"tse" [3]
+	// 	0: node-id=1 store-id=1
+	// /System/"tse"-"max_results3" [4]
+	// 	0: node-id=1 store-id=1
+	// "max_results3"-"max_results4" [11]
+	// 	0: node-id=1 store-id=1
+	// 5 result(s)
 }
 
 func Example_zone() {
@@ -605,15 +464,31 @@ func Example_zone() {
 	c.Run("zone ls")
 	c.Run("zone get system.nonexistent")
 	c.Run("zone get system.lease")
+	c.Run("zone set system.lease --file=./testdata/zone_attrs.yaml")
+	c.Run("zone set system.namespace --file=./testdata/zone_attrs.yaml")
+	c.Run("zone set system.nonexistent --file=./testdata/zone_attrs.yaml")
 	c.Run("zone set system --file=./testdata/zone_range_max_bytes.yaml")
 	c.Run("zone get system")
 	c.Run("zone rm system")
 	c.Run("zone ls")
 	c.Run("zone rm .default")
+	c.Run("zone set .meta --file=./testdata/zone_range_max_bytes.yaml")
+	c.Run("zone set .system --file=./testdata/zone_range_max_bytes.yaml")
+	c.Run("zone set .timeseries --file=./testdata/zone_range_max_bytes.yaml")
+	c.Run("zone get .system")
+	c.Run("zone ls")
 	c.Run("zone set .default --file=./testdata/zone_range_max_bytes.yaml")
 	c.Run("zone get system")
 	c.Run("zone set .default --disable-replication")
 	c.Run("zone get system")
+	c.Run("zone rm .meta")
+	c.Run("zone rm .system")
+	c.Run("zone ls")
+	c.Run("zone rm .timeseries")
+	c.Run("zone ls")
+	c.Run("zone rm .meta")
+	c.Run("zone rm .system")
+	c.Run("zone rm .timeseries")
 
 	// Output:
 	// zone ls
@@ -638,6 +513,12 @@ func Example_zone() {
 	//   ttlseconds: 86400
 	// num_replicas: 1
 	// constraints: [us-east-1a, ssd]
+	// zone set system.lease --file=./testdata/zone_attrs.yaml
+	// setting zone configs for individual system tables is not supported; try setting your config on the entire "system" database instead
+	// zone set system.namespace --file=./testdata/zone_attrs.yaml
+	// setting zone configs for individual system tables is not supported; try setting your config on the entire "system" database instead
+	// zone set system.nonexistent --file=./testdata/zone_attrs.yaml
+	// system.nonexistent not found
 	// zone set system --file=./testdata/zone_range_max_bytes.yaml
 	// range_min_bytes: 1048576
 	// range_max_bytes: 134217728
@@ -658,7 +539,41 @@ func Example_zone() {
 	// zone ls
 	// .default
 	// zone rm .default
-	// unable to remove .default
+	// unable to remove special zone .default
+	// zone set .meta --file=./testdata/zone_range_max_bytes.yaml
+	// range_min_bytes: 0
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 0
+	// num_replicas: 3
+	// constraints: []
+	// zone set .system --file=./testdata/zone_range_max_bytes.yaml
+	// range_min_bytes: 0
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 0
+	// num_replicas: 3
+	// constraints: []
+	// zone set .timeseries --file=./testdata/zone_range_max_bytes.yaml
+	// range_min_bytes: 0
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 0
+	// num_replicas: 3
+	// constraints: []
+	// zone get .system
+	// .system
+	// range_min_bytes: 0
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 0
+	// num_replicas: 3
+	// constraints: []
+	// zone ls
+	// .default
+	// .meta
+	// .system
+	// .timeseries
 	// zone set .default --file=./testdata/zone_range_max_bytes.yaml
 	// range_min_bytes: 1048576
 	// range_max_bytes: 134217728
@@ -689,6 +604,23 @@ func Example_zone() {
 	//   ttlseconds: 86400
 	// num_replicas: 1
 	// constraints: []
+	// zone rm .meta
+	// DELETE 1
+	// zone rm .system
+	// DELETE 1
+	// zone ls
+	// .default
+	// .timeseries
+	// zone rm .timeseries
+	// DELETE 1
+	// zone ls
+	// .default
+	// zone rm .meta
+	// DELETE 0
+	// zone rm .system
+	// DELETE 0
+	// zone rm .timeseries
+	// DELETE 0
 }
 
 func Example_sql() {
@@ -846,7 +778,7 @@ func Example_sql_column_labels() {
 	//   """foo" STRING,
 	//   "\foo" STRING,
 	//   """foo\nbar""" STRING,
-	//   κόσμε STRING,
+	//   "κόσμε" STRING,
 	//   "a|b" STRING,
 	//   ܈85 STRING
 	// );
@@ -890,6 +822,7 @@ func Example_sql_table() {
 	c.RunWithArgs([]string{"sql", "--format=csv", "-e", "select * from t.t"})
 	c.RunWithArgs([]string{"sql", "--format=sql", "-e", "select * from t.t"})
 	c.RunWithArgs([]string{"sql", "--format=html", "-e", "select * from t.t"})
+	c.RunWithArgs([]string{"sql", "--format=raw", "-e", "select * from t.t"})
 	c.RunWithArgs([]string{"sql", "--format=records", "-e", "select * from t.t"})
 	c.RunWithArgs([]string{"sql", "--format=pretty", "-e", "select '  hai' as x"})
 	c.RunWithArgs([]string{"sql", "--format=pretty", "-e", "explain(indent) select s from t.t union all select s from t.t"})
@@ -1009,6 +942,56 @@ func Example_sql_table() {
 	// <tr><td>a	b	c<br/>12	123123213	12313</td><td>tabs</td></tr>
 	// </tbody>
 	// </table>
+	// sql --format=raw -e select * from t.t
+	// # 2 columns
+	// # row 1
+	// ## 3
+	// foo
+	// ## 15
+	// printable ASCII
+	// # row 2
+	// ## 4
+	// "foo
+	// ## 27
+	// printable ASCII with quotes
+	// # row 3
+	// ## 4
+	// \foo
+	// ## 30
+	// printable ASCII with backslash
+	// # row 4
+	// ## 7
+	// foo
+	// bar
+	// ## 19
+	// non-printable ASCII
+	// # row 5
+	// ## 11
+	// κόσμε
+	// ## 14
+	// printable UTF8
+	// # row 6
+	// ## 2
+	// ñ
+	// ## 28
+	// printable UTF8 using escapes
+	// # row 7
+	// ## 6
+	// "\x01"
+	// ## 25
+	// non-printable UTF8 string
+	// # row 8
+	// ## 4
+	// ܈85
+	// ## 25
+	// UTF8 string with RTL char
+	// # row 9
+	// ## 24
+	// a	b	c
+	// 12	123123213	12313
+	// ## 4
+	// tabs
+	// # 9 rows
 	// sql --format=records -e select * from t.t
 	// -[ RECORD 1 ]
 	// s | foo
@@ -1070,7 +1053,26 @@ func Example_user() {
 	c.Run("user ls")
 	c.Run("user ls --format=pretty")
 	c.Run("user ls --format=tsv")
+	c.Run("user set FOO")
+	c.Run("user set Foo")
+	c.Run("user set fOo")
+	c.Run("user set foO")
 	c.Run("user set foo")
+	c.Run("user set _foo")
+	c.Run("user set f_oo")
+	c.Run("user set foo_")
+	c.Run("user set ,foo")
+	c.Run("user set f,oo")
+	c.Run("user set foo,")
+	c.Run("user set 0foo")
+	c.Run("user set foo0")
+	c.Run("user set f0oo")
+	c.Run("user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof")
+	c.Run("user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo")
+	c.Run("user set Ομηρος")
+	// Try some reserved keywords.
+	c.Run("user set and")
+	c.Run("user set table")
 	// Don't use get, since the output of hashedPassword is random.
 	// c.Run("user get foo")
 	c.Run("user ls --format=pretty")
@@ -1090,23 +1092,92 @@ func Example_user() {
 	// user ls --format=tsv
 	// 0 rows
 	// username
+	// user set FOO
+	// INSERT 1
+	// user set Foo
+	// INSERT 1
+	// user set fOo
+	// INSERT 1
+	// user set foO
+	// INSERT 1
 	// user set foo
 	// INSERT 1
+	// user set _foo
+	// INSERT 1
+	// user set f_oo
+	// INSERT 1
+	// user set foo_
+	// INSERT 1
+	// user set ,foo
+	// username ",foo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
+	// user set f,oo
+	// username "f,oo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
+	// user set foo,
+	// username "foo," invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
+	// user set 0foo
+	// username "0foo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
+	// user set foo0
+	// INSERT 1
+	// user set f0oo
+	// INSERT 1
+	// user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof
+	// username "foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
+	// user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo
+	// INSERT 1
+	// user set Ομηρος
+	// INSERT 1
+	// user set and
+	// INSERT 1
+	// user set table
+	// INSERT 1
 	// user ls --format=pretty
-	// +----------+
-	// | username |
-	// +----------+
-	// | foo      |
-	// +----------+
-	// (1 row)
+	// +-----------------------------------------------------------------+
+	// |                            username                             |
+	// +-----------------------------------------------------------------+
+	// | _foo                                                            |
+	// | and                                                             |
+	// | f0oo                                                            |
+	// | f_oo                                                            |
+	// | foo                                                             |
+	// | foo0                                                            |
+	// | foo_                                                            |
+	// | foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo |
+	// | table                                                           |
+	// | ομηρος                                                          |
+	// +-----------------------------------------------------------------+
+	// (10 rows)
 	// user rm foo
 	// DELETE 1
 	// user ls --format=pretty
-	// +----------+
-	// | username |
-	// +----------+
-	// +----------+
-	// (0 rows)
+	// +-----------------------------------------------------------------+
+	// |                            username                             |
+	// +-----------------------------------------------------------------+
+	// | _foo                                                            |
+	// | and                                                             |
+	// | f0oo                                                            |
+	// | f_oo                                                            |
+	// | foo0                                                            |
+	// | foo_                                                            |
+	// | foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo |
+	// | table                                                           |
+	// | ομηρος                                                          |
+	// +-----------------------------------------------------------------+
+	// (9 rows)
+}
+
+func Example_cert() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	c.RunWithCAArgs([]string{"cert", "create-client", "foo"})
+	c.RunWithCAArgs([]string{"cert", "create-client", "Ομηρος"})
+	c.RunWithCAArgs([]string{"cert", "create-client", "0foo"})
+
+	// Output:
+	// cert create-client foo
+	// cert create-client Ομηρος
+	// cert create-client 0foo
+	// failed to generate client certificate and key: username "0foo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits or underscores, and must not exceed 63 characters
 }
 
 // TestFlagUsage is a basic test to make sure the fragile
@@ -1114,77 +1185,92 @@ func Example_user() {
 func TestFlagUsage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	// Override os.Stdout with our own.
-	old := os.Stdout
-	defer func() {
-		os.Stdout = old
-	}()
-
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	done := make(chan struct{})
-	var buf bytes.Buffer
-	// copy the output in a separate goroutine so printing can't block indefinitely.
-	go func() {
-		// Copy reads 'r' until EOF is reached.
-		_, _ = io.Copy(&buf, r)
-		close(done)
-	}()
-
-	if err := Run([]string{"help"}); err != nil {
-		fmt.Println(err)
-	}
-
-	// back to normal state
-	w.Close()
-	<-done
-
-	// Filter out all test flags.
-	testFlagRE := regexp.MustCompile(`--(test\.|verbosity|vmodule)`)
-	lines := strings.Split(buf.String(), "\n")
-	final := []string{}
-	for _, l := range lines {
-		if testFlagRE.MatchString(l) {
-			continue
-		}
-		final = append(final, l)
-	}
-	got := strings.Join(final, "\n")
-	expected := `CockroachDB command-line interface and server.
-
-Usage:
+	expUsage := `Usage:
   cockroach [command]
 
 Available Commands:
-  start          start a node
-  cert           create ca, node, and client certs
-  freeze-cluster freeze the cluster in preparation for an update
-  quit           drain and shutdown node
+  start       start a node
+  cert        create ca, node, and client certs
+  quit        drain and shutdown node
 
-  sql            open a sql shell
-  user           get, set, list and remove users
-  zone           get, set, list and remove zones
-  node           list nodes and show their status
-  dump           dump sql tables
+  sql         open a sql shell
+  user        get, set, list and remove users
+  zone        get, set, list and remove zones
+  node        list nodes and show their status
+  dump        dump sql tables
 
-  gen            generate auxiliary files
-  version        output version information
-  debug          debugging commands
-  help           Help about any command
+  gen         generate auxiliary files
+  version     output version information
+  debug       debugging commands
+  help        Help about any command
 
 Flags:
-      --alsologtostderr Severity[=INFO]   logs at or above this threshold go to stderr (default INFO)
-      --log-backtrace-at traceLocation    when logging hits line file:N, emit a stack trace (default :0)
-      --log-dir string                    if non-empty, write log files in this directory
-      --logtostderr                       log to standard error instead of files
-      --no-color                          disable standard error log colorization
+      --log-backtrace-at traceLocation   when logging hits line file:N, emit a stack trace (default :0)
+      --log-dir string                   if non-empty, write log files in this directory
+      --log-dir-max-size bytes           maximum combined size of all log files (default 100 MiB)
+      --log-file-max-size bytes          maximum size of each log file (default 10 MiB)
+      --log-file-verbosity Severity      minimum verbosity of messages written to the log file (default INFO)
+      --logtostderr Severity[=DEFAULT]   logs at or above this threshold go to stderr (default NONE)
+      --no-color                         disable standard error log colorization
 
 Use "cockroach [command] --help" for more information about a command.
 `
+	helpExpected := fmt.Sprintf("CockroachDB command-line interface and server.\n\n%s", expUsage)
+	badFlagExpected := fmt.Sprintf("%s\nError: unknown flag: --foo\n", expUsage)
 
-	if got != expected {
-		t.Errorf("got:\n%s\n----\nexpected:\n%s", got, expected)
+	testCases := []struct {
+		flags    []string
+		expErr   bool
+		expected string
+	}{
+		{[]string{"help"}, false, helpExpected},    // request help specifically
+		{[]string{"--foo"}, true, badFlagExpected}, // unknown flag
+	}
+	for _, test := range testCases {
+		t.Run(strings.Join(test.flags, ","), func(t *testing.T) {
+			// Override os.Stdout or os.Stderr with our own.
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cockroachCmd.SetOutput(w)
+			defer cockroachCmd.SetOutput(nil)
+
+			done := make(chan error)
+			var buf bytes.Buffer
+			// copy the output in a separate goroutine so printing can't block indefinitely.
+			go func() {
+				// Copy reads 'r' until EOF is reached.
+				_, err := io.Copy(&buf, r)
+				done <- err
+			}()
+
+			if err := Run(test.flags); err != nil && !test.expErr {
+				t.Error(err)
+			}
+
+			// back to normal state
+			w.Close()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+
+			// Filter out all test flags.
+			testFlagRE := regexp.MustCompile(`--(test\.|verbosity|vmodule)`)
+			lines := strings.Split(buf.String(), "\n")
+			final := []string{}
+			for _, l := range lines {
+				if testFlagRE.MatchString(l) {
+					continue
+				}
+				final = append(final, l)
+			}
+			got := strings.Join(final, "\n")
+
+			if got != test.expected {
+				t.Errorf("got:\n%s\n----\nexpected:\n%s", got, test.expected)
+			}
+		})
 	}
 }
 
@@ -1217,37 +1303,8 @@ func Example_node() {
 	// Error: node 10000 doesn't exist
 }
 
-func TestFreeze(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	c := newCLITest(cliTestParams{})
-	defer c.cleanup()
-
-	assertOutput := func(msg string) {
-		if !strings.HasSuffix(strings.TrimSpace(msg), "ok") {
-			t.Fatal(errors.Errorf("expected trailing 'ok':\n%s", msg))
-		}
-	}
-
-	{
-		out, err := c.RunWithCapture("freeze-cluster")
-		if err != nil {
-			t.Fatal(err)
-		}
-		assertOutput(out)
-	}
-	{
-		out, err := c.RunWithCapture("freeze-cluster --undo")
-		if err != nil {
-			t.Fatal(err)
-		}
-		assertOutput(out)
-	}
-}
-
 func TestNodeStatus(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("#13394")
 
 	start := timeutil.Now()
 	c := newCLITest(cliTestParams{})
@@ -1335,9 +1392,9 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 		idx    int
 		maxval int64
 	}{
-		{"live_bytes", 5, 40000},
+		{"live_bytes", 5, 50000},
 		{"key_bytes", 6, 30000},
-		{"value_bytes", 7, 40000},
+		{"value_bytes", 7, 50000},
 		{"intent_bytes", 8, 30000},
 		{"system_bytes", 9, 30000},
 		{"leader_ranges", 10, 3},
@@ -1476,56 +1533,90 @@ func TestJunkPositionalArguments(t *testing.T) {
 	c := newCLITest(cliTestParams{t: t, noServer: true})
 	defer c.cleanup()
 
-	for i, test := range []struct {
-		cmd        *cobra.Command
-		invocation string
-	}{
-		{startCmd, "start junk"},
-		{sqlShellCmd, "sql junk"},
-		{genManCmd, "gen man junk"},
-		{genAutocompleteCmd, "gen autocomplete junk"},
-		{genExamplesCmd, "gen example-data file junk"},
+	for i, test := range []string{
+		"start junk",
+		"sql junk",
+		"gen man junk",
+		"gen autocomplete junk",
+		"gen example-data file junk",
 	} {
-		out, err := c.RunWithCapture(test.invocation)
+		out, err := c.RunWithCapture(test)
 		if err != nil {
 			t.Fatal(errors.Wrap(err, strconv.Itoa(i)))
 		}
-		exp := test.invocation + "\ninvalid arguments\n"
+		exp := test + "\ninvalid arguments\n"
 		if exp != out {
 			t.Errorf("expected:\n%s\ngot:\n%s", exp, out)
 		}
 	}
 }
 
-func Example_zip() {
+func TestZip(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
 	c := newCLITest(cliTestParams{})
 	defer c.cleanup()
 
-	c.Run("debug zip /dev/null")
+	out, err := c.RunWithCapture("debug zip " + os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const expected = `debug zip ` + os.DevNull + `
+writing ` + os.DevNull + `
+  debug/events
+  debug/liveness
+  debug/settings
+  debug/nodes/1/status
+  debug/nodes/1/gossip
+  debug/nodes/1/stacks
+  debug/nodes/1/ranges/1
+  debug/nodes/1/ranges/2
+  debug/nodes/1/ranges/3
+  debug/nodes/1/ranges/4
+  debug/nodes/1/ranges/5
+  debug/nodes/1/ranges/6
+  debug/nodes/1/ranges/7
+  debug/nodes/1/ranges/8
+  debug/nodes/1/ranges/9
+  debug/nodes/1/ranges/10
+  debug/schema/system@details
+  debug/schema/system/descriptor
+  debug/schema/system/eventlog
+  debug/schema/system/jobs
+  debug/schema/system/lease
+  debug/schema/system/namespace
+  debug/schema/system/rangelog
+  debug/schema/system/settings
+  debug/schema/system/ui
+  debug/schema/system/users
+  debug/schema/system/zones
+`
+
+	if out != expected {
+		t.Errorf("expected:\n%s\ngot:\n%s", expected, out)
+	}
+}
+
+func Example_in_memory() {
+	spec, err := base.NewStoreSpec("type=mem,size=1GiB")
+	if err != nil {
+		panic(err)
+	}
+	c := newCLITest(cliTestParams{
+		storeSpecs: []base.StoreSpec{spec},
+	})
+	defer c.cleanup()
+
+	// Test some sql to ensure that the in memory store is working.
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.f (x int, y int); insert into t.f values (42, 69)"})
+	c.RunWithArgs([]string{"node", "ls"})
 
 	// Output:
-	// debug zip /dev/null
-	// writing /dev/null
-	//   debug/events
-	//   debug/liveness
-	//   debug/nodes/1/status
-	//   debug/nodes/1/gossip
-	//   debug/nodes/1/stacks
-	//   debug/nodes/1/ranges/1
-	//   debug/nodes/1/ranges/2
-	//   debug/nodes/1/ranges/3
-	//   debug/nodes/1/ranges/4
-	//   debug/nodes/1/ranges/5
-	//   debug/nodes/1/ranges/6
-	//   debug/nodes/1/ranges/7
-	//   debug/schema/system@details
-	//   debug/schema/system/descriptor
-	//   debug/schema/system/eventlog
-	//   debug/schema/system/jobs
-	//   debug/schema/system/lease
-	//   debug/schema/system/namespace
-	//   debug/schema/system/rangelog
-	//   debug/schema/system/ui
-	//   debug/schema/system/users
-	//   debug/schema/system/zones
+	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
+	// INSERT 1
+	// node ls
+	// 1 row
+	// id
+	// 1
 }

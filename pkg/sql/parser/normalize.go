@@ -263,7 +263,7 @@ func (expr *ComparisonExpr) normalize(v *normalizeVisitor) TypedExpr {
 
 				invertedOp, err := invertComparisonOp(expr.Operator)
 				if err != nil {
-					v.err = nil
+					v.err = err
 					return expr
 				}
 
@@ -307,6 +307,30 @@ func (expr *ComparisonExpr) normalize(v *normalizeVisitor) TypedExpr {
 					op = Plus
 				case Div:
 					op = Mult
+					if expr.Operator != EQ {
+						// In this case, we must remember to *flip* the inequality if the
+						// divisor is negative, since we are in effect multiplying both sides
+						// of the inequality by a negative number.
+						divisor, err := left.TypedRight().Eval(v.ctx)
+						if err != nil {
+							v.err = err
+							return expr
+						}
+						if divisor.Compare(v.ctx, DZero) < 0 {
+							if !exprCopied {
+								exprCopy := *expr
+								expr = &exprCopy
+								exprCopied = true
+							}
+
+							invertedOp, err := invertComparisonOp(expr.Operator)
+							if err != nil {
+								v.err = err
+								return expr
+							}
+							expr = NewTypedComparisonExpr(invertedOp, expr.TypedLeft(), expr.TypedRight())
+						}
+					}
 				}
 
 				newBinExpr := newBinExprIfValidOverload(op,
@@ -318,8 +342,10 @@ func (expr *ComparisonExpr) normalize(v *normalizeVisitor) TypedExpr {
 
 				newRightExpr, err := newBinExpr.Eval(v.ctx)
 				if err != nil {
-					v.err = err
-					return expr
+					// In the case of an error during Eval, give up on normalizing this
+					// expression. There are some expected errors here if, for example,
+					// normalization produces a result that overflows an int64.
+					break
 				}
 
 				if !exprCopied {
@@ -372,8 +398,7 @@ func (expr *ComparisonExpr) normalize(v *normalizeVisitor) TypedExpr {
 
 				newRightExpr, err := newBinExpr.Eval(v.ctx)
 				if err != nil {
-					v.err = err
-					return expr
+					break
 				}
 
 				if !exprCopied {
@@ -503,33 +528,39 @@ func (expr *AnnotateTypeExpr) normalize(v *normalizeVisitor) TypedExpr {
 
 func (expr *RangeCond) normalize(v *normalizeVisitor) TypedExpr {
 	left, from, to := expr.TypedLeft(), expr.TypedFrom(), expr.TypedTo()
-	if left == DNull || from == DNull || to == DNull {
+	if left == DNull || (from == DNull && to == DNull) {
 		return DNull
 	}
 
+	// "a BETWEEN b AND c" -> "a >= b AND a <= c"
+	leftCmp := GE
+	rightCmp := LE
+	makeOpExpr := func(left, right TypedExpr) normalizableExpr { return NewTypedAndExpr(left, right) }
 	if expr.Not {
 		// "a NOT BETWEEN b AND c" -> "a < b OR a > c"
-		newLeft := NewTypedComparisonExpr(LT, left, from).normalize(v)
-		if v.err != nil {
-			return expr
-		}
-		newRight := NewTypedComparisonExpr(GT, left, to).normalize(v)
-		if v.err != nil {
-			return expr
-		}
-		return NewTypedOrExpr(newLeft, newRight).normalize(v)
+		leftCmp = LT
+		rightCmp = GT
+		makeOpExpr = func(left, right TypedExpr) normalizableExpr { return NewTypedOrExpr(left, right) }
 	}
 
-	// "a BETWEEN b AND c" -> "a >= b AND a <= c"
-	newLeft := NewTypedComparisonExpr(GE, left, from).normalize(v)
-	if v.err != nil {
-		return expr
+	var newLeft, newRight TypedExpr
+	if from == DNull {
+		newLeft = DNull
+	} else {
+		newLeft = NewTypedComparisonExpr(leftCmp, left, from).normalize(v)
+		if v.err != nil {
+			return expr
+		}
 	}
-	newRight := NewTypedComparisonExpr(LE, left, to).normalize(v)
-	if v.err != nil {
-		return expr
+	if to == DNull {
+		newRight = DNull
+	} else {
+		newRight = NewTypedComparisonExpr(rightCmp, left, to).normalize(v)
+		if v.err != nil {
+			return expr
+		}
 	}
-	return NewTypedAndExpr(newLeft, newRight).normalize(v)
+	return makeOpExpr(newLeft, newRight).normalize(v)
 }
 
 // NormalizeExpr normalizes a typed expression, simplifying where possible,
@@ -569,7 +600,7 @@ func (v *normalizeVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
 	case *Subquery:
 		// Avoid normalizing subqueries. We need the subquery to be expanded in
 		// order to do so properly.
-		// TODO(knz) This should happen when the prepare and execute phases are
+		// TODO(knz): This should happen when the prepare and execute phases are
 		//     separated for SelectClause.
 		return false, expr
 	}

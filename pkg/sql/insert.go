@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -52,14 +53,14 @@ type insertNode struct {
 //   Notes: postgres requires INSERT. No "on duplicate key update" option.
 //          mysql requires INSERT. Also requires UPDATE on "ON DUPLICATE KEY UPDATE".
 func (p *planner) Insert(
-	ctx context.Context, n *parser.Insert, desiredTypes []parser.Type, autoCommit bool,
+	ctx context.Context, n *parser.Insert, desiredTypes []parser.Type,
 ) (planNode, error) {
 	tn, err := p.getAliasedTableName(n.Table)
 	if err != nil {
 		return nil, err
 	}
 
-	en, err := p.makeEditNode(ctx, tn, autoCommit, privilege.INSERT)
+	en, err := p.makeEditNode(ctx, tn, privilege.INSERT)
 	if err != nil {
 		return nil, err
 	}
@@ -70,9 +71,9 @@ func (p *planner) Insert(
 			}
 		}
 		// TODO(dan): Support RETURNING in UPSERTs.
-		// TODO(nvanbenschoten): We will need to at least support RETURNING NOTHING.
-		if parser.HasReturningClause(n.Returning) {
-			return nil, fmt.Errorf("RETURNING is not supported with UPSERT")
+		if _, ok := n.Returning.(*parser.ReturningExprs); ok {
+			return nil, util.UnimplementedWithIssueErrorf(6637,
+				"RETURNING is not supported with UPSERT")
 		}
 	}
 
@@ -91,9 +92,6 @@ func (p *planner) Insert(
 	numInputColumns := len(cols)
 
 	cols, defaultExprs, err := ProcessDefaultColumns(cols, en.tableDesc, &p.parser, &p.evalCtx)
-	if err != nil {
-		return nil, err
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +119,7 @@ func (p *planner) Insert(
 	// Create the plan for the data source.
 	// This performs type checking on source expressions, collecting
 	// types for placeholders in the process.
-	rows, err := p.newPlan(ctx, insertRows, desiredTypesFromSelect, false)
+	rows, err := p.newPlan(ctx, insertRows, desiredTypesFromSelect)
 	if err != nil {
 		return nil, err
 	}
@@ -130,20 +128,20 @@ func (p *planner) Insert(
 		return nil, fmt.Errorf("INSERT error: table %s has %d columns but %d values were supplied", n.Table, numInputColumns, expressions)
 	}
 
-	fkTables := tablesNeededForFKs(*en.tableDesc, CheckInserts)
+	fkTables := sqlbase.TablesNeededForFKs(*en.tableDesc, sqlbase.CheckInserts)
 	if err := p.fillFKTableMap(ctx, fkTables); err != nil {
 		return nil, err
 	}
-	ri, err := MakeRowInserter(p.txn, en.tableDesc, fkTables, cols, checkFKs)
+	ri, err := sqlbase.MakeRowInserter(p.txn, en.tableDesc, fkTables, cols, sqlbase.CheckFKs)
 	if err != nil {
 		return nil, err
 	}
 
 	var tw tableWriter
 	if n.OnConflict == nil {
-		tw = &tableInserter{ri: ri, autoCommit: autoCommit}
+		tw = &tableInserter{ri: ri, autoCommit: p.autoCommit}
 	} else {
-		updateExprs, conflictIndex, err := upsertExprsAndIndex(en.tableDesc, *n.OnConflict, ri.insertCols)
+		updateExprs, conflictIndex, err := upsertExprsAndIndex(en.tableDesc, *n.OnConflict, ri.InsertCols)
 		if err != nil {
 			return nil, err
 		}
@@ -154,7 +152,7 @@ func (p *planner) Insert(
 			// someone needs it.
 			tw = &tableUpserter{
 				ri:            ri,
-				autoCommit:    autoCommit,
+				autoCommit:    p.autoCommit,
 				conflictIndex: *conflictIndex,
 			}
 		} else {
@@ -183,22 +181,23 @@ func (p *planner) Insert(
 			}
 
 			helper, err := p.makeUpsertHelper(
-				ctx, tn, en.tableDesc, ri.insertCols, updateCols, updateExprs, conflictIndex)
+				ctx, tn, en.tableDesc, ri.InsertCols, updateCols, updateExprs, conflictIndex)
 			if err != nil {
 				return nil, err
 			}
 
-			fkTables := tablesNeededForFKs(*en.tableDesc, CheckUpdates)
+			fkTables := sqlbase.TablesNeededForFKs(*en.tableDesc, sqlbase.CheckUpdates)
 			if err := p.fillFKTableMap(ctx, fkTables); err != nil {
 				return nil, err
 			}
 			tw = &tableUpserter{
 				ri:            ri,
-				autoCommit:    autoCommit,
+				autoCommit:    p.autoCommit,
 				fkTables:      fkTables,
 				updateCols:    updateCols,
 				conflictIndex: *conflictIndex,
 				evaler:        helper,
+				isUpsertAlias: n.OnConflict.IsUpsertAlias(),
 			}
 		}
 	}
@@ -207,7 +206,7 @@ func (p *planner) Insert(
 		n:                     n,
 		editNodeBase:          en,
 		defaultExprs:          defaultExprs,
-		insertCols:            ri.insertCols,
+		insertCols:            ri.InsertCols,
 		insertColIDtoRowIndex: ri.InsertColIDtoRowIndex,
 		tw: tw,
 	}
@@ -217,7 +216,7 @@ func (p *planner) Insert(
 	}
 
 	if err := in.run.initEditNode(
-		ctx, &in.editNodeBase, rows, n.Returning, desiredTypes); err != nil {
+		ctx, &in.editNodeBase, rows, in.tw, n.Returning, desiredTypes); err != nil {
 		return nil, err
 	}
 
@@ -262,7 +261,7 @@ func ProcessDefaultColumns(
 		}
 	}
 
-	defaultExprs, err := makeDefaultExprs(cols, parse, evalCtx)
+	defaultExprs, err := sqlbase.MakeDefaultExprs(cols, parse, evalCtx)
 	return cols, defaultExprs, err
 }
 
@@ -290,7 +289,7 @@ func (n *insertNode) Start(ctx context.Context) error {
 		}
 	}
 
-	if err := n.run.startEditNode(ctx, &n.editNodeBase, n.tw); err != nil {
+	if err := n.run.startEditNode(ctx, &n.editNodeBase); err != nil {
 		return err
 	}
 
@@ -319,7 +318,9 @@ func (n *insertNode) Next(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	n.checkHelper.loadRow(n.insertColIDtoRowIndex, rowVals, false)
+	if err := n.checkHelper.loadRow(n.insertColIDtoRowIndex, rowVals, false); err != nil {
+		return false, err
+	}
 	if err := n.checkHelper.check(&n.p.evalCtx); err != nil {
 		return false, err
 	}
@@ -511,57 +512,7 @@ func fillDefaults(
 	return ret
 }
 
-func makeDefaultExprs(
-	cols []sqlbase.ColumnDescriptor, parse *parser.Parser, evalCtx *parser.EvalContext,
-) ([]parser.TypedExpr, error) {
-	// Check to see if any of the columns have DEFAULT expressions. If there
-	// are no DEFAULT expressions, we don't bother with constructing the
-	// defaults map as the defaults are all NULL.
-	haveDefaults := false
-	for _, col := range cols {
-		if col.DefaultExpr != nil {
-			haveDefaults = true
-			break
-		}
-	}
-	if !haveDefaults {
-		return nil, nil
-	}
-
-	// Build the default expressions map from the parsed SELECT statement.
-	defaultExprs := make([]parser.TypedExpr, 0, len(cols))
-	exprStrings := make([]string, 0, len(cols))
-	for _, col := range cols {
-		if col.DefaultExpr != nil {
-			exprStrings = append(exprStrings, *col.DefaultExpr)
-		}
-	}
-	exprs, err := parser.ParseExprsTraditional(exprStrings)
-	if err != nil {
-		return nil, err
-	}
-
-	defExprIdx := 0
-	for _, col := range cols {
-		if col.DefaultExpr == nil {
-			defaultExprs = append(defaultExprs, parser.DNull)
-			continue
-		}
-		expr := exprs[defExprIdx]
-		typedExpr, err := parser.TypeCheck(expr, nil, col.Type.ToDatumType())
-		if err != nil {
-			return nil, err
-		}
-		if typedExpr, err = parse.NormalizeExpr(evalCtx, typedExpr); err != nil {
-			return nil, err
-		}
-		defaultExprs = append(defaultExprs, typedExpr)
-		defExprIdx++
-	}
-	return defaultExprs, nil
-}
-
-func (n *insertNode) Columns() ResultColumns {
+func (n *insertNode) Columns() sqlbase.ResultColumns {
 	return n.rh.columns
 }
 
@@ -582,3 +533,7 @@ func (n *insertNode) DebugValues() debugValues {
 }
 
 func (n *insertNode) Ordering() orderingInfo { return orderingInfo{} }
+
+func (n *insertNode) Spans(ctx context.Context) (reads, writes roachpb.Spans, err error) {
+	return n.run.collectSpans(ctx)
+}

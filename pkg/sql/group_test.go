@@ -20,6 +20,8 @@ import (
 	"reflect"
 	"testing"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -33,9 +35,9 @@ func TestDesiredAggregateOrder(t *testing.T) {
 		expr     string
 		ordering sqlbase.ColumnOrdering
 	}{
-		{`a`, nil},
 		{`MIN(a)`, sqlbase.ColumnOrdering{{ColIdx: 0, Direction: encoding.Ascending}}},
 		{`MAX(a)`, sqlbase.ColumnOrdering{{ColIdx: 0, Direction: encoding.Descending}}},
+		{`MIN(a+1)`, sqlbase.ColumnOrdering{{ColIdx: 0, Direction: encoding.Ascending}}},
 		{`(MIN(a), MAX(a))`, nil},
 		{`(MIN(a), AVG(a))`, nil},
 		{`(MIN(a), COUNT(a))`, nil},
@@ -45,18 +47,34 @@ func TestDesiredAggregateOrder(t *testing.T) {
 		{`(MIN(a), MIN(a))`, nil},
 		{`(MIN(a+1), MIN(a))`, nil},
 		{`(COUNT(a), MIN(a))`, nil},
-		{`(MIN(a+1))`, nil},
 	}
 	p := makeTestPlanner()
 	for _, d := range testData {
-		evalCtx := &parser.EvalContext{}
 		sel := makeSelectNode(t)
-		expr := parseAndNormalizeExpr(t, evalCtx, d.expr, sel)
+		expr := parseAndNormalizeExpr(t, &p.evalCtx, d.expr, sel)
 		group := &groupNode{planner: p}
-		(extractAggregatesVisitor{n: group}).extract(expr)
-		ordering := desiredAggregateOrdering(group.funcs)
+		render := &renderNode{planner: p}
+		postRender := &renderNode{planner: p}
+		postRender.ivarHelper = parser.MakeIndexedVarHelper(postRender, len(group.funcs))
+		v := extractAggregatesVisitor{
+			ctx:        context.TODO(),
+			groupNode:  group,
+			preRender:  render,
+			ivarHelper: &postRender.ivarHelper,
+			planner:    p,
+		}
+		if _, err := v.extract(expr); err != nil {
+			t.Fatal(err)
+		}
+		ordering := group.desiredAggregateOrdering()
 		if !reflect.DeepEqual(d.ordering, ordering) {
 			t.Fatalf("%s: expected %v, but found %v", d.expr, d.ordering, ordering)
+		}
+		// Verify we never have a desired ordering if there is a GROUP BY.
+		group.numGroupCols = 1
+		ordering = group.desiredAggregateOrdering()
+		if len(ordering) > 0 {
+			t.Fatalf("%s: expected no ordering when there is a GROUP BY, found %v", d.expr, ordering)
 		}
 	}
 }

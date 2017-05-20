@@ -17,13 +17,13 @@
 package parser
 
 import (
-	"fmt"
 	"math"
 	"testing"
+	"time"
 )
 
 func prepareExpr(t *testing.T, datumExpr string) TypedExpr {
-	expr, err := ParseExprTraditional(datumExpr)
+	expr, err := ParseExpr(datumExpr)
 	if err != nil {
 		t.Fatalf("%s: %v", datumExpr, err)
 	}
@@ -93,28 +93,20 @@ func TestDatumOrdering(t *testing.T) {
 
 		// Intervals
 		{`'1 day':::interval`, noPrev, noNext,
-			`'-9223372036854775808m-9223372036854775808d-2562047h47m16.854775808s'`,
-			`'9223372036854775807m9223372036854775807d2562047h47m16.854775807s'`},
+			`'-768614336404564650y-8mon-9223372036854775808d-2562047h-47m-16s-854ms-775µs-808ns'`,
+			`'768614336404564650y7mon9223372036854775807d2562047h47m16s854ms775µs807ns'`},
 		// Max interval: we use Postgres syntax, because Go doesn't accept
 		// months/days and ISO8601 doesn't accept nanoseconds.
 		{`'9223372036854775807 months 9223372036854775807 days ` +
 			`2562047 hours 47 minutes 16 seconds 854775807 nanoseconds':::interval`,
 			noPrev, valIsMax,
-			`'-9223372036854775808m-9223372036854775808d-2562047h47m16.854775808s'`,
-			`'9223372036854775807m9223372036854775807d2562047h47m16.854775807s'`},
-		// It's hard to generate a minimum interval! We can't use a
-		// negative value inside the string constant, because that's not
-		// allowed in a Postgres duration specification. We can't use the
-		// full positive value (9223372036854775808) and then negate that
-		// after parsing, because that would overflow. So we generate
-		// first a slightly smaller absolute value by conversion, negate,
-		// then add the missing bits.
-		{`-'9223372036854775807 months 9223372036854775807 days ` +
-			`2562047 hours 47 minutes 16 seconds':::interval` +
-			`-'1 month 1 day 854775808 nanoseconds':::interval`,
+			`'-768614336404564650y-8mon-9223372036854775808d-2562047h-47m-16s-854ms-775µs-808ns'`,
+			`'768614336404564650y7mon9223372036854775807d2562047h47m16s854ms775µs807ns'`},
+		{`'-9223372036854775808 months -9223372036854775808 days ` +
+			`-2562047 h -47 m -16 s -854775808 ns':::interval`,
 			valIsMin, noNext,
-			`'-9223372036854775808m-9223372036854775808d-2562047h47m16.854775808s'`,
-			`'9223372036854775807m9223372036854775807d2562047h47m16.854775807s'`},
+			`'-768614336404564650y-8mon-9223372036854775808d-2562047h-47m-16s-854ms-775µs-808ns'`,
+			`'768614336404564650y7mon9223372036854775807d2562047h47m16s854ms775µs807ns'`},
 
 		// NULL
 		{`NULL`, valIsMin, valIsMax, `NULL`, `NULL`},
@@ -129,7 +121,7 @@ func TestDatumOrdering(t *testing.T) {
 
 		{`row(true, false, false)`, `(false, true, true)`, `(true, false, true)`,
 			`(false, false, false)`, `(true, true, true)`},
-		{`row(false, true, true)`, `(false, true, false)`, `(true, false, false)`,
+		{`row(false, true, true)`, `(false, true, false)`, `(true, NULL, NULL)`,
 			`(false, false, false)`, `(true, true, true)`},
 
 		{`row(0, 0)`, `(0, -1)`, `(0, 1)`,
@@ -137,7 +129,7 @@ func TestDatumOrdering(t *testing.T) {
 			`(9223372036854775807, 9223372036854775807)`},
 
 		{`row(0, 9223372036854775807)`,
-			`(0, 9223372036854775806)`, `(1, -9223372036854775808)`,
+			`(0, 9223372036854775806)`, `(1, NULL)`,
 			`(-9223372036854775808, -9223372036854775808)`,
 			`(9223372036854775807, 9223372036854775807)`},
 		{`row(9223372036854775807, 9223372036854775807)`,
@@ -162,26 +154,28 @@ func TestDatumOrdering(t *testing.T) {
 
 		{`row(true, NULL, false)`, `(false, NULL, true)`, `(true, NULL, true)`,
 			`(false, NULL, false)`, `(true, NULL, true)`},
-		{`row(false, NULL, true)`, `(false, NULL, false)`, `(true, NULL, false)`,
+		{`row(false, NULL, true)`, `(false, NULL, false)`, `(true, NULL, NULL)`,
 			`(false, NULL, false)`, `(true, NULL, true)`},
 
 		{`row(row(true), row(false))`, `((false), (true))`, `((true), (true))`,
 			`((false), (false))`, `((true), (true))`},
-		{`row(row(false), row(true))`, `((false), (false))`, `((true), (false))`,
+		{`row(row(false), row(true))`, `((false), (false))`, `((true), NULL)`,
 			`((false), (false))`, `((true), (true))`},
 
 		// Arrays
 
-		// TODO(nathan) Until we support literals for empty arrays, this
+		// TODO(nathan): Until we support literals for empty arrays, this
 		// is the easiest way to construct one.
-		{`current_schemas(false)`, valIsMin, `{NULL}`, `{}`, noMax},
+		{`current_schemas(false)`, valIsMin, `ARRAY[NULL]`, `ARRAY[]`, noMax},
 
-		{`array[NULL]`, noPrev, `{NULL,NULL}`, `{}`, noMax},
-		{`array[true]`, noPrev, `{true,NULL}`, `{}`, noMax},
+		{`array[NULL]`, noPrev, `ARRAY[NULL,NULL]`, `ARRAY[]`, noMax},
+		{`array[true]`, noPrev, `ARRAY[true,NULL]`, `ARRAY[]`, noMax},
 
 		// Mixed tuple/array datums.
-		{`row(ARRAY[true], row(true))`, `({true}, (false))`, `({true,NULL}, (false))`, `({}, (false))`, noMax},
-		{`row(row(false), ARRAY[true])`, noPrev, `((false), {true,NULL})`, `((false), {})`, noMax},
+		{`row(ARRAY[true], row(true))`, `(ARRAY[true], (false))`, `(ARRAY[true,NULL], NULL)`,
+			`(ARRAY[], (false))`, noMax},
+		{`row(row(false), ARRAY[true])`, noPrev, `((false), ARRAY[true,NULL])`,
+			`((false), ARRAY[])`, noMax},
 	}
 	for _, td := range testData {
 		expr := prepareExpr(t, td.datumExpr)
@@ -206,7 +200,7 @@ func TestDatumOrdering(t *testing.T) {
 				continue
 			}
 			if !isMin {
-				dPrev := fmt.Sprintf("%s", prevVal)
+				dPrev := prevVal.String()
 				if dPrev != td.prev {
 					t.Errorf("%s: Prev(): got %s, expected %s", td.datumExpr, dPrev, td.prev)
 				}
@@ -229,7 +223,7 @@ func TestDatumOrdering(t *testing.T) {
 				continue
 			}
 			if !isMax {
-				dNext := fmt.Sprintf("%s", nextVal)
+				dNext := nextVal.String()
 				if dNext != td.next {
 					t.Errorf("%s: Next(): got %s, expected %s", td.datumExpr, dNext, td.next)
 				}
@@ -244,7 +238,7 @@ func TestDatumOrdering(t *testing.T) {
 				t.Errorf("%s: hasMin true, expected false", td.datumExpr)
 			}
 		} else {
-			dMin := fmt.Sprintf("%s", minVal)
+			dMin := minVal.String()
 			if dMin != td.min {
 				t.Errorf("%s: min(): got %s, expected %s", td.datumExpr, dMin, td.min)
 			}
@@ -254,7 +248,7 @@ func TestDatumOrdering(t *testing.T) {
 				t.Errorf("%s: hasMax true, expected false", td.datumExpr)
 			}
 		} else {
-			dMax := fmt.Sprintf("%s", maxVal)
+			dMax := maxVal.String()
 			if dMax != td.max {
 				t.Errorf("%s: max(): got %s, expected %s", td.datumExpr, dMax, td.max)
 			}
@@ -325,6 +319,45 @@ func TestParseDIntervalWithField(t *testing.T) {
 		}
 		if expected.Compare(&EvalContext{}, actual) != 0 {
 			t.Errorf("INTERVAL %s %v: got %s, expected %s", td.str, td.field, actual, expected)
+		}
+	}
+}
+
+func TestParseDDate(t *testing.T) {
+	testData := []struct {
+		str      string
+		expected string
+	}{
+		{"2017-03-03 -01:00:00", "2017-03-03"},
+		{"2017-03-03 -1:0:0", "2017-03-03"},
+		{"2017-03-03 -01:00", "2017-03-03"},
+		{"2017-03-03 -01", "2017-03-03"},
+		{"2017-03-03 -010000", "2017-03-03"},
+		{"2017-03-03 -0100", "2017-03-03"},
+		{"2017-03-03 -1", "2017-03-03"},
+		{"2017-03-03", "2017-03-03"},
+		{"2017-3-3 -01:00:00", "2017-03-03"},
+		{"2017-3-3 -1:0:0", "2017-03-03"},
+		{"2017-3-3 -01:00", "2017-03-03"},
+		{"2017-3-3 -01", "2017-03-03"},
+		{"2017-3-3 -010000", "2017-03-03"},
+		{"2017-3-3 -0100", "2017-03-03"},
+		{"2017-3-3 -1", "2017-03-03"},
+		{"2017-3-3", "2017-03-03"},
+	}
+	for _, td := range testData {
+		actual, err := ParseDDate(td.str, time.UTC)
+		if err != nil {
+			t.Errorf("unexpected error while parsing DATE %s: %s", td.str, err)
+			continue
+		}
+		expected, err := ParseDDate(td.expected, time.UTC)
+		if err != nil {
+			t.Errorf("unexpected error while parsing expected value DATE %s: %s", td.expected, err)
+			continue
+		}
+		if expected.Compare(&EvalContext{}, actual) != 0 {
+			t.Errorf("DATE %s: got %s, expected %s", td.str, actual, expected)
 		}
 	}
 }

@@ -17,6 +17,7 @@
 package parser
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -33,7 +34,7 @@ func TestEval(t *testing.T) {
 		// Bitwise operators.
 		{`1 & 3`, `1`},
 		{`1 | 3`, `3`},
-		{`1 ^ 3`, `2`},
+		{`1 # 3`, `2`},
 		// Arithmetic operators.
 		{`1 + 1`, `2`},
 		{`1 - 2`, `-1`},
@@ -51,25 +52,41 @@ func TestEval(t *testing.T) {
 		{`1.1 % 2.4`, `1.1`},
 		{`4.1 // 2.4`, `1`},
 		{`-4.5:::float // 1.2:::float`, `-3.0`},
+		{`2 ^ 3`, `8`},
+		{`2:::float ^ 3:::float`, `8.0`},
+		{`2:::decimal ^ 3:::decimal`, `8`},
+		{`2:::int ^ 62:::int`, `4611686018427387904`},
+		// Various near-edge cases for overflow.
+		{`0:::int * 0:::int`, `0`},
+		{`0:::int * 1:::int`, `0`},
+		{`1:::int * 0:::int`, `0`},
+		{`1:::int * 1:::int`, `1`},
+		{`4611686018427387904:::int * 1:::int`, `4611686018427387904`},
+		{`-4611686018427387905:::int * 1:::int`, `-4611686018427387905`},
 		// Heterogeneous int/decimal arithmetic is valid.
 		{`1.1:::decimal + 2:::int`, `3.1`},
 		{`1.1:::decimal - 2:::int`, `-0.9`},
 		{`1.1:::decimal * 2:::int`, `2.2`},
 		{`1.1:::decimal % 2:::int`, `1.1`},
 		{`4.1:::decimal // 2:::int`, `2`},
+		{`1.1:::decimal ^ 2:::int`, `1.21`},
 		{`2:::int +  2.1:::decimal`, `4.1`},
 		{`2:::int -  2.1:::decimal`, `-0.1`},
 		{`2:::int *  2.1:::decimal`, `4.2`},
 		{`2:::int %  2.1:::decimal`, `2.0`},
 		{`4:::int // 2.1:::decimal`, `1`},
+		{`2:::int ^ 2.1:::decimal`, `4.2870938501451726569`},
 		// Division is always done on floats or decimals.
 		{`4 / 5`, `0.8`},
 		{`1.1:::decimal / 2.2:::decimal`, `0.5`},
-		{`1:::int / 2.2:::decimal`, `0.4545454545454545`},
+		{`1:::int / 2.2:::decimal`, `0.45454545454545454545`},
 		{`1.1:::decimal / 2:::int`, `0.55`},
-		// Only floats support infinity.
+		// Verify INT_MIN / -1 = -INT_MIN.
+		{`(-9223372036854775807:::int - 1) / -1`, `9223372036854775808`},
+		// Infinity.
 		{`1.0:::float / 0.0`, `+Inf`},
 		{`-1.0:::float * (1.0:::float / 0.0)`, `-Inf`},
+		{`power(0::decimal, -1)`, `Infinity`},
 		// Grouping
 		{`1 + 2 + (3 * 4)`, `15`},
 		// Unary operators.
@@ -485,12 +502,12 @@ func TestEval(t *testing.T) {
 		{`lower('HELLO')`, `'hello'`},
 		{`UPPER('hello')`, `'HELLO'`},
 		// Array constructors.
-		{`ARRAY[]:::int[]`, `{}`},
-		{`ARRAY[NULL]`, `{NULL}`},
-		{`ARRAY[1, 2, 3]`, `{1,2,3}`},
-		{`ARRAY['a', 'b', 'c']`, `{'a','b','c'}`},
-		{`ARRAY[ARRAY[1, 2], ARRAY[2, 3]]`, `{{1,2},{2,3}}`},
-		{`ARRAY[1, NULL]`, `{1,NULL}`},
+		{`ARRAY[]:::int[]`, `ARRAY[]`},
+		{`ARRAY[NULL]`, `ARRAY[NULL]`},
+		{`ARRAY[1, 2, 3]`, `ARRAY[1,2,3]`},
+		{`ARRAY['a', 'b', 'c']`, `ARRAY['a','b','c']`},
+		{`ARRAY[ARRAY[1, 2], ARRAY[2, 3]]`, `ARRAY[ARRAY[1,2],ARRAY[2,3]]`},
+		{`ARRAY[1, NULL]`, `ARRAY[1,NULL]`},
 		// Array sizes.
 		{`array_length(ARRAY[1, 2, 3], 1)`, `3`},
 		{`array_length(ARRAY[1, 2, 3], 2)`, `NULL`},
@@ -537,6 +554,11 @@ func TestEval(t *testing.T) {
 		{`(1.1::decimal)::float`, `1.1`},
 		{`(1.1::decimal)::boolean`, `true`},
 		{`(0.0::decimal)::boolean`, `false`},
+		{`(1e300::decimal)::float`, `1e+300`},
+		{`(9223372036854775807::decimal)::int`, `9223372036854775807`},
+		// The two largest floats that can be converted to an int, albeit inexactly.
+		{`9223372036854775295::float::int`, `9223372036854774784`},
+		{`-9223372036854775295::float::int`, `-9223372036854774784`},
 		{`1.1::int`, `1`},
 		{`1.5::int`, `2`},
 		{`1.9::int`, `2`},
@@ -594,6 +616,7 @@ func TestEval(t *testing.T) {
 		{`('2010-09-28 12:00:00.1'::timestamp)::date`, `'2010-09-28'`},
 		{`'2010-09-28 12:00:00.1'::timestamp`, `'2010-09-28 12:00:00.1+00:00'`},
 		{`'2010-09-28 12:00:00.1+02:00'::timestamp`, `'2010-09-28 10:00:00.1+00:00'`},
+		{`'2010-09-28 12:00:00.524000 +02:00:00'::timestamp`, `'2010-09-28 10:00:00.524+00:00'`},
 		{`'2010-09-28 12:00:00.1-07:00'::timestamp`, `'2010-09-28 19:00:00.1+00:00'`},
 		{`'2010-09-28T12:00:00'::timestamp`, `'2010-09-28 12:00:00+00:00'`},
 		{`'2010-09-28T12:00:00Z'::timestamp`, `'2010-09-28 12:00:00+00:00'`},
@@ -602,8 +625,8 @@ func TestEval(t *testing.T) {
 		{`'2010-09-28 12:00:00.1-04'::timestamp`, `'2010-09-28 16:00:00.1+00:00'`},
 		{`'2010-09-28 12:00:00.1-04'::timestamp::text`, `'2010-09-28 16:00:00.1+00:00'`},
 		{`'2010-09-28 12:00:00.1-04'::timestamptz::text`, `'2010-09-28 16:00:00.1+00:00'`},
-		{`'12h2m1s23ms'::interval`, `'12h2m1.023s'`},
-		{`'12h2m1s23ms'::interval::text`, `'12h2m1.023s'`},
+		{`'12h2m1s23ms'::interval`, `'12h2m1s23ms'`},
+		{`'12h2m1s23ms'::interval::text`, `'12h2m1s23ms'`},
 		{`interval '1'`, `'1s'`},
 		{`CAST('1' AS interval)`, `'1s'`},
 		{`'1'::interval`, `'1s'`},
@@ -622,7 +645,7 @@ func TestEval(t *testing.T) {
 		{`'2010-09-28 12:00:00.1-04:00'::timestamp - '12 hours 2 minutes'::interval`, `'2010-09-28 03:58:00.1+00:00'`},
 		{`'2010-09-28 12:00:00.1-04:00'::timestamp - 'PT12H2M'::interval`, `'2010-09-28 03:58:00.1+00:00'`},
 		{`'2010-09-28 12:00:00.1-04:00'::timestamp - '12:2'::interval`, `'2010-09-28 03:58:00.1+00:00'`},
-		{`'2010-09-28 12:00:00.1-04:00'::timestamp - '2010-09-28 12:00:00.1+00:00'::timestamp`, `'4h0m0s'`},
+		{`'2010-09-28 12:00:00.1-04:00'::timestamp - '2010-09-28 12:00:00.1+00:00'::timestamp`, `'4h'`},
 		{`'1970-01-01 00:01:00.123456-00:00'::timestamp::int`, `60`},
 		{`'1970-01-01 00:01:00.123456-00:00'::timestamptz::int`, `60`},
 		{`'1970-01-10'::date::int`, `9`},
@@ -638,15 +661,15 @@ func TestEval(t *testing.T) {
 		{`10::int::date`, `'1970-01-11'`},
 		{`10::int::timestamp`, `'1970-01-01 00:00:10+00:00'`},
 		{`10::int::timestamptz`, `'1970-01-01 00:00:10+00:00'`},
-		{`10123456::int::interval`, `'10.123456s'`},
+		{`10123456::int::interval`, `'10s123ms456µs'`},
 		// Type annotation expressions.
 		{`ANNOTATE_TYPE('s', string)`, `'s'`},
 		{`ANNOTATE_TYPE('s', bytes)`, `b's'`},
 		{`ANNOTATE_TYPE('2010-09-28', date)`, `'2010-09-28'`},
-		{`ANNOTATE_TYPE('PT12H2M', interval)`, `'12h2m0s'`},
-		{`ANNOTATE_TYPE('2 02:12', interval)`, `'0m2d2h12m0s'`},
-		{`ANNOTATE_TYPE('2 02:12:34', interval)`, `'0m2d2h12m34s'`},
-		{`ANNOTATE_TYPE('1-2 02:12', interval)`, `'14m0d2h12m0s'`},
+		{`ANNOTATE_TYPE('PT12H2M', interval)`, `'12h2m'`},
+		{`ANNOTATE_TYPE('2 02:12', interval)`, `'2d2h12m'`},
+		{`ANNOTATE_TYPE('2 02:12:34', interval)`, `'2d2h12m34s'`},
+		{`ANNOTATE_TYPE('1-2 02:12', interval)`, `'1y2mon2h12m'`},
 		{`ANNOTATE_TYPE('2010-09-28', timestamp)`, `'2010-09-28 00:00:00+00:00'`},
 		{`ANNOTATE_TYPE('2010-09-28', timestamptz)`, `'2010-09-28 00:00:00+00:00'`},
 		{`ANNOTATE_TYPE(123, int) + 1`, `124`},
@@ -693,88 +716,27 @@ func TestEval(t *testing.T) {
 		{`extract_duration(second from '10m20s30ms'::interval)`, `620`},
 		{`extract_duration(millisecond from '20s30ms40µs'::interval)`, `20030`},
 		{`extract_duration(microsecond from '12345ns'::interval)`, `12`},
-		// Time and date conversion.
-		{`experimental_strftime('2016-09-28'::date, '%d@%Y/%m')`, `'28@2016/09'`},
-		{`experimental_strftime('2010-01-10 12:13:14.123456+00:00'::timestamp, '%a %A %w %d %b %B %m %y %Y %H %I %p %M %S %f %z %Z %j %U %W %c %x %X %%')`,
-			`'Sun Sunday 0 10 Jan January 01 10 2010 12 12 PM 13 14 123456 +0000 UTC 010 02 01 Sun Jan 10 12:13:14 2010 01/10/10 12:13:14 %'`},
-		{`experimental_strftime('2010-01-10 12:13:14.123456+00:00'::timestamptz, '%a %A %w %d %b %B %m %y %Y %H %I %p %M %S %f %z %Z %j %U %W %c %x %X %%')`,
-			`'Sun Sunday 0 10 Jan January 01 10 2010 12 12 PM 13 14 123456 +0000 UTC 010 02 01 Sun Jan 10 12:13:14 2010 01/10/10 12:13:14 %'`},
-		{`experimental_strptime('%d %Y %B', '03 2006 December')`, `'2006-12-03 00:00:00+00:00'`},
-		{`experimental_strptime('%y %m %d %M %S %H', '06 12 21 05 33 14')`, `'2006-12-21 14:05:33+00:00'`},
 		// Need two interval ops to verify the return type matches the return struct type.
 		{`'2010-09-28 12:00:00.1-04:00'::timestamptz - '0s'::interval - '0s'::interval`, `'2010-09-28 16:00:00.1+00:00'`},
-		{`'12h2m1s23ms'::interval + '1h'::interval`, `'13h2m1.023s'`},
+		{`'12h2m1s23ms'::interval + '1h'::interval`, `'13h2m1s23ms'`},
 		{`'12 hours 2 minutes 1 second'::interval + '1h'::interval`, `'13h2m1s'`},
 		{`'PT12H2M1S'::interval + '1h'::interval`, `'13h2m1s'`},
 		{`'12:02:01'::interval + '1h'::interval`, `'13h2m1s'`},
-		{`'12h2m1s23ms'::interval - '1h'::interval`, `'11h2m1.023s'`},
+		{`'12h2m1s23ms'::interval - '1h'::interval`, `'11h2m1s23ms'`},
 		{`'12 hours 2 minutes 1 second'::interval - '1h'::interval`, `'11h2m1s'`},
 		{`'PT12H2M1S'::interval - '1h'::interval`, `'11h2m1s'`},
-		{`'1h'::interval - '12h2m1s23ms'::interval`, `'-11h2m1.023s'`},
-		{`'PT1H'::interval - '12h2m1s23ms'::interval`, `'-11h2m1.023s'`},
-		{`'1 hour'::interval - '12h2m1s23ms'::interval`, `'-11h2m1.023s'`},
-		{`3 * '1h2m'::interval * 3`, `'9h18m0s'`},
-		{`3 * '1 hour 2 minutes'::interval * 3`, `'9h18m0s'`},
-		{`3 * 'PT1H2M'::interval * 3`, `'9h18m0s'`},
-		{`'3h'::interval / 2`, `'1h30m0s'`},
-		{`'PT3H'::interval / 2`, `'1h30m0s'`},
-		{`'3:00'::interval / 2`, `'1h30m0s'`},
-		{`'3 hours'::interval / 2`, `'1h30m0s'`},
-		{`'0:1'::interval`, `'1m0s'`},
-		{`'0:1.0'::interval`, `'1m0s'`},
-		{`'1'::interval`, `'1s'`},
-		{`'1.0:0:0'::interval`, `'1h0m0s'`},
-		{`'1.2'::interval`, `'1.2s'`},
-		{`'1.2:1:1.2'::interval`, `'1h13m1.2s'`},
-		{`'1:0:0'::interval`, `'1h0m0s'`},
-		{`'1:1.2'::interval`, `'1h1m12s'`},
-		{`'1:2'::interval`, `'1h2m0s'`},
-		{`'1:2.3'::interval`, `'1h2m18s'`},
-		{`'1:2:3'::interval`, `'1h2m3s'`},
-		{`'1234:56:54'::interval`, `'1234h56m54s'`},
-		{`'-0:1'::interval`, `'-1m0s'`},
-		{`'-0:1.0'::interval`, `'-1m0s'`},
-		{`'-1'::interval`, `'-1s'`},
-		{`'-1.0:0:0'::interval`, `'-1h0m0s'`},
-		{`'-1.2'::interval`, `'-1.2s'`},
-		{`'-1:0:0'::interval`, `'-1h0m0s'`},
-		{`'-1:1.2'::interval`, `'-1h1m12s'`},
-		{`'-1:2'::interval`, `'-1h2m0s'`},
-		{`'-1:2.3'::interval`, `'-1h2m18s'`},
-		{`'-1:2:3'::interval`, `'-1h2m3s'`},
-		{`'-1234:56:54'::interval`, `'-1234h56m54s'`},
-		{`'1-2'::interval`, `'14m0d0ns'`},
-		{`'-1-2'::interval`, `'-14m0d0ns'`},
-		{`'1-2 3'::interval`, `'14m0d3s'`},
-		{`'1-2 -3'::interval`, `'14m0d-3s'`},
-		{`'-1-2 -3'::interval`, `'-14m0d-3s'`},
-		{`'2 4:08'::interval`, `'0m2d4h8m0s'`},
-		{`'-2 4:08'::interval`, `'0m-2d4h8m0s'`},
-		{`'2 -4:08'::interval`, `'0m2d-4h8m0s'`},
-		{`'1-2 4:08'::interval`, `'14m0d4h8m0s'`},
-		{`'1-2 3 4:08'::interval`, `'14m3d4h8m0s'`},
-		{`'1-2 3 4:08:05'::interval`, `'14m3d4h8m5s'`},
-		{`'1-2 4:08:23'::interval`, `'14m0d4h8m23s'`},
-		{`'1- 4:08:23'::interval`, `'12m0d4h8m23s'`},
-		{`'0-2 3 4:08'::interval`, `'2m3d4h8m0s'`},
-		{`'1- 3 4:08:'::interval`, `'12m3d4h8m0s'`},
-		{`'-1- 3 4:08:'::interval`, `'-12m3d4h8m0s'`},
-		{`'0- 3 4:08'::interval`, `'0m3d4h8m0s'`},
-		{`'-0- 3 4:08'::interval`, `'0m3d4h8m0s'`},
-		{`'-0- -0 4:08'::interval`, `'4h8m0s'`},
-		{`'-0- -0 0:0'::interval`, `'0s'`},
-		{`'-0- -0 -0:0'::interval`, `'0s'`},
-		{`'-0- -3 -4:08'::interval`, `'0m-3d-4h8m0s'`},
-		{`'0- 3 4::08'::interval`, `'0m3d4h0m8s'`},
-		{`'	0-   3    4::08  '::interval`, `'0m3d4h0m8s'`},
-		{`'2 4:08:23'::interval`, `'0m2d4h8m23s'`},
-		{`'1-2 3 4:08:23'::interval`, `'14m3d4h8m23s'`},
-		{`'1-'::interval`, `'12m0d0ns'`},
-		{`'1- 2'::interval`, `'12m0d2s'`},
-		{`'2 3:'::interval`, `'0m2d3h0m0s'`},
-		{`'2 3:4:'::interval`, `'0m2d3h4m0s'`},
-		{`'1- 3:'::interval`, `'12m0d3h0m0s'`},
-		{`'1- 3:4'::interval`, `'12m0d3h4m0s'`},
+		{`'1h'::interval - '12h2m1s23ms'::interval`, `'-11h-2m-1s-23ms'`},
+		{`'PT1H'::interval - '12h2m1s23ms'::interval`, `'-11h-2m-1s-23ms'`},
+		{`'1 hour'::interval - '12h2m1s23ms'::interval`, `'-11h-2m-1s-23ms'`},
+		{`3 * '1h2m'::interval * 3`, `'9h18m'`},
+		{`3 * '1 hour 2 minutes'::interval * 3`, `'9h18m'`},
+		{`3 * 'PT1H2M'::interval * 3`, `'9h18m'`},
+		{`'3h'::interval / 2`, `'1h30m'`},
+		{`'PT3H'::interval / 2`, `'1h30m'`},
+		{`'3:00'::interval / 2`, `'1h30m'`},
+		{`'3 hours'::interval / 2`, `'1h30m'`},
+		{`'3 hours'::interval * 2.5`, `'7h30m'`},
+		{`'3 hours'::interval / 2.5`, `'1h12m'`},
 		// Conditional expressions.
 		{`IF(true, 1, 2/0)`, `1`},
 		{`IF(false, 1/0, 2)`, `2`},
@@ -815,6 +777,30 @@ func TestEval(t *testing.T) {
 		{`'-Inf'::float = '+Inf'::float`, `false`},
 		{`'-Inf'::float > '+Inf'::float`, `false`},
 		{`'-Inf'::float >= '+Inf'::float`, `false`},
+		{`'Infinity'::decimal`, `Infinity`},
+		{`'+Infinity'::decimal`, `Infinity`},
+		{`'-Infinity'::decimal`, `-Infinity`},
+		{`'Inf'::decimal`, `Infinity`},
+		{`'+Inf'::decimal`, `Infinity`},
+		{`'-Inf'::decimal`, `-Infinity`},
+		{`'Inf'::decimal(4)`, `Infinity`},
+		{`'+Inf'::decimal < 1.0`, `false`},
+		{`'+Inf'::decimal <= 1.0`, `false`},
+		{`'+Inf'::decimal = 1.0`, `false`},
+		{`'+Inf'::decimal > 1.0`, `true`},
+		{`'+Inf'::decimal >= 1.0`, `true`},
+		{`'-Inf'::decimal < 1.0`, `true`},
+		{`'-Inf'::decimal <= 1.0`, `true`},
+		{`'-Inf'::decimal = 1.0`, `false`},
+		{`'-Inf'::decimal > 1.0`, `false`},
+		{`'-Inf'::decimal >= 1.0`, `false`},
+		{`'-Inf'::decimal < '+Inf'::decimal`, `true`},
+		{`'-Inf'::decimal <= '+Inf'::decimal`, `true`},
+		{`'-Inf'::decimal = '+Inf'::decimal`, `false`},
+		{`'-Inf'::decimal > '+Inf'::decimal`, `false`},
+		{`'-Inf'::decimal >= '+Inf'::decimal`, `false`},
+		{`'Inf'::decimal::float`, `+Inf`},
+		{`'Inf'::float::decimal`, `Infinity`},
 		// NaN
 		{`'NaN'::float`, `NaN`},
 		{`'NaN'::float(4)`, `NaN`},
@@ -840,9 +826,33 @@ func TestEval(t *testing.T) {
 		{`'NaN'::float = 'NaN'::float`, `false`},
 		{`'NaN'::float > 'NaN'::float`, `false`},
 		{`'NaN'::float >= 'NaN'::float`, `false`},
+		{`'NaN'::decimal`, `NaN`},
+		{`'NaN'::decimal(4)`, `NaN`},
+		{`'NaN'::decimal < 1.0`, `false`},
+		{`'NaN'::decimal <= 1.0`, `false`},
+		{`'NaN'::decimal = 1.0`, `false`},
+		{`'NaN'::decimal > 1.0`, `false`},
+		{`'NaN'::decimal >= 1.0`, `false`},
+		{`'NaN'::decimal < '+Inf'::decimal`, `false`},
+		{`'NaN'::decimal <= '+Inf'::decimal`, `false`},
+		{`'NaN'::decimal = '+Inf'::decimal`, `false`},
+		{`'NaN'::decimal > '+Inf'::decimal`, `false`},
+		{`'NaN'::decimal >= '+Inf'::decimal`, `false`},
+		{`'NaN'::decimal < '-Inf'::decimal`, `false`},
+		{`'NaN'::decimal <= '-Inf'::decimal`, `false`},
+		{`'NaN'::decimal = '-Inf'::decimal`, `false`},
+		{`'NaN'::decimal > '-Inf'::decimal`, `false`},
+		{`'NaN'::decimal >= '-Inf'::decimal`, `false`},
+		{`'NaN'::decimal < 'NaN'::decimal`, `false`},
+		{`'NaN'::decimal <= 'NaN'::decimal`, `false`},
+		{`'NaN'::decimal = 'NaN'::decimal`, `false`},
+		{`'NaN'::decimal > 'NaN'::decimal`, `false`},
+		{`'NaN'::decimal >= 'NaN'::decimal`, `false`},
+		{`'NaN'::decimal::float`, `NaN`},
+		{`'NaN'::float::decimal`, `NaN`},
 	}
 	for _, d := range testData {
-		expr, err := ParseExprTraditional(d.expr)
+		expr, err := ParseExpr(d.expr)
 		if err != nil {
 			t.Fatalf("%s: %v", d.expr, err)
 		}
@@ -865,6 +875,151 @@ func TestEval(t *testing.T) {
 	}
 }
 
+func TestTimeConversion(t *testing.T) {
+	tests := []struct {
+		start     string
+		format    string
+		tm        string
+		revformat string
+		reverse   string
+	}{
+		// %a %A %b %B (+ %Y)
+		{`Wed Oct 05 2016`, `%a %b %d %Y`, `2016-10-05 00:00:00+00:00`, ``, ``},
+		{`Wednesday October 05 2016`, `%A %B %d %Y`, `2016-10-05 00:00:00+00:00`, ``, ``},
+		// %c
+		{`Wed Oct 5 01:02:03 2016`, `%c`, `2016-10-05 01:02:03+00:00`, ``, ``},
+		// %C %d (+ %m %y)
+		{`20 06 10 12`, `%C %y %m %d`, `2006-10-12 00:00:00+00:00`, ``, ``},
+		// %D
+		{`10/12/06`, `%D`, `2006-10-12 00:00:00+00:00`, ``, ``},
+		// %e (+ %Y %m)
+		{`2006 10  3`, `%Y %m %e`, `2006-10-03 00:00:00+00:00`, ``, ``},
+		// %f (+ %c)
+		{`Wed Oct 5 01:02:03 2016 .123`, `%c .%f`, `2016-10-05 01:02:03.123+00:00`, `.%f`, `.123000000`},
+		{`Wed Oct 5 01:02:03 2016 .123456`, `%c .%f`, `2016-10-05 01:02:03.123456+00:00`, `.%f`, `.123456000`},
+		{`Wed Oct 5 01:02:03 2016 .123456789`, `%c .%f`, `2016-10-05 01:02:03.123457+00:00`, `.%f`, `.123457000`},
+		{`Wed Oct 5 01:02:03 2016 .999999999`, `%c .%f`, `2016-10-05 01:02:04+00:00`, `.%f`, `.000000000`},
+		// %F
+		{`2006-10-03`, `%F`, `2006-10-03 00:00:00+00:00`, ``, ``},
+		// %h (+ %Y %d)
+		{`2006 Oct 03`, `%Y %h %d`, `2006-10-03 00:00:00+00:00`, ``, ``},
+		// %H (+ %S %M)
+		{`20061012 01:03:02`, `%Y%m%d %H:%S:%M`, `2006-10-12 01:02:03+00:00`, ``, ``},
+		// %I (+ %Y %m %d)
+		{`20161012 11`, `%Y%m%d %I`, `2016-10-12 11:00:00+00:00`, ``, ``},
+		// %j (+ %Y)
+		{`2016 286`, `%Y %j`, `2016-10-12 00:00:00+00:00`, ``, ``},
+		// %k (+ %Y %m %d)
+		{`20061012 23`, `%Y%m%d %k`, `2006-10-12 23:00:00+00:00`, ``, ``},
+		// %l (+ %Y %m %d %p)
+		{`20061012  5 PM`, `%Y%m%d %l %p`, `2006-10-12 17:00:00+00:00`, ``, ``},
+		// %n (+ %Y %m %d)
+		{"2006\n10\n03", `%Y%n%m%n%d`, `2006-10-03 00:00:00+00:00`, ``, ``},
+		// %p cannot be parsed before hour specifiers, so be sure that
+		// they appear in this order.
+		{`20161012 11 PM`, `%Y%m%d %I %p`, `2016-10-12 23:00:00+00:00`, ``, ``},
+		{`20161012 11 AM`, `%Y%m%d %I %p`, `2016-10-12 11:00:00+00:00`, ``, ``},
+		// %r
+		{`20161012 11:02:03 PM`, `%Y%m%d %r`, `2016-10-12 23:02:03+00:00`, ``, ``},
+		// %R
+		{`20161012 11:02`, `%Y%m%d %R`, `2016-10-12 11:02:00+00:00`, ``, ``},
+		// %s
+		{`1491920586`, `%s`, `2017-04-11 14:23:06+00:00`, ``, ``},
+		// %t (+ %Y %m %d)
+		{"2006\t10\t03", `%Y%t%m%t%d`, `2006-10-03 00:00:00+00:00`, ``, ``},
+		// %T (+ %Y %m %d)
+		{`20061012 01:02:03`, `%Y%m%d %T`, `2006-10-12 01:02:03+00:00`, ``, ``},
+		// %U %u (+ %Y)
+		{`2018 10 4`, `%Y %U %u`, `2018-03-15 00:00:00+00:00`, ``, ``},
+		// %W %w (+ %Y)
+		{`2018 10 4`, `%Y %W %w`, `2018-03-08 00:00:00+00:00`, ``, ``},
+		// %x
+		{`10/12/06`, `%x`, `2006-10-12 00:00:00+00:00`, ``, ``},
+		// %X
+		{`20061012 01:02:03`, `%Y%m%d %X`, `2006-10-12 01:02:03+00:00`, ``, ``},
+		// %y (+ %m %d)
+		{`000101`, `%y%m%d`, `2000-01-01 00:00:00+00:00`, ``, ``},
+		{`680101`, `%y%m%d`, `2068-01-01 00:00:00+00:00`, ``, ``},
+		{`690101`, `%y%m%d`, `1969-01-01 00:00:00+00:00`, ``, ``},
+		{`990101`, `%y%m%d`, `1999-01-01 00:00:00+00:00`, ``, ``},
+		// %Y
+		{`19000101`, `%Y%m%d`, `1900-01-01 00:00:00+00:00`, ``, ``},
+		{`20000101`, `%Y%m%d`, `2000-01-01 00:00:00+00:00`, ``, ``},
+		{`30000101`, `%Y%m%d`, `3000-01-01 00:00:00+00:00`, ``, ``},
+		// %z causes the time zone to adjust the time when parsing, but the time zone information
+		// is not retained when printing the timestamp out back.
+		{`20160101 13:00 +0655`, `%Y%m%d %H:%M %z`, `2016-01-01 06:05:00+00:00`, `%Y%m%d %H:%M %z`, `20160101 06:05 +0000`},
+	}
+
+	for _, test := range tests {
+		ctx := &EvalContext{}
+		exprStr := fmt.Sprintf("experimental_strptime('%s', '%s')", test.start, test.format)
+		expr, err := ParseExpr(exprStr)
+		if err != nil {
+			t.Errorf("%s: %v", exprStr, err)
+			continue
+		}
+		typedExpr, err := expr.TypeCheck(nil, TypeTimestamp)
+		if err != nil {
+			t.Errorf("%s: %v", exprStr, err)
+			continue
+		}
+		r, err := typedExpr.Eval(ctx)
+		if err != nil {
+			t.Errorf("%s: %v", exprStr, err)
+			continue
+		}
+		ts, ok := r.(*DTimestampTZ)
+		if !ok {
+			t.Errorf("%s: result not a timestamp: %s", exprStr, r)
+			continue
+		}
+
+		tmS := ts.String()
+		tmS = tmS[1 : len(tmS)-1] // strip the quote delimiters
+		if tmS != test.tm {
+			t.Errorf("%s: got %q, expected %q", exprStr, tmS, test.tm)
+			continue
+		}
+
+		revfmt := test.format
+		if test.revformat != "" {
+			revfmt = test.revformat
+		}
+
+		ref := test.start
+		if test.reverse != "" {
+			ref = test.reverse
+		}
+
+		exprStr = fmt.Sprintf("experimental_strftime('%s'::timestamp, '%s')", tmS, revfmt)
+		expr, err = ParseExpr(exprStr)
+		if err != nil {
+			t.Errorf("%s: %v", exprStr, err)
+			continue
+		}
+		typedExpr, err = expr.TypeCheck(nil, TypeTimestamp)
+		if err != nil {
+			t.Errorf("%s: %v", exprStr, err)
+			continue
+		}
+		r, err = typedExpr.Eval(ctx)
+		if err != nil {
+			t.Errorf("%s: %v", exprStr, err)
+			continue
+		}
+		rs, ok := r.(*DString)
+		if !ok {
+			t.Errorf("%s: result not a string: %s", exprStr, r)
+			continue
+		}
+		revS := string(*rs)
+		if ref != revS {
+			t.Errorf("%s: got %q, expected %q", exprStr, revS, ref)
+		}
+	}
+}
+
 func TestEvalError(t *testing.T) {
 	testData := []struct {
 		expr     string
@@ -875,6 +1030,7 @@ func TestEvalError(t *testing.T) {
 		{`1 // 0`, `division by zero`},
 		{`1.5 / 0`, `division by zero`},
 		{`'11h2m'::interval / 0`, `division by zero`},
+		{`'11h2m'::interval / 0.0::float`, `division by zero`},
 		{`'???'::bool`,
 			`could not parse '???' as type bool: strconv.ParseBool: parsing "???": invalid syntax`},
 		{`'foo'::int`,
@@ -888,7 +1044,7 @@ func TestEvalError(t *testing.T) {
 		{`'2010-09-28 12:00.1 MST'::timestamp`,
 			`could not parse '2010-09-28 12:00.1 MST' as type timestamp`},
 		{`'abcd'::interval`,
-			`could not parse 'abcd' as type interval: time: invalid duration abcd`},
+			`could not parse 'abcd' as type interval: interval: missing unit`},
 		{`'1- 2:3:4 9'::interval`,
 			`could not parse '1- 2:3:4 9' as type interval: invalid input syntax for type interval 1- 2:3:4 9`},
 		{`b'\xff\xfe\xfd'::string`, `invalid utf8: "\xff\xfe\xfd"`},
@@ -897,9 +1053,37 @@ func TestEvalError(t *testing.T) {
 		{`ARRAY[ARRAY[1, 2], ARRAY[1]]`, `multidimensional arrays must have array expressions with matching dimensions`},
 		// TODO(pmattis): Check for overflow.
 		// {`~0 + 1`, `0`},
+		{`9223372036854775807::int + 1::int`, `integer out of range`},
+		{`-9223372036854775807::int + -2::int`, `integer out of range`},
+		{`-9223372036854775807::int + -9223372036854775807::int`, `integer out of range`},
+		{`9223372036854775807::int + 9223372036854775807::int`, `integer out of range`},
+		{`9223372036854775807::int - -1::int`, `integer out of range`},
+		{`-9223372036854775807::int - 2::int`, `integer out of range`},
+		{`-9223372036854775807::int - 9223372036854775807::int`, `integer out of range`},
+		{`9223372036854775807::int - -9223372036854775807::int`, `integer out of range`},
+		{`4611686018427387904::int * 2::int`, `integer out of range`},
+		{`4611686018427387904::int * 2::int`, `integer out of range`},
+		{`(-9223372036854775807:::int - 1) * -1:::int`, `integer out of range`},
+		{`123 ^ 100`, `integer out of range`},
+		{`power(123, 100)`, `integer out of range`},
+		// Although these next two tests are valid integers, a float cannot represent
+		// them exactly, and so rounds them to a larger number that is out of bounds
+		// for an int. Thus, they should fail during this conversion.
+		{`9223372036854775807::float::int`, `integer out of range`},
+		{`-9223372036854775808::float::int`, `integer out of range`},
+		// The two smallest floats that cannot be converted to an int.
+		{`9223372036854775296::float::int`, `integer out of range`},
+		{`-9223372036854775296::float::int`, `integer out of range`},
+		{`1e500::decimal::int`, `integer out of range`},
+		{`1e500::decimal::float`, `float out of range`},
+		{`1e300::decimal::float::int`, `integer out of range`},
+		{`'Inf'::decimal::int`, `integer out of range`},
+		{`'NaN'::decimal::int`, `integer out of range`},
+		{`'Inf'::float::int`, `integer out of range`},
+		{`'NaN'::float::int`, `integer out of range`},
 	}
 	for _, d := range testData {
-		expr, err := ParseExprTraditional(d.expr)
+		expr, err := ParseExpr(d.expr)
 		if err != nil {
 			t.Fatalf("%s: %v", d.expr, err)
 		}

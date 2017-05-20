@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"testing"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -40,7 +42,7 @@ func TestAsOfTime(t *testing.T) {
 		AsyncExecNotification: asyncSchemaChangerDisabled,
 	}
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	const val1 = 1
 	const val2 = 2
@@ -157,7 +159,7 @@ func TestAsOfTime(t *testing.T) {
 	// Old queries shouldn't work.
 	if err := db.QueryRow("SELECT a FROM d.t AS OF SYSTEM TIME '1969-12-31'").Scan(&i); err == nil {
 		t.Fatal("expected error")
-	} else if !testutils.IsError(err, "pq: batch timestamp -86400.000000000,0 must be after replica GC threshold 0.000000000,0") {
+	} else if !testutils.IsError(err, "pq: batch timestamp -86400.000000000,0 must be after GC threshold 0.000000000,0") {
 		t.Fatal(err)
 	}
 
@@ -196,7 +198,7 @@ func TestAsOfRetry(t *testing.T) {
 	// Disable one phase commits because they cannot be restarted.
 	params.Knobs.Store.(*storage.StoreTestingKnobs).DisableOnePhaseCommits = true
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	const val1 = 1
 	const val2 = 2
@@ -249,7 +251,7 @@ func TestAsOfRetry(t *testing.T) {
 					}
 					if count > 0 && bytes.Contains(req.Key, []byte(key)) {
 						magicVals.restartCounts[key]--
-						err := roachpb.NewTransactionRetryError()
+						err := roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN)
 						magicVals.failedValues[string(req.Key)] =
 							failureRecord{err, args.Hdr.Txn}
 						txn := args.Hdr.Txn.Clone()

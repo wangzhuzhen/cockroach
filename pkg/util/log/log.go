@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"golang.org/x/net/context"
 )
@@ -65,6 +66,16 @@ func SetExitFunc(f func(int)) {
 func logDepth(ctx context.Context, depth int, sev Severity, format string, args []interface{}) {
 	// TODO(tschottdorf): logging hooks should have their entry point here.
 	addStructured(ctx, sev, depth+1, format, args)
+}
+
+// Shout logs to the specified severity's log, and also to the real
+// stderr if logging is currently redirected to a file.
+func Shout(ctx context.Context, sev Severity, args ...interface{}) {
+	logDepth(ctx, 1, sev, "", args)
+	if stderrRedirected {
+		fmt.Fprintf(OrigStderr, "*\n* %s: %s\n*\n", sev.String(),
+			strings.Replace(MakeMessage(ctx, "", args), "\n", "\n* ", -1))
+	}
 }
 
 // Infof logs to the INFO log.

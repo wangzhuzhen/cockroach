@@ -25,6 +25,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -46,7 +47,7 @@ func TestManualReplication(t *testing.T) {
 				UseDatabase: "t",
 			},
 		})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	s0 := sqlutils.MakeSQLRunner(t, tc.Conns[0])
 	s1 := sqlutils.MakeSQLRunner(t, tc.Conns[1])
@@ -104,7 +105,7 @@ func TestManualReplication(t *testing.T) {
 	// Transfer the lease to node 1.
 	leaseHolder, err := tc.FindRangeLeaseHolder(
 		tableRangeDesc,
-		&base.ReplicationTarget{
+		&roachpb.ReplicationTarget{
 			NodeID:  tc.Servers[0].GetNode().Descriptor.NodeID,
 			StoreID: tc.Servers[0].GetFirstStoreID(),
 		})
@@ -126,7 +127,7 @@ func TestManualReplication(t *testing.T) {
 	// new lease.
 	leaseHolder, err = tc.FindRangeLeaseHolder(
 		tableRangeDesc,
-		&base.ReplicationTarget{
+		&roachpb.ReplicationTarget{
 			NodeID:  tc.Servers[0].GetNode().Descriptor.NodeID,
 			StoreID: tc.Servers[0].GetFirstStoreID(),
 		})
@@ -147,7 +148,7 @@ func TestBasicManualReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	tc := StartTestCluster(t, 3, base.TestClusterArgs{ReplicationMode: base.ReplicationManual})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	desc, err := tc.AddReplicas(keys.MinKey, tc.Target(1), tc.Target(2))
 	if err != nil {
@@ -179,7 +180,7 @@ func TestBasicAutoReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	tc := StartTestCluster(t, 3, base.TestClusterArgs{ReplicationMode: base.ReplicationAuto})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 	// NB: StartTestCluster will wait for full replication.
 }
 
@@ -195,7 +196,7 @@ func TestStopServer(t *testing.T) {
 		},
 		ReplicationMode: base.ReplicationAuto,
 	})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	// Connect to server 1, ensure it is answering requests over HTTP and GRPC.
 	server1 := tc.Server(1)
@@ -228,7 +229,17 @@ func TestStopServer(t *testing.T) {
 	tc.StopServer(1)
 
 	// Verify HTTP and GRPC requests to server now fail.
-	httpErrorText := "connection refused"
+	//
+	// On *nix, this error is:
+	//
+	// dial tcp 127.0.0.1:65054: getsockopt: connection refused
+	//
+	// On Windows, this error is:
+	//
+	// dial tcp 127.0.0.1:59951: connectex: No connection could be made because the target machine actively refused it.
+	//
+	// So we look for the common bit.
+	httpErrorText := `dial tcp .*: .* refused`
 	if err := httputil.GetJSON(httpClient1, url, &response); err == nil {
 		t.Fatal("Expected HTTP Request to fail after server stopped")
 	} else if !testutils.IsError(err, httpErrorText) {

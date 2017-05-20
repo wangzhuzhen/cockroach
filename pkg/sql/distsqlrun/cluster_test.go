@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -45,7 +46,7 @@ func TestClusterFlow(t *testing.T) {
 
 	args := base.TestClusterArgs{ReplicationMode: base.ReplicationManual}
 	tc := serverutils.StartTestCluster(t, 3, args)
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	sumDigitsFn := func(row int) parser.Datum {
 		sum := 0
@@ -79,10 +80,19 @@ func TestClusterFlow(t *testing.T) {
 	// Note that the ranges won't necessarily be local to the table readers, but
 	// that doesn't matter for the purposes of this test.
 
-	// Start a span (useful to look at spans using Lighstep).
+	// Start a span (useful to look at spans using Lightstep).
 	sp := tracing.NewTracer().StartSpan("cluster test")
 	ctx := opentracing.ContextWithSpan(context.Background(), sp)
 	defer sp.Finish()
+
+	txnProto := roachpb.NewTransaction(
+		"cluster-test",
+		nil, // baseKey
+		roachpb.NormalUserPriority,
+		enginepb.SERIALIZABLE,
+		tc.Server(0).Clock().Now(),
+		0, // maxOffset
+	)
 
 	tr1 := TableReaderSpec{
 		Table:    *desc,
@@ -104,74 +114,87 @@ func TestClusterFlow(t *testing.T) {
 
 	fid := FlowID{uuid.MakeV4()}
 
-	req1 := &SetupFlowRequest{}
-	req1.Flow = FlowSpec{
-		FlowID: fid,
-		Processors: []ProcessorSpec{{
-			Core: ProcessorCoreUnion{TableReader: &tr1},
-			Post: PostProcessSpec{
-				OutputColumns: []uint32{0, 1},
-			},
-			Output: []OutputRouterSpec{{
-				Type: OutputRouterSpec_PASS_THROUGH,
-				Streams: []StreamEndpointSpec{
-					{Type: StreamEndpointSpec_REMOTE, StreamID: 0, TargetAddr: tc.Server(2).ServingAddr()},
-				},
-			}},
-		}},
-	}
-
-	req2 := &SetupFlowRequest{}
-	req2.Flow = FlowSpec{
-		FlowID: fid,
-		Processors: []ProcessorSpec{{
-			Core: ProcessorCoreUnion{TableReader: &tr2},
-			Post: PostProcessSpec{
-				OutputColumns: []uint32{0, 1},
-			},
-			Output: []OutputRouterSpec{{
-				Type: OutputRouterSpec_PASS_THROUGH,
-				Streams: []StreamEndpointSpec{
-					{Type: StreamEndpointSpec_REMOTE, StreamID: 1, TargetAddr: tc.Server(2).ServingAddr()},
-				},
-			}},
-		}},
-	}
-
-	req3 := &SetupFlowRequest{}
-	req3.Flow = FlowSpec{
-		FlowID: fid,
-		Processors: []ProcessorSpec{
-			{
-				Core: ProcessorCoreUnion{TableReader: &tr3},
+	req1 := &SetupFlowRequest{
+		Version: Version,
+		Txn:     *txnProto,
+		Flow: FlowSpec{
+			FlowID: fid,
+			Processors: []ProcessorSpec{{
+				Core: ProcessorCoreUnion{TableReader: &tr1},
 				Post: PostProcessSpec{
+					Projection:    true,
 					OutputColumns: []uint32{0, 1},
 				},
 				Output: []OutputRouterSpec{{
 					Type: OutputRouterSpec_PASS_THROUGH,
 					Streams: []StreamEndpointSpec{
-						{Type: StreamEndpointSpec_LOCAL, StreamID: 2},
+						{Type: StreamEndpointSpec_REMOTE, StreamID: 0, TargetAddr: tc.Server(2).ServingAddr()},
 					},
 				}},
-			},
-			{
-				Input: []InputSyncSpec{{
-					Type:     InputSyncSpec_ORDERED,
-					Ordering: Ordering{Columns: []Ordering_Column{{1, Ordering_Column_ASC}}},
-					Streams: []StreamEndpointSpec{
-						{Type: StreamEndpointSpec_REMOTE, StreamID: 0},
-						{Type: StreamEndpointSpec_REMOTE, StreamID: 1},
-						{Type: StreamEndpointSpec_LOCAL, StreamID: 2},
-					},
-				}},
-				Core: ProcessorCoreUnion{JoinReader: &JoinReaderSpec{Table: *desc}},
+			}},
+		},
+	}
+
+	req2 := &SetupFlowRequest{
+		Version: Version,
+		Txn:     *txnProto,
+		Flow: FlowSpec{
+			FlowID: fid,
+			Processors: []ProcessorSpec{{
+				Core: ProcessorCoreUnion{TableReader: &tr2},
 				Post: PostProcessSpec{
-					OutputColumns: []uint32{2},
+					Projection:    true,
+					OutputColumns: []uint32{0, 1},
 				},
 				Output: []OutputRouterSpec{{
-					Type:    OutputRouterSpec_PASS_THROUGH,
-					Streams: []StreamEndpointSpec{{Type: StreamEndpointSpec_SYNC_RESPONSE}},
+					Type: OutputRouterSpec_PASS_THROUGH,
+					Streams: []StreamEndpointSpec{
+						{Type: StreamEndpointSpec_REMOTE, StreamID: 1, TargetAddr: tc.Server(2).ServingAddr()},
+					},
 				}},
+			}},
+		},
+	}
+
+	req3 := &SetupFlowRequest{
+		Version: Version,
+		Txn:     *txnProto,
+		Flow: FlowSpec{
+			FlowID: fid,
+			Processors: []ProcessorSpec{
+				{
+					Core: ProcessorCoreUnion{TableReader: &tr3},
+					Post: PostProcessSpec{
+						Projection:    true,
+						OutputColumns: []uint32{0, 1},
+					},
+					Output: []OutputRouterSpec{{
+						Type: OutputRouterSpec_PASS_THROUGH,
+						Streams: []StreamEndpointSpec{
+							{Type: StreamEndpointSpec_LOCAL, StreamID: 2},
+						},
+					}},
+				},
+				{
+					Input: []InputSyncSpec{{
+						Type:     InputSyncSpec_ORDERED,
+						Ordering: Ordering{Columns: []Ordering_Column{{1, Ordering_Column_ASC}}},
+						Streams: []StreamEndpointSpec{
+							{Type: StreamEndpointSpec_REMOTE, StreamID: 0},
+							{Type: StreamEndpointSpec_REMOTE, StreamID: 1},
+							{Type: StreamEndpointSpec_LOCAL, StreamID: 2},
+						},
+					}},
+					Core: ProcessorCoreUnion{JoinReader: &JoinReaderSpec{Table: *desc}},
+					Post: PostProcessSpec{
+						Projection:    true,
+						OutputColumns: []uint32{2},
+					},
+					Output: []OutputRouterSpec{{
+						Type:    OutputRouterSpec_PASS_THROUGH,
+						Streams: []StreamEndpointSpec{{Type: StreamEndpointSpec_SYNC_RESPONSE}},
+					}},
+				},
 			},
 		},
 	}
@@ -237,8 +260,9 @@ func TestClusterFlow(t *testing.T) {
 		}
 		rows, metas = testGetDecodedRows(t, &decoder, rows, metas)
 	}
+	metas = ignoreMisplannedRanges(metas)
 	if len(metas) != 0 {
-		t.Fatalf("unexpected metadata (%d): %v", len(metas), metas)
+		t.Fatalf("unexpected metadata (%d): %+v", len(metas), metas)
 	}
 	// The result should be all the numbers in string form, ordered by the
 	// digit sum (and then by number).
@@ -255,4 +279,16 @@ func TestClusterFlow(t *testing.T) {
 	if rowStr := rows.String(); rowStr != expected {
 		t.Errorf("Result: %s\n Expected: %s\n", rowStr, expected)
 	}
+}
+
+// ignoreMisplannedRanges takes a slice of metadata and returns the entries that
+// are not about range info from mis-planned ranges.
+func ignoreMisplannedRanges(metas []ProducerMetadata) []ProducerMetadata {
+	res := make([]ProducerMetadata, 0)
+	for _, m := range metas {
+		if len(m.Ranges) == 0 {
+			res = append(res, m)
+		}
+	}
+	return res
 }

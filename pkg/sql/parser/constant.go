@@ -26,8 +26,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/pkg/errors"
-
-	"github.com/cockroachdb/apd"
 )
 
 // Constant is an constant literal expression which may be resolved to more than one type.
@@ -52,17 +50,28 @@ func isConstant(expr Expr) bool {
 	return ok
 }
 
-func isNumericConstant(expr Expr) bool {
-	_, ok := expr.(*NumVal)
-	return ok
-}
-
 func typeCheckConstant(c Constant, ctx *SemaContext, desired Type) (TypedExpr, error) {
 	avail := c.AvailableTypes()
 	if desired != TypeAny {
 		for _, typ := range avail {
 			if desired.Equivalent(typ) {
 				return c.ResolveAsType(ctx, desired)
+			}
+		}
+	}
+
+	// If a numeric constant will be promoted to a DECIMAL because it was out
+	// of range of an INT, but an INT is desired, throw an error here so that
+	// the error message specifically mentions the overflow.
+	if desired.FamilyEqual(TypeInt) {
+		if n, ok := c.(*NumVal); ok {
+			_, err := n.AsInt64()
+			switch err {
+			case errConstOutOfRange:
+				return nil, err
+			case errConstNotInt:
+			default:
+				panic(fmt.Sprintf("unexpected error %v", err))
 			}
 		}
 	}
@@ -179,9 +188,12 @@ func (expr *NumVal) asConstantInt() (constant.Value, bool) {
 }
 
 var (
-	numValAvailIntFloatDec = []Type{TypeInt, TypeDecimal, TypeFloat, TypeOid}
-	numValAvailDecFloatInt = []Type{TypeDecimal, TypeFloat, TypeInt, TypeOid}
-	numValAvailDecFloat    = []Type{TypeDecimal, TypeFloat}
+	intLikeTypes     = []Type{TypeInt, TypeOid}
+	decimalLikeTypes = []Type{TypeDecimal, TypeFloat}
+
+	numValAvailInteger             = append(intLikeTypes, decimalLikeTypes...)
+	numValAvailDecimalNoFraction   = append(decimalLikeTypes, intLikeTypes...)
+	numValAvailDecimalWithFraction = decimalLikeTypes
 )
 
 // AvailableTypes implements the Constant interface.
@@ -189,11 +201,11 @@ func (expr *NumVal) AvailableTypes() []Type {
 	switch {
 	case expr.canBeInt64():
 		if expr.Kind() == constant.Int {
-			return numValAvailIntFloatDec
+			return numValAvailInteger
 		}
-		return numValAvailDecFloatInt
+		return numValAvailDecimalNoFraction
 	default:
-		return numValAvailDecFloat
+		return numValAvailDecimalWithFraction
 	}
 }
 
@@ -216,7 +228,7 @@ func (expr *NumVal) ResolveAsType(ctx *SemaContext, typ Type) (Datum, error) {
 		dd := &expr.resDecimal
 		s := expr.OrigString
 		if s == "" {
-			// TODO(nvanbenschoten) We should propagate width through constant folding so that we
+			// TODO(nvanbenschoten): We should propagate width through constant folding so that we
 			// can control precision on folded values as well.
 			s = expr.ExactString()
 		}
@@ -224,40 +236,77 @@ func (expr *NumVal) ResolveAsType(ctx *SemaContext, typ Type) (Datum, error) {
 			// Handle constant.ratVal, which will return a rational string
 			// like 6/7. If only we could call big.Rat.FloatString() on it...
 			num, den := s[:idx], s[idx+1:]
-			if _, _, err := dd.SetString(num); err != nil {
+			if err := dd.SetString(num); err != nil {
 				return nil, errors.Wrapf(err, "could not evaluate numerator of %v as Datum type DDecimal "+
 					"from string %q", expr, num)
 			}
-			// TODO(nvanbenschoten) Should we try to avoid this allocation?
-			denDec := new(apd.Decimal)
-			if _, _, err := denDec.SetString(den); err != nil {
+			// TODO(nvanbenschoten): Should we try to avoid this allocation?
+			denDec, err := ParseDDecimal(den)
+			if err != nil {
 				return nil, errors.Wrapf(err, "could not evaluate denominator %v as Datum type DDecimal "+
 					"from string %q", expr, den)
 			}
-			if _, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, denDec); err != nil {
+			if _, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, &denDec.Decimal); err != nil {
 				return nil, err
 			}
 		} else {
-			if _, _, err := dd.SetString(s); err != nil {
+			if err := dd.SetString(s); err != nil {
 				return nil, errors.Wrapf(err, "could not evaluate %v as Datum type DDecimal from "+
 					"string %q", expr, s)
 			}
 		}
 		return dd, nil
-	case TypeOid:
+	case TypeOid,
+		TypeRegClass,
+		TypeRegNamespace,
+		TypeRegProc,
+		TypeRegProcedure,
+		TypeRegType:
+
 		d, err := expr.ResolveAsType(ctx, TypeInt)
 		if err != nil {
 			return nil, err
 		}
-		return NewDOid(*d.(*DInt)), nil
+		oid := NewDOid(*d.(*DInt))
+		oid.kind = oidTypeToColType(typ)
+		return oid, nil
 	default:
 		return nil, fmt.Errorf("could not resolve %T %v into a %T", expr, expr, typ)
 	}
 }
 
-// commonNumericConstantType returns the best constant type which is shared
-// between a set of provided numeric constants. Here, "best" is defined as
-// the smallest numeric data type which will not lose information.
+// commonConstantType returns the most constrained type which is mutually
+// resolvable between a set of provided constants. It returns false if constants
+// are not all of the same kind, and therefore share no common type.
+//
+// The function takes a slice of indexedExprs, but expects all indexedExprs
+// to wrap a Constant. The reason it does no take a slice of Constants instead
+// is to avoid forcing callers to allocate separate slices of Constant.
+func commonConstantType(vals []indexedExpr) (Type, bool) {
+	switch vals[0].e.(Constant).(type) {
+	case *NumVal:
+		for _, val := range vals[1:] {
+			if _, ok := val.e.(Constant).(*NumVal); !ok {
+				return nil, false
+			}
+		}
+		return commonNumericConstantType(vals), true
+	case *StrVal:
+		for _, val := range vals[1:] {
+			if _, ok := val.e.(Constant).(*StrVal); !ok {
+				return nil, false
+			}
+		}
+		return commonStringConstantType(vals), true
+	default:
+		panic(fmt.Sprintf("unexpected Constant type %T", vals[0].e))
+	}
+}
+
+// commonNumericConstantType returns the best type which is mutually
+// resolvable between a set of provided numeric constants. Here, "best"
+// is defined as the smallest numeric data type that all constants can
+// become without losing information.
 //
 // The function takes a slice of indexedExprs, but expects all indexedExprs
 // to wrap a *NumVal. The reason it does no take a slice of *NumVals instead
@@ -269,6 +318,23 @@ func commonNumericConstantType(vals []indexedExpr) Type {
 		}
 	}
 	return TypeInt
+}
+
+// commonStringConstantType returns the best type which is shared
+// between a set of provided string constants. Here, "best" is defined as
+// the most specific string-like type that applies to all constants. This
+// suffers from the same limitation as StrVal.AvailableTypes.
+//
+// The function takes a slice of indexedExprs, but expects all indexedExprs
+// to wrap a *StrVal. The reason it does no take a slice of *StrVals instead
+// is to avoid forcing callers to allocate separate slices of *StrVals.
+func commonStringConstantType(vals []indexedExpr) Type {
+	for _, c := range vals {
+		if c.e.(*StrVal).bytesEsc {
+			return TypeBytes
+		}
+	}
+	return TypeString
 }
 
 // StrVal represents a constant string value.
@@ -511,8 +577,8 @@ func (constantFolderVisitor) VisitPost(expr Expr) (retExpr Expr) {
 
 // foldConstantLiterals folds all constant literals using exact arithmetic.
 //
-// TODO(nvanbenschoten) Can this visitor be preallocated (like normalizeVisitor)?
-// TODO(nvanbenschoten) Investigate normalizing associative operations to group
+// TODO(nvanbenschoten): Can this visitor be preallocated (like normalizeVisitor)?
+// TODO(nvanbenschoten): Investigate normalizing associative operations to group
 //     constants together and permit further numeric constant folding.
 func foldConstantLiterals(expr Expr) (Expr, error) {
 	v := constantFolderVisitor{}

@@ -19,7 +19,6 @@ package distsqlrun
 import (
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/pkg/errors"
 )
@@ -45,8 +44,9 @@ type StreamEncoder struct {
 	// infos is initialized when the first row is received.
 	infos []DatumInfo
 
-	rowBuf   []byte
-	metadata []RemoteProducerMetadata
+	rowBuf       []byte
+	numEmptyRows int
+	metadata     []RemoteProducerMetadata
 
 	// headerSent is set after the first message (which contains the header) has
 	// been sent.
@@ -84,7 +84,7 @@ func (se *StreamEncoder) AddMetadata(meta ProducerMetadata) {
 		}
 	} else {
 		enc.Value = &RemoteProducerMetadata_Error{
-			Error: roachpb.NewError(meta.Err),
+			Error: NewError(meta.Err),
 		}
 	}
 	se.metadata = append(se.metadata, enc)
@@ -100,6 +100,10 @@ func (se *StreamEncoder) AddRow(row sqlbase.EncDatumRow) error {
 			if !ok {
 				enc = preferredEncoding
 			}
+			if enc != sqlbase.DatumEncoding_VALUE && sqlbase.HasCompositeKeyEncoding(row[i].Type.Kind) {
+				// Force VALUE encoding for composite types (key encodings may lose data).
+				enc = sqlbase.DatumEncoding_VALUE
+			}
 			se.infos[i].Encoding = enc
 			se.infos[i].Type = row[i].Type
 		}
@@ -107,6 +111,10 @@ func (se *StreamEncoder) AddRow(row sqlbase.EncDatumRow) error {
 	if len(se.infos) != len(row) {
 		return errors.Errorf("inconsistent row length: had %d, now %d",
 			len(se.infos), len(row))
+	}
+	if len(row) == 0 {
+		se.numEmptyRows++
+		return nil
 	}
 	for i := range row {
 		var err error
@@ -124,9 +132,11 @@ func (se *StreamEncoder) FormMessage(ctx context.Context) *ProducerMessage {
 	msg := &se.msg
 	msg.Header = nil
 	msg.Data.RawBytes = se.rowBuf
+	msg.Data.NumEmptyRows = int32(se.numEmptyRows)
 	msg.Data.Metadata = make([]RemoteProducerMetadata, len(se.metadata))
 	copy(msg.Data.Metadata, se.metadata)
 	se.metadata = se.metadata[:0]
+
 	if !se.headerSent {
 		msg.Header = &se.msgHdr
 		se.headerSent = true
@@ -141,5 +151,6 @@ func (se *StreamEncoder) FormMessage(ctx context.Context) *ProducerMessage {
 	}
 
 	se.rowBuf = se.rowBuf[:0]
+	se.numEmptyRows = 0
 	return msg
 }

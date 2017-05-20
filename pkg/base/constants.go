@@ -19,12 +19,22 @@ package base
 import "time"
 
 const (
+	// DefaultMaxClockOffset is the default maximum acceptable clock offset value.
+	// On Azure, clock offsets between 250ms and 500ms are common. On AWS and GCE,
+	// clock offsets generally stay below 250ms. See comments on Config.MaxOffset
+	// for more on this setting.
+	DefaultMaxClockOffset = 500 * time.Millisecond
+
 	// DefaultHeartbeatInterval is how often heartbeats are sent from the
 	// transaction coordinator to a live transaction. These keep it from
 	// being preempted by other transactions writing the same keys. If a
 	// transaction fails to be heartbeat within 2x the heartbeat interval,
 	// it may be aborted by conflicting txns.
-	DefaultHeartbeatInterval = 5 * time.Second
+	DefaultHeartbeatInterval = 1 * time.Second
+
+	// DefaultSendNextTimeout is the duration to wait before trying
+	// another replica to send a KV batch.
+	DefaultSendNextTimeout = 500 * time.Millisecond
 
 	// SlowRequestThreshold is the amount of time to wait before considering a
 	// request to be "slow".

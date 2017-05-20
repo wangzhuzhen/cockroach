@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -50,7 +49,7 @@ func (p *planner) RenameDatabase(ctx context.Context, n *parser.RenameDatabase) 
 		return nil, err
 	}
 
-	dbDesc, err := p.mustGetDatabaseDesc(ctx, string(n.Name))
+	dbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), string(n.Name))
 	if err != nil {
 		return nil, err
 	}
@@ -68,12 +67,12 @@ func (p *planner) RenameDatabase(ctx context.Context, n *parser.RenameDatabase) 
 	// are currently just stored as strings, they explicitly specify the database
 	// name. Rather than trying to rewrite them with the changed DB name, we
 	// simply disallow such renames for now.
-	tbNames, err := p.getTableNames(ctx, dbDesc)
+	tbNames, err := getTableNames(ctx, p.txn, p.getVirtualTabler(), dbDesc)
 	if err != nil {
 		return nil, err
 	}
 	for i := range tbNames {
-		tbDesc, err := p.getTableOrViewDesc(ctx, &tbNames[i])
+		tbDesc, err := getTableOrViewDesc(ctx, p.txn, p.getVirtualTabler(), &tbNames[i])
 		if err != nil {
 			return nil, err
 		}
@@ -98,7 +97,7 @@ func (p *planner) RenameDatabase(ctx context.Context, n *parser.RenameDatabase) 
 			}
 			msg := fmt.Sprintf("cannot rename database because view %q depends on table %q", viewName, tbDesc.Name)
 			hint := fmt.Sprintf("you can drop %s instead.", viewName)
-			return nil, pgerror.WithHint(sqlbase.NewDependentObjectError(msg), hint)
+			return nil, sqlbase.NewDependentObjectErrorWithHint(msg, hint)
 		}
 	}
 
@@ -123,7 +122,7 @@ func (p *planner) RenameTable(ctx context.Context, n *parser.RenameTable) (planN
 		return nil, err
 	}
 
-	dbDesc, err := p.mustGetDatabaseDesc(ctx, oldTn.Database())
+	dbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), oldTn.Database())
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +134,7 @@ func (p *planner) RenameTable(ctx context.Context, n *parser.RenameTable) (planN
 	// made more lenient down the road if needed.
 	var tableDesc *sqlbase.TableDescriptor
 	if n.IsView {
-		tableDesc, err = p.getViewDesc(ctx, oldTn)
+		tableDesc, err = getViewDesc(ctx, p.txn, p.getVirtualTabler(), oldTn)
 		if err != nil {
 			return nil, err
 		}
@@ -151,7 +150,7 @@ func (p *planner) RenameTable(ctx context.Context, n *parser.RenameTable) (planN
 			return nil, sqlbase.NewUndefinedViewError(oldTn.String())
 		}
 	} else {
-		tableDesc, err = p.getTableDesc(ctx, oldTn)
+		tableDesc, err = getTableDesc(ctx, p.txn, p.getVirtualTabler(), oldTn)
 		if err != nil {
 			return nil, err
 		}
@@ -182,7 +181,7 @@ func (p *planner) RenameTable(ctx context.Context, n *parser.RenameTable) (planN
 	}
 
 	// Check if target database exists.
-	targetDbDesc, err := p.mustGetDatabaseDesc(ctx, newTn.Database())
+	targetDbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), newTn.Database())
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +235,7 @@ func (p *planner) RenameTable(ctx context.Context, n *parser.RenameTable) (planN
 	}
 	p.notifySchemaChange(tableDesc.ID, sqlbase.InvalidMutationID)
 
-	p.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
+	p.session.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
 		if err := expectDescriptorID(systemConfig, newTbKey, descID); err != nil {
 			return err
 		}
@@ -259,7 +258,7 @@ func (p *planner) RenameIndex(ctx context.Context, n *parser.RenameIndex) (planN
 		return nil, err
 	}
 
-	tableDesc, err := p.mustGetTableDesc(ctx, tn)
+	tableDesc, err := mustGetTableDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +330,7 @@ func (p *planner) RenameColumn(ctx context.Context, n *parser.RenameColumn) (pla
 	if err != nil {
 		return nil, err
 	}
-	tableDesc, err := p.getTableDesc(ctx, tn)
+	tableDesc, err := getTableDesc(ctx, p.txn, p.getVirtualTabler(), tn)
 	if err != nil {
 		return nil, err
 	}
@@ -385,7 +384,7 @@ func (p *planner) RenameColumn(ctx context.Context, n *parser.RenameColumn) (pla
 	}
 
 	if _, _, err := tableDesc.FindColumnByNormalizedName(normNewColName); err == nil {
-		return nil, fmt.Errorf("column name %q already exists", n.NewName)
+		return nil, fmt.Errorf("column name %q already exists", string(n.NewName))
 	}
 
 	preFn := func(expr parser.Expr) (err error, recurse bool, newExpr parser.Expr) {
@@ -408,7 +407,7 @@ func (p *planner) RenameColumn(ctx context.Context, n *parser.RenameColumn) (pla
 	for i, check := range tableDesc.Checks {
 		exprStrings[i] = check.Expr
 	}
-	exprs, err := parser.ParseExprsTraditional(exprStrings)
+	exprs, err := parser.ParseExprs(exprStrings)
 	if err != nil {
 		return nil, err
 	}
@@ -463,5 +462,5 @@ func (p *planner) dependentViewRenameError(
 	msg := fmt.Sprintf("cannot rename %s %q because view %q depends on it",
 		typeName, objName, viewName)
 	hint := fmt.Sprintf("you can drop %s instead.", viewName)
-	return pgerror.WithHint(sqlbase.NewDependentObjectError(msg), hint)
+	return sqlbase.NewDependentObjectErrorWithHint(msg, hint)
 }

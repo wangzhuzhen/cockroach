@@ -171,37 +171,37 @@ func (b *writeBuffer) writeTextDatum(d parser.Datum, sessionLoc *time.Location) 
 				// Emit nothing on NULL.
 				continue
 			}
-			d.Format(&b.variablePutbuf, parser.FmtSimple)
+			parser.FormatNode(&b.variablePutbuf, parser.FmtSimple, d)
 		}
 		b.variablePutbuf.WriteString(")")
 		b.writeLengthPrefixedVariablePutbuf()
 
 	case *parser.DArray:
-		switch d.ResolvedType().Oid() {
-		case oid.T_int2vector:
+		// Arrays are serialized as a string of comma-separated values, surrounded
+		// by braces.
+		begin, sep, end := "{", ",", "}"
+
+		if d.ResolvedType().Oid() == oid.T_int2vector {
 			// int2vectors are serialized as a string of space-separated values.
-			for i, d := range v.Array {
-				if i > 0 {
-					b.variablePutbuf.WriteString(" ")
-				}
-				d.Format(&b.variablePutbuf, parser.FmtBareStrings)
-			}
-			b.writeLengthPrefixedVariablePutbuf()
-		default:
-			// Arrays are serialized as a string of comma-separated values, surrounded
-			// by braces.
-			b.variablePutbuf.WriteString("{")
-			for i, d := range v.Array {
-				if i > 0 {
-					b.variablePutbuf.WriteString(",")
-				}
-				d.Format(&b.variablePutbuf, parser.FmtBareStrings)
-			}
-			b.variablePutbuf.WriteString("}")
-			b.writeLengthPrefixedVariablePutbuf()
+			begin, sep, end = "", " ", ""
 		}
+
+		b.variablePutbuf.WriteString(begin)
+		for i, d := range v.Array {
+			if i > 0 {
+				b.variablePutbuf.WriteString(sep)
+			}
+			// TODO(radu): we are relying on Format but this doesn't work correctly
+			// if we have an array inside this array. To support nested arrays, we
+			// would need to recurse or add a special FmtFlag.
+			parser.FormatNode(&b.variablePutbuf, parser.FmtBareStrings, d)
+		}
+		b.variablePutbuf.WriteString(end)
+		b.writeLengthPrefixedVariablePutbuf()
+
 	case *parser.DOid:
 		b.writeLengthPrefixedDatum(v)
+
 	default:
 		b.setError(errors.Errorf("unsupported type %T", d))
 	}
@@ -478,12 +478,11 @@ func decodeOidDatum(id oid.Oid, code formatCode, b []byte) (parser.Datum, error)
 			}
 			return parser.NewDFloat(parser.DFloat(f)), nil
 		case oid.T_numeric:
-			dd := &parser.DDecimal{}
-			_, res, err := parser.HighPrecisionCtx.SetString(&dd.Decimal, string(b))
-			if res != 0 || err != nil {
+			d, err := parser.ParseDDecimal(string(b))
+			if err != nil {
 				return nil, errors.Errorf("could not parse string %q as decimal", b)
 			}
-			return dd, nil
+			return d, nil
 		case oid.T_bytea:
 			// http://www.postgresql.org/docs/current/static/datatype-binary.html#AEN5667
 			// Code cribbed from github.com/lib/pq.

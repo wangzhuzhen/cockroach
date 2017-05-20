@@ -22,10 +22,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -51,14 +51,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
-	"github.com/cockroachdb/cockroach/pkg/util/sdnotify"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
-
-var errMissingParams = errors.New("missing or invalid parameters")
 
 // jemallocHeapDump is an optional function to be called at heap dump time.
 // This will be non-nil when jemalloc is linked in with profiling enabled.
@@ -80,7 +77,7 @@ uninitialized, specify the --join flag to point to any healthy node
 (or list of nodes) already part of the cluster.
 `,
 	Example: `  cockroach start --insecure --store=attrs=ssd,path=/mnt/ssd1 [--join=host:port,[host:port]]`,
-	RunE:    MaybeDecorateGRPCError(runStart),
+	RunE:    MaybeShoutError(MaybeDecorateGRPCError(runStart)),
 }
 
 func setDefaultSizeParameters(ctx *server.Config) {
@@ -98,31 +95,56 @@ func setDefaultSizeParameters(ctx *server.Config) {
 	}
 }
 
-func initInsecure() error {
-	if !serverCfg.Insecure || insecure.isSet {
-		return nil
+// maxSizePerProfile is the maximum total size in bytes for profiles per
+// profile type.
+var maxSizePerProfile = envutil.EnvOrDefaultInt64(
+	"COCKROACH_MAX_SIZE_PER_PROFILE", 100<<20 /* 100 MB */)
+
+// gcProfiles removes old profiles matching the specified prefix when the sum
+// of newer profiles is larger than maxSize. Requires that the suffix used for
+// the profiles indicates age (e.g. by using a date/timestamp suffix) such that
+// sorting the filenames corresponds to ordering the profiles from oldest to
+// newest.
+func gcProfiles(dir, prefix string, maxSize int64) {
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		log.Warning(context.Background(), err)
+		return
 	}
-	// The --insecure flag was not specified on the command line, verify that the
-	// host refers to a loopback address.
-	if connHost != "" {
-		addr, err := net.ResolveIPAddr("ip", connHost)
-		if err != nil {
-			return err
+	var sum int64
+	var found int
+	for i := len(files) - 1; i >= 0; i-- {
+		f := files[i]
+		if !f.Mode().IsRegular() {
+			continue
 		}
-		if !addr.IP.IsLoopback() {
-			return fmt.Errorf("specify --insecure to listen on external address %s", connHost)
+		if !strings.HasPrefix(f.Name(), prefix) {
+			continue
 		}
-	} else {
-		serverCfg.Addr = net.JoinHostPort("localhost", connPort)
-		serverCfg.AdvertiseAddr = serverCfg.Addr
-		serverCfg.HTTPAddr = net.JoinHostPort("localhost", httpPort)
+		found++
+		sum += f.Size()
+		if found == 1 {
+			// Always keep the most recent profile.
+			continue
+		}
+		if sum <= maxSize {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, f.Name())); err != nil {
+			log.Info(context.Background(), err)
+		}
 	}
-	return nil
 }
 
 func initMemProfile(ctx context.Context, dir string) {
+	const jeprof = "jeprof."
+	const memprof = "memprof."
+
+	gcProfiles(dir, jeprof, maxSizePerProfile)
+	gcProfiles(dir, memprof, maxSizePerProfile)
+
 	memProfileInterval := envutil.EnvOrDefaultDuration("COCKROACH_MEMPROF_INTERVAL", -1)
-	if memProfileInterval < 0 {
+	if memProfileInterval <= 0 {
 		return
 	}
 	if min := time.Second; memProfileInterval < min {
@@ -139,6 +161,7 @@ func initMemProfile(ctx context.Context, dir string) {
 	}
 
 	go func() {
+		ctx := context.Background()
 		t := time.NewTicker(memProfileInterval)
 		defer t.Stop()
 
@@ -151,13 +174,14 @@ func initMemProfile(ctx context.Context, dir string) {
 
 				// Try jemalloc heap profile first, we only log errors.
 				if jemallocHeapDump != nil {
-					jepath := filepath.Join(dir, "jeprof."+suffix)
+					jepath := filepath.Join(dir, jeprof+suffix)
 					if err := jemallocHeapDump(jepath); err != nil {
 						log.Warningf(ctx, "error writing jemalloc heap %s: %s", jepath, err)
 					}
+					gcProfiles(dir, jeprof, maxSizePerProfile)
 				}
 
-				path := filepath.Join(dir, "memprof."+suffix)
+				path := filepath.Join(dir, memprof+suffix)
 				// Try writing a go heap profile.
 				f, err := os.Create(path)
 				if err != nil {
@@ -169,14 +193,18 @@ func initMemProfile(ctx context.Context, dir string) {
 					log.Warningf(ctx, "error writing go heap %s: %s", path, err)
 					return
 				}
+				gcProfiles(dir, memprof, maxSizePerProfile)
 			}()
 		}
 	}()
 }
 
 func initCPUProfile(ctx context.Context, dir string) {
+	const cpuprof = "cpuprof."
+	gcProfiles(dir, cpuprof, maxSizePerProfile)
+
 	cpuProfileInterval := envutil.EnvOrDefaultDuration("COCKROACH_CPUPROF_INTERVAL", -1)
-	if cpuProfileInterval < 0 {
+	if cpuProfileInterval <= 0 {
 		return
 	}
 	if min := time.Second; cpuProfileInterval < min {
@@ -186,6 +214,10 @@ func initCPUProfile(ctx context.Context, dir string) {
 	}
 
 	go func() {
+		defer log.RecoverAndReportPanic(ctx)
+
+		ctx := context.Background()
+
 		t := time.NewTicker(cpuProfileInterval)
 		defer t.Stop()
 
@@ -201,7 +233,7 @@ func initCPUProfile(ctx context.Context, dir string) {
 			func() {
 				const format = "2006-01-02T15_04_05.999"
 				suffix := timeutil.Now().Add(cpuProfileInterval).Format(format)
-				f, err := os.Create(filepath.Join(dir, "cpuprof."+suffix))
+				f, err := os.Create(filepath.Join(dir, cpuprof+suffix))
 				if err != nil {
 					log.Warningf(ctx, "error creating go cpu file %s", err)
 					return
@@ -212,6 +244,7 @@ func initCPUProfile(ctx context.Context, dir string) {
 					pprof.StopCPUProfile()
 					currentProfile.Close()
 					currentProfile = nil
+					gcProfiles(dir, cpuprof, maxSizePerProfile)
 				}
 
 				// Start the new profile.
@@ -255,87 +288,29 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return usageAndError(cmd)
 	}
 
-	if startBackground {
-		return rerunBackground()
+	if ok, err := maybeRerunBackground(); ok {
+		return err
 	}
 
+	// Use the server-specific values for some flags and settings.
+	serverCfg.Insecure = serverInsecure
+	serverCfg.SSLCertsDir = serverSSLCertsDir
+	serverCfg.User = security.NodeUser
+
 	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh, os.Interrupt)
-	// TODO(spencer): Move this behind a build tag for portability to
-	// non-unix platforms.
-	signal.Notify(signalCh, syscall.SIGTERM, syscall.SIGQUIT)
+	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
 	tracer := tracing.NewTracer()
 	sp := tracer.StartSpan("server start")
 	startCtx := opentracing.ContextWithSpan(context.Background(), sp)
 
-	if err := initInsecure(); err != nil {
-		return err
-	}
-
-	// Default the log directory to the "logs" subdirectory of the first
-	// non-memory store. We only do this for the "start" command which is why
-	// this work occurs here and not in an OnInitialize function.
-	//
+	// Set up the logging and profiling output.
 	// It is important that no logging occurs before this point or the log files
 	// will be created in $TMPDIR instead of their expected location.
-	pf := cockroachCmd.PersistentFlags()
-	f := pf.Lookup(logflags.LogDirName)
-	if !log.DirSet() && !f.Changed {
-		// We only override the log directory if the user has not explicitly
-		// disabled file logging using --log-dir="".
-		for _, spec := range serverCfg.Stores.Specs {
-			if spec.InMemory {
-				continue
-			}
-			if err := f.Value.Set(filepath.Join(spec.Path, "logs")); err != nil {
-				return err
-			}
-			break
-		}
+	stopper, err := setupAndInitializeLoggingAndProfiling(startCtx)
+	if err != nil {
+		return err
 	}
-
-	logDir := f.Value.String()
-	if logDir != "" {
-		vf := pf.Lookup(logflags.AlsoLogToStderrName)
-		ls := pf.Lookup(logflags.LogToStderrName)
-		if ls.Value.String() == "false" && !vf.Changed {
-			// Unless the settings were overridden by the user, silence
-			// logging to stderr because the messages will go to a log file.
-			if err := vf.Value.Set(log.Severity_NONE.String()); err != nil {
-				return err
-			}
-		}
-
-		// Make sure the path exists.
-		if err := os.MkdirAll(logDir, 0755); err != nil {
-			return err
-		}
-		log.Eventf(startCtx, "created log directory %s", logDir)
-	} else {
-		// The backtrace generator below wants an output directory.  If
-		// there is none configured, simply emit the backtraces to the
-		// current directory.
-		logDir = "."
-	}
-
-	// We log build information to stdout (for the short summary), but also
-	// to stderr to coincide with the full logs.
-	info := build.GetInfo()
-	log.Infof(startCtx, info.Short())
-
-	initMemProfile(startCtx, f.Value.String())
-	initCPUProfile(startCtx, f.Value.String())
-	initBlockProfile()
-
-	// Default user for servers.
-	serverCfg.User = security.NodeUser
-
-	// Disable Stopper task tracking as performing that call site tracking is
-	// moderately expensive (certainly outweighing the infrequent benefit it
-	// provides).
-	stopper := initBacktrace(logDir, stop.TrackTasks(false))
-	log.Event(startCtx, "initialized profiles")
 
 	// Run the rest of the startup process in the background to avoid preventing
 	// proper handling of signals if we get stuck on something during
@@ -351,6 +326,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 	var s *server.Server
 	errChan := make(chan error, 1)
 	go func() {
+		// Ensure that the log files see the startup messages immediately.
+		defer log.Flush()
+		defer log.RecoverAndReportPanic(startCtx)
 		defer sp.Finish()
 		if err := func() error {
 			if err := serverCfg.InitNode(); err != nil {
@@ -365,7 +343,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 			var err error
 			s, err = server.NewServer(serverCfg, stopper)
 			if err != nil {
-				return errors.Wrap(err, "failed to start Cockroach server")
+				return errors.Wrap(err, "failed to start server")
 			}
 
 			serverStatusMu.Lock()
@@ -386,12 +364,13 @@ func runStart(cmd *cobra.Command, args []string) error {
 				s.PeriodicallyCheckForUpdates()
 			}
 
-			pgURL, err := serverCfg.PGURL(url.User(connUser))
+			pgURL, err := serverCfg.PGURL(url.User(sqlConnUser))
 			if err != nil {
 				return err
 			}
 
 			var buf bytes.Buffer
+			info := build.GetInfo()
 			tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
 			fmt.Fprintf(tw, "CockroachDB node starting at %s\n", timeutil.Now())
 			fmt.Fprintf(tw, "build:\t%s %s @ %s (%s)\n", info.Distribution, info.Tag, info.Time, info.GoVersion)
@@ -427,8 +406,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 				return err
 			}
 			msg := buf.String()
-			log.Infof(startCtx, "Startup message:\n%s", msg)
-			fmt.Print(msg)
+			log.Infof(startCtx, "node startup completed:\n%s", msg)
+			if !log.LoggingToStderr(log.Severity_INFO) {
+				fmt.Print(msg)
+			}
 			return nil
 		}(); err != nil {
 			errChan <- err
@@ -444,9 +425,22 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// is stopped externally (for example, via the quit endpoint).
 	select {
 	case err := <-errChan:
+		// SetSync both flushes and ensures that subsequent log writes are flushed too.
+		log.SetSync(true)
 		return err
 	case <-stopper.ShouldStop():
+		// Server is being stopped externally and our job is finished
+		// here since we don't know if it's a graceful shutdown or not.
+		<-stopper.IsStopped()
+		// SetSync both flushes and ensures that subsequent log writes are flushed too.
+		log.SetSync(true)
+		return nil
 	case sig := <-signalCh:
+		// We start synchronizing log writes from here, because if a
+		// signal was received there is a non-zero chance the sender of
+		// this signal will follow up with SIGKILL if the shutdown is not
+		// timely, and we don't want logs to be lost.
+		log.SetSync(true)
 		log.Infof(shutdownCtx, "received signal '%s'", sig)
 		if sig == os.Interrupt {
 			// Graceful shutdown after an interrupt should cause the process
@@ -467,7 +461,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 					log.Warning(shutdownCtx, err)
 				}
 			}
-			stopper.Stop()
+			stopper.Stop(shutdownCtx)
 		}()
 	}
 
@@ -491,52 +485,136 @@ func runStart(cmd *cobra.Command, args []string) error {
 	select {
 	case sig := <-signalCh:
 		returnErr = fmt.Errorf("received signal '%s' during shutdown, initiating hard shutdown", sig)
-		log.Errorf(shutdownCtx, "%v", returnErr)
-		fmt.Fprintln(os.Stdout, returnErr)
-		// This new signal is not welcome, as it interferes with the
-		// graceful shutdown process.  On Unix, a signal that was not
-		// handled gracefully by the application should be visible to
-		// other processes as an exit code encoded as 128+signal number.
-
+		// This new signal is not welcome, as it interferes with the graceful
+		// shutdown process. On Unix, a signal that was not handled gracefully by
+		// the application should be visible to other processes as an exit code
+		// encoded as 128+signal number.
+		//
 		// Also, on Unix, os.Signal is syscall.Signal and it's convertible to int.
 		ErrorCode = 128 + int(sig.(syscall.Signal))
 		// NB: we do not return here to go through log.Flush below.
 	case <-time.After(time.Minute):
 		returnErr = errors.New("time limit reached, initiating hard shutdown")
-		log.Errorf(shutdownCtx, "%v", returnErr)
-		fmt.Fprintln(os.Stdout, returnErr)
 		// NB: we do not return here to go through log.Flush below.
 	case <-stopper.IsStopped():
 		const msgDone = "server drained and shutdown completed"
 		log.Infof(shutdownCtx, msgDone)
 		fmt.Fprintln(os.Stdout, msgDone)
 	}
-	log.Flush()
 
 	return returnErr
 }
 
-// rerunBackground restarts the current process in the background.
-func rerunBackground() error {
-	args := make([]string, 0, len(os.Args))
-	foundBackground := false
-	for _, arg := range os.Args {
-		if arg == "--background" || strings.HasPrefix(arg, "--background=") {
-			foundBackground = true
-			continue
+// setupAndInitializeLoggingAndProfiling does what it says on the label.
+// Prior to this however it determines suitable defaults for the
+// logging output directory and the verbosity level of stderr logging.
+// We only do this for the "start" command which is why this work
+// occurs here and not in an OnInitialize function.
+func setupAndInitializeLoggingAndProfiling(startCtx context.Context) (*stop.Stopper, error) {
+	// Default the log directory to the "logs" subdirectory of the first
+	// non-memory store. If more than one non-memory stores is detected,
+	// print a warning.
+	ambiguousLogDirs := false
+	pf := cockroachCmd.PersistentFlags()
+	f := pf.Lookup(logflags.LogDirName)
+	if !log.DirSet() && !f.Changed {
+		// We only override the log directory if the user has not explicitly
+		// disabled file logging using --log-dir="".
+		newDir := ""
+		for _, spec := range serverCfg.Stores.Specs {
+			if spec.InMemory {
+				continue
+			}
+			if newDir != "" {
+				ambiguousLogDirs = true
+				break
+			}
+			newDir = filepath.Join(spec.Path, "logs")
 		}
-		args = append(args, arg)
+		if err := f.Value.Set(newDir); err != nil {
+			return nil, err
+		}
 	}
-	if !foundBackground {
-		args = append(args, "--background=false")
+
+	// We need an output directory below. We use the current directory unless
+	// the log directory is configured, in which case we use that.
+	outputDirectory := "."
+	if logDir := f.Value.String(); logDir != "" {
+		outputDirectory = logDir
+
+		ls := pf.Lookup(logflags.LogToStderrName)
+		if !ls.Changed {
+			// Unless the settings were overridden by the user, silence
+			// logging to stderr because the messages will go to a log file.
+			if err := ls.Value.Set(log.Severity_NONE.String()); err != nil {
+				return nil, err
+			}
+		}
+
+		// Make sure the path exists.
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			return nil, err
+		}
+		log.Eventf(startCtx, "created log directory %s", logDir)
+
+		// Start the log file GC daemon to remove files that make the log
+		// directory too large.
+		log.StartGCDaemon()
 	}
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = stderr
-	return sdnotify.Exec(cmd)
+
+	if ambiguousLogDirs {
+		// Note that we can't report this message earlier, because the log directory
+		// may not have been ready before the call to MkdirAll() above.
+		log.Shout(startCtx, log.Severity_WARNING, "multiple stores configured"+
+			" and --log-dir not specified, you may want to specify --log-dir to disambiguate.")
+	}
+
+	if serverInsecure {
+		// Use a non-annotated context here since the annotation just looks funny,
+		// particularly to new users (made worse by it always printing as [n?]).
+		addr := serverConnHost
+		if addr == "" {
+			addr = "<all your IP addresses>"
+		}
+		log.Shout(context.Background(), log.Severity_WARNING,
+			"RUNNING IN INSECURE MODE!\n\n"+
+				"- Your cluster is open for any client that can access "+addr+".\n"+
+				"- Any user, even root, can log in without providing a password.\n"+
+				"- Any user, connecting as root, can read or write any data in your cluster.\n"+
+				"- There is no network encryption nor authentication, and thus no confidentiality.\n\n"+
+				"Check out how to secure your cluster: https://www.cockroachlabs.com/docs/secure-a-cluster.html")
+	}
+
+	// We log build information to stdout (for the short summary), but also
+	// to stderr to coincide with the full logs.
+	info := build.GetInfo()
+	log.Infof(startCtx, info.Short())
+
+	initMemProfile(startCtx, outputDirectory)
+	initCPUProfile(startCtx, outputDirectory)
+	initBlockProfile()
+
+	// Disable Stopper task tracking as performing that call site tracking is
+	// moderately expensive (certainly outweighing the infrequent benefit it
+	// provides).
+	stopper := initBacktrace(outputDirectory, stop.TrackTasks(false))
+	log.Event(startCtx, "initialized profiles")
+
+	return stopper, nil
 }
 
-func getGRPCConn() (*grpc.ClientConn, *hlc.Clock, *stop.Stopper, error) {
+func addrWithDefaultHost(addr string) (string, error) {
+	host, port, err := net.SplitHostPort(baseCfg.Addr)
+	if err != nil {
+		return "", err
+	}
+	if host == "" {
+		host = "localhost"
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+func getClientGRPCConn() (*grpc.ClientConn, *hlc.Clock, *stop.Stopper, error) {
 	// 0 to disable max offset checks; this RPC context is not a member of the
 	// cluster, so there's no need to enforce that its max offset is the same
 	// as that of nodes in the cluster.
@@ -560,7 +638,7 @@ func getGRPCConn() (*grpc.ClientConn, *hlc.Clock, *stop.Stopper, error) {
 }
 
 func getAdminClient() (serverpb.AdminClient, *stop.Stopper, error) {
-	conn, _, stopper, err := getGRPCConn()
+	conn, _, stopper, err := getClientGRPCConn()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -585,58 +663,69 @@ completed, the server exits.
 	RunE: MaybeDecorateGRPCError(runQuit),
 }
 
-// doShutdown attempts to trigger a server shutdown. When given an empty
-// onModes slice, it's a hard shutdown.
-func doShutdown(ctx context.Context, c serverpb.AdminClient, onModes []int32) error {
-	// This is kind of hairy, but should work well in practice. We want to
-	// distinguish between the case in which we can't even connect to the
-	// server (in which case we don't want our caller to try to come back with
-	// a hard retry) and the case in which an attempt to shut down fails (times
-	// out, or perhaps drops the connection while waiting). To that end, we
-	// first run a noop DrainRequest. If that fails, we give up. Otherwise, we
-	// wait for the "real" request to give us a response and then continue
-	// reading until the connection drops (which then counts as a success, for
-	// the connection dropping is likely the result of the Stopper having
-	// reached the final stages of shutdown).
-	for i, modes := range [][]int32{nil, onModes} {
-		stream, err := c.Drain(ctx, &serverpb.DrainRequest{
-			On:       modes,
-			Shutdown: i > 0,
-		})
-		if err != nil {
-			return err
-		}
-		// Only signal the caller to try again with a hard shutdown if we're
-		// not already trying to do that, and if the initial connection attempt
-		// (without shutdown) has succeeded.
-		tryHard := i > 0 && len(onModes) > 0
-		var hasResp bool
-		for {
-			if _, err := stream.Recv(); err != nil {
-				if hasResp && grpcutil.IsClosedConnection(err) {
-					// We're trying to shut down, and we already got a response
-					// and now the connection is closed. This means we shut
-					// down successfully.
-					return nil
-				}
-				if tryHard {
-					// Either we hadn't seen a response yet (in which case it's
-					// likely that our connection broke while waiting for the
-					// shutdown to happen); try again (and harder).
-					return errTryHardShutdown{err}
-				}
-				// Case in which we don't even know whether the server is
-				// running. No point in trying again.
-				return err
+// checkNodeRunning performs a no-op RPC and returns an error if it failed to
+// connect to the server.
+func checkNodeRunning(ctx context.Context, c serverpb.AdminClient) error {
+	// Send a no-op Drain request.
+	stream, err := c.Drain(ctx, &serverpb.DrainRequest{
+		On:       nil,
+		Shutdown: false,
+	})
+	if err != nil {
+		return errors.Wrap(err, "Failed to connect to the node: error sending drain request")
+	}
+	// Ignore errors from the stream. We've managed to connect to the node above,
+	// and that's all that this function is interested in.
+	for {
+		if _, err := stream.Recv(); err != nil {
+			if err != io.EOF {
+				log.Warningf(ctx, "unexpected error from no-op Drain request: %s", err)
 			}
-			if i == 0 {
-				// Our liveness probe succeeded.
-				break
-			}
-			hasResp = true
+			break
 		}
 	}
 	return nil
+}
+
+// doShutdown attempts to trigger a server shutdown. When given an empty
+// onModes slice, it's a hard shutdown.
+//
+// errTryHardShutdown is returned if the caller should do a hard-shutdown.
+func doShutdown(ctx context.Context, c serverpb.AdminClient, onModes []int32) error {
+	// We want to distinguish between the case in which we can't even connect to
+	// the server (in which case we don't want our caller to try to come back with
+	// a hard retry) and the case in which an attempt to shut down fails (times
+	// out, or perhaps drops the connection while waiting). To that end, we first
+	// run a noop DrainRequest. If that fails, we give up.
+	if err := checkNodeRunning(ctx, c); err != nil {
+		return err
+	}
+	// Send a drain request and continue reading until the connection drops (which
+	// then counts as a success, for the connection dropping is likely the result
+	// of the Stopper having reached the final stages of shutdown).
+	stream, err := c.Drain(ctx, &serverpb.DrainRequest{
+		On:       onModes,
+		Shutdown: true,
+	})
+	if err != nil {
+		//  This most likely means that we shut down successfully. Note that
+		//  sometimes the connection can be shut down even before a DrainResponse gets
+		//  sent back to us, so we don't require a response on the stream (see
+		//  #14184).
+		if grpcutil.IsClosedConnection(err) {
+			return nil
+		}
+		return errors.Wrap(err, "Error sending drain request")
+	}
+	for {
+		if _, err := stream.Recv(); err != nil {
+			if grpcutil.IsClosedConnection(err) {
+				return nil
+			}
+			// Unexpected error; the caller should try again (and harder).
+			return errTryHardShutdown{err}
+		}
+	}
 }
 
 type errTryHardShutdown struct{ error }
@@ -657,61 +746,27 @@ func runQuit(_ *cobra.Command, _ []string) (err error) {
 	if err != nil {
 		return err
 	}
-	defer stopper.Stop()
-
 	ctx := stopperContext(stopper)
+	defer stopper.Stop(ctx)
 
-	if err := doShutdown(ctx, c, onModes); err != nil {
-		if _, ok := err.(*errTryHardShutdown); ok {
-			fmt.Fprintf(
-				os.Stdout, "graceful shutdown failed: %s\nproceeding with hard shutdown\n", err,
-			)
-		} else {
-			return err
-		}
-	} else {
-		return nil
-	}
-	// Not passing drain modes tells the server to not bother and go
-	// straight to shutdown.
-	return errors.Wrap(doShutdown(ctx, c, nil), "hard shutdown failed")
-}
-
-// freezeClusterCmd command issues a cluster-wide freeze.
-var freezeClusterCmd = &cobra.Command{
-	Use:   "freeze-cluster",
-	Short: "freeze the cluster in preparation for an update",
-	Long: `
-Disables all Raft groups and stops new commands from being executed in preparation
-for a stop-the-world update of the cluster. Once the command has completed, the
-nodes in the cluster should be terminated, all binaries updated, and only then
-restarted. A failed or incomplete invocation of this command can be rolled back
-using the --undo flag, or by restarting all the nodes in the cluster.
-`,
-	RunE: MaybeDecorateGRPCError(runFreezeCluster),
-}
-
-func runFreezeCluster(_ *cobra.Command, _ []string) error {
-	c, stopper, err := getAdminClient()
-	if err != nil {
-		return err
-	}
-	defer stopper.Stop()
-	stream, err := c.ClusterFreeze(stopperContext(stopper),
-		&serverpb.ClusterFreezeRequest{Freeze: !undoFreezeCluster})
-	if err != nil {
-		return err
-	}
-	for {
-		resp, err := stream.Recv()
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- doShutdown(ctx, c, onModes)
+	}()
+	select {
+	case err := <-errChan:
 		if err != nil {
-			if err == io.EOF {
+			if _, ok := err.(errTryHardShutdown); ok {
+				fmt.Printf("graceful shutdown failed: %s; proceeding with hard shutdown\n", err)
 				break
 			}
 			return err
 		}
-		fmt.Println(resp.Message)
+		return nil
+	case <-time.After(time.Minute):
+		fmt.Println("timed out; proceeding with hard shutdown")
 	}
-	fmt.Println("ok")
-	return nil
+	// Not passing drain modes tells the server to not bother and go
+	// straight to shutdown.
+	return errors.Wrap(doShutdown(ctx, c, nil), "hard shutdown failed")
 }

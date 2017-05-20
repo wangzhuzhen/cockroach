@@ -20,8 +20,10 @@ import (
 	"bytes"
 	"fmt"
 
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -72,12 +74,12 @@ func (s *subquery) Format(buf *bytes.Buffer, f parser.FmtFlags) {
 		buf.WriteString("EXISTS ")
 	}
 	if f == parser.FmtShowTypes {
-		// TODO(knz/nvanbenschoten) It is not possible to extract types
+		// TODO(knz/nvanbenschoten): It is not possible to extract types
 		// from the subquery using Format, because type checking does not
 		// replace the sub-expressions of a SelectClause node in-place.
 		f = parser.FmtSimple
 	}
-	s.subquery.Format(buf, f)
+	parser.FormatNode(buf, f, s.subquery)
 }
 
 func (s *subquery) String() string { return parser.AsString(s) }
@@ -94,7 +96,7 @@ func (s *subquery) TypeCheck(_ *parser.SemaContext, desired parser.Type) (parser
 	// sub-query. For now, the type is simply derived during the subquery node
 	// creation by looking at the result column types.
 
-	// TODO(nvanbenschoten) Type checking for the comparison operator(s)
+	// TODO(nvanbenschoten): Type checking for the comparison operator(s)
 	// should take this new node into account. In particular it should
 	// check that the tuple types match pairwise.
 	return s, nil
@@ -274,6 +276,35 @@ func (p *planner) startSubqueryPlans(ctx context.Context, plan planNode) error {
 	})
 }
 
+// subquerySpanCollector is responsible for collecting all read spans that
+// subqueries in a query plan may touch. Subqueries should never be performing
+// any write operations, so only the read spans are collected.
+// FOR REVIEW: this assumption is correct, right?
+type subquerySpanCollector struct {
+	reads roachpb.Spans
+}
+
+func (v *subquerySpanCollector) subqueryNode(ctx context.Context, sq *subquery) error {
+	reads, writes, err := sq.plan.Spans(ctx)
+	if err != nil {
+		return err
+	}
+	if len(writes) > 0 {
+		return errors.Errorf("unexpected span writes in subquery: %v", writes)
+	}
+	v.reads = append(v.reads, reads...)
+	return nil
+}
+
+func collectSubquerySpans(ctx context.Context, plan planNode) (roachpb.Spans, error) {
+	var v subquerySpanCollector
+	po := planObserver{subqueryNode: v.subqueryNode}
+	if err := walkPlan(ctx, plan, po); err != nil {
+		return nil, err
+	}
+	return v.reads, nil
+}
+
 // subqueryVisitor replaces parser.Subquery syntax nodes by a
 // sql.subquery node and an initial query plan for running the
 // sub-query.
@@ -318,7 +349,7 @@ func (v *subqueryVisitor) VisitPre(expr parser.Expr) (recurse bool, newExpr pars
 	// Calling newPlan() might recursively invoke expandSubqueries, so we need to preserve
 	// the state of the visitor across the call to newPlan().
 	visitorCopy := v.planner.subqueryVisitor
-	plan, err := v.planner.newPlan(v.ctx, sq.Select, nil, false)
+	plan, err := v.planner.newPlan(v.ctx, sq.Select, nil)
 	v.planner.subqueryVisitor = visitorCopy
 	if err != nil {
 		v.err = err

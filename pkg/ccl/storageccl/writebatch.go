@@ -4,7 +4,7 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/pkg/ccl/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
 
 package storageccl
 
@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -34,11 +35,6 @@ func init() {
 func evalWriteBatch(
 	ctx context.Context, batch engine.ReadWriter, cArgs storage.CommandArgs, _ roachpb.Response,
 ) (storage.EvalResult, error) {
-	if !storage.ProposerEvaluatedKVEnabled() {
-		// To reduce the footprint of things that have ever been downstream of
-		// raft, forbid this command from running without proposer evaluated kv.
-		panic("command WriteBatch is not allowed without proposer evaluated KV")
-	}
 
 	args := cArgs.Args.(*roachpb.WriteBatchRequest)
 	h := cArgs.Header
@@ -46,6 +42,9 @@ func evalWriteBatch(
 
 	_, span := tracing.ChildSpan(ctx, fmt.Sprintf("WriteBatch [%s,%s)", args.Key, args.EndKey))
 	defer tracing.FinishSpan(span)
+	if log.V(1) {
+		log.Infof(ctx, "writebatch [%s,%s)", args.Key, args.EndKey)
+	}
 
 	// We can't use the normal RangeKeyMismatchError mechanism for dealing with
 	// splits because args.Data should stay an opaque blob to DistSender.
@@ -71,7 +70,9 @@ func evalWriteBatch(
 	iter := batch.NewIterator(false)
 	defer iter.Close()
 	iter.Seek(mvccStartKey)
-	if iter.Valid() && iter.Key().Less(mvccEndKey) {
+	if ok, err := iter.Valid(); err != nil {
+		return storage.EvalResult{}, err
+	} else if ok && iter.Key().Less(mvccEndKey) {
 		existingStats, err := iter.ComputeStats(mvccStartKey, mvccEndKey, h.Timestamp.WallTime)
 		if err != nil {
 			return storage.EvalResult{}, err

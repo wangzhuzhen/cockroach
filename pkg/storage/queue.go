@@ -471,8 +471,8 @@ func (bq *baseQueue) MaybeRemove(rangeID roachpb.RangeID) {
 // processLoop processes the entries in the queue until the provided
 // stopper signals exit.
 func (bq *baseQueue) processLoop(clock *hlc.Clock, stopper *stop.Stopper) {
-	stopper.RunWorker(func() {
-		ctx := bq.AnnotateCtx(context.Background())
+	ctx := bq.AnnotateCtx(context.Background())
+	stopper.RunWorker(ctx, func(ctx context.Context) {
 		defer func() {
 			bq.mu.Lock()
 			bq.mu.stopped = true
@@ -508,8 +508,8 @@ func (bq *baseQueue) processLoop(clock *hlc.Clock, stopper *stop.Stopper) {
 				repl := bq.pop()
 				var duration time.Duration
 				if repl != nil {
-					if stopper.RunTask(func() {
-						annotatedCtx := repl.AnnotateCtx(ctx)
+					annotatedCtx := repl.AnnotateCtx(ctx)
+					if stopper.RunTask(annotatedCtx, func(annotatedCtx context.Context) {
 						start := timeutil.Now()
 						if err := bq.processReplica(annotatedCtx, repl, clock); err != nil {
 							// Maybe add failing replica to purgatory if the queue supports it.
@@ -573,6 +573,12 @@ func (bq *baseQueue) processReplica(
 		log.Infof(ctx, "processing replica")
 	}
 
+	if !repl.IsInitialized() {
+		// We checked this when adding the replica, but we need to check it again
+		// in case this is a different replica with the same range ID (see #14193).
+		return errors.New("cannot process uninitialized replica")
+	}
+
 	if err := repl.IsDestroyed(); err != nil {
 		if log.V(3) {
 			log.Infof(queueCtx, "replica destroyed (%s); skipping", err)
@@ -590,8 +596,10 @@ func (bq *baseQueue) processReplica(
 				if log.V(3) {
 					log.Infof(queueCtx, "%s; skipping", v)
 				}
+				log.Eventf(ctx, "%s; skipping", v)
 				return nil
 			default:
+				log.ErrEventf(ctx, "could not obtain lease: %s", pErr)
 				return errors.Wrapf(pErr.GoError(), "%s: could not obtain lease", repl)
 			}
 		}
@@ -658,8 +666,8 @@ func (bq *baseQueue) maybeAddToPurgatory(
 		repl.RangeID: triggeringErr,
 	}
 
-	stopper.RunWorker(func() {
-		ctx := bq.AnnotateCtx(context.Background())
+	workerCtx := bq.AnnotateCtx(context.Background())
+	stopper.RunWorker(workerCtx, func(ctx context.Context) {
 		ticker := time.NewTicker(purgatoryReportInterval)
 		for {
 			select {
@@ -679,8 +687,8 @@ func (bq *baseQueue) maybeAddToPurgatory(
 						log.Errorf(ctx, "range %s no longer exists on store: %s", id, err)
 						return
 					}
-					if stopper.RunTask(func() {
-						annotatedCtx := repl.AnnotateCtx(ctx)
+					annotatedCtx := repl.AnnotateCtx(ctx)
+					if stopper.RunTask(annotatedCtx, func(annotatedCtx context.Context) {
 						if err := bq.processReplica(annotatedCtx, repl, clock); err != nil {
 							bq.maybeAddToPurgatory(annotatedCtx, repl, err, clock, stopper)
 						}

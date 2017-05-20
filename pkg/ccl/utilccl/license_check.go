@@ -9,20 +9,23 @@
 package utilccl
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/pkg/errors"
 )
 
-// enterpriseEnabled indicates if the cluster has enterprise features enabled.
-// TODO(dt): this is a stub for now, to be replaced with some sort of runtime
-// configurable license key or other control mechanism.
-var enterpriseEnabled = envutil.EnvOrDefaultBool("COCKROACH_ENTERPRISE_ENABLED", false)
+// EnterpriseEnabled is temporary, until #14114 is implemented.
+var EnterpriseEnabled = func() *settings.BoolSetting {
+	name := "enterprise.enabled"
+	s := settings.RegisterBoolSetting(name, "set to true to enable Enterprise features", false)
+	settings.Hide(name)
+	return s
+}()
 
 // CheckEnterpriseEnabled returns a non-nil error if the requested enterprise
 // feature is not enabled, including information or a link explaining how to
 // enable it.
 func CheckEnterpriseEnabled(feature string) error {
-	if enterpriseEnabled {
+	if EnterpriseEnabled.Get() {
 		return nil
 	}
 	// TODO(dt): link to some stable URL that then redirects to a helpful page
@@ -34,13 +37,4 @@ func CheckEnterpriseEnabled(feature string) error {
 		feature,
 		link,
 	)
-}
-
-// TestingEnableEnterprise overrides enterprise feature gating for testing.
-func TestingEnableEnterprise(enabled bool) func() {
-	before := enterpriseEnabled
-	enterpriseEnabled = enabled
-	return func() {
-		enterpriseEnabled = before
-	}
 }

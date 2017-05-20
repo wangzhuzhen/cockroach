@@ -86,7 +86,7 @@ func (v *planVisitor) visit(plan planNode) {
 	}
 
 	name := nodeName(plan)
-	var recurse bool
+	recurse := true
 	if v.observer.enterNode != nil {
 		recurse = v.observer.enterNode(v.ctx, name, plan)
 	}
@@ -117,7 +117,7 @@ func (v *planVisitor) visit(plan planNode) {
 		var subplans []planNode
 		for i, tuple := range n.tuples {
 			for j, expr := range tuple {
-				if n.columns[j].omitted {
+				if n.columns[j].Omitted {
 					continue
 				}
 				var fieldName string
@@ -197,9 +197,9 @@ func (v *planVisitor) visit(plan planNode) {
 			if len(n.pred.leftColNames) > 0 {
 				var buf bytes.Buffer
 				buf.WriteByte('(')
-				n.pred.leftColNames.Format(&buf, parser.FmtSimple)
+				parser.FormatNode(&buf, parser.FmtSimple, n.pred.leftColNames)
 				buf.WriteString(") = (")
-				n.pred.rightColNames.Format(&buf, parser.FmtSimple)
+				parser.FormatNode(&buf, parser.FmtSimple, n.pred.rightColNames)
 				buf.WriteByte(')')
 				v.observer.attr(name, "equality", buf.String())
 			}
@@ -233,7 +233,7 @@ func (v *planVisitor) visit(plan planNode) {
 
 	case *sortNode:
 		if v.observer.attr != nil {
-			var columns ResultColumns
+			var columns sqlbase.ResultColumns
 			if n.plan != nil {
 				columns = n.plan.Columns()
 			}
@@ -256,11 +256,6 @@ func (v *planVisitor) visit(plan planNode) {
 		for i, agg := range n.funcs {
 			subplans = v.expr(name, "aggregate", i, agg.expr, subplans)
 		}
-		for i, rexpr := range n.render {
-			subplans = v.expr(name, "render", i, rexpr, subplans)
-		}
-		subplans = v.expr(name, "having", -1, n.having, subplans)
-		v.subqueries(name, subplans)
 		v.visit(n.plan)
 
 	case *windowNode:
@@ -279,11 +274,10 @@ func (v *planVisitor) visit(plan planNode) {
 		v.visit(n.right)
 
 	case *splitNode:
-		var subplans []planNode
-		for i, e := range n.exprs {
-			subplans = v.expr(name, "expr", i, e, subplans)
-		}
-		v.subqueries(name, subplans)
+		v.visit(n.rows)
+
+	case *relocateNode:
+		v.visit(n.rows)
 
 	case *insertNode:
 		if v.observer.attr != nil {
@@ -319,9 +313,9 @@ func (v *planVisitor) visit(plan planNode) {
 	case *updateNode:
 		if v.observer.attr != nil {
 			v.observer.attr(name, "table", n.tableDesc.Name)
-			if len(n.tw.ru.updateCols) > 0 {
+			if len(n.tw.ru.UpdateCols) > 0 {
 				var buf bytes.Buffer
-				for i, col := range n.tw.ru.updateCols {
+				for i, col := range n.tw.ru.UpdateCols {
 					if i > 0 {
 						buf.WriteString(", ")
 					}
@@ -497,40 +491,44 @@ func nodeName(plan planNode) string {
 // strings are constant and not precomptued so that the type names can
 // be changed without changing the output of "EXPLAIN".
 var planNodeNames = map[reflect.Type]string{
-	reflect.TypeOf(&alterTableNode{}):     "alter table",
-	reflect.TypeOf(&copyNode{}):           "copy",
-	reflect.TypeOf(&createDatabaseNode{}): "create database",
-	reflect.TypeOf(&createIndexNode{}):    "create index",
-	reflect.TypeOf(&createTableNode{}):    "create table",
-	reflect.TypeOf(&createUserNode{}):     "create user",
-	reflect.TypeOf(&createViewNode{}):     "create view",
-	reflect.TypeOf(&delayedNode{}):        "virtual table",
-	reflect.TypeOf(&deleteNode{}):         "delete",
-	reflect.TypeOf(&distinctNode{}):       "distinct",
-	reflect.TypeOf(&dropDatabaseNode{}):   "drop database",
-	reflect.TypeOf(&dropIndexNode{}):      "drop index",
-	reflect.TypeOf(&dropTableNode{}):      "drop table",
-	reflect.TypeOf(&dropViewNode{}):       "drop view",
-	reflect.TypeOf(&emptyNode{}):          "empty",
-	reflect.TypeOf(&explainDebugNode{}):   "explain debug",
-	reflect.TypeOf(&explainDistSQLNode{}): "explain dist_sql",
-	reflect.TypeOf(&explainPlanNode{}):    "explain plan",
-	reflect.TypeOf(&explainTraceNode{}):   "explain trace",
-	reflect.TypeOf(&filterNode{}):         "filter",
-	reflect.TypeOf(&groupNode{}):          "group",
-	reflect.TypeOf(&hookFnNode{}):         "plugin",
-	reflect.TypeOf(&indexJoinNode{}):      "index-join",
-	reflect.TypeOf(&insertNode{}):         "insert",
-	reflect.TypeOf(&joinNode{}):           "join",
-	reflect.TypeOf(&limitNode{}):          "limit",
-	reflect.TypeOf(&ordinalityNode{}):     "ordinality",
-	reflect.TypeOf(&scanNode{}):           "scan",
-	reflect.TypeOf(&renderNode{}):         "render",
-	reflect.TypeOf(&sortNode{}):           "sort",
-	reflect.TypeOf(&splitNode{}):          "split",
-	reflect.TypeOf(&unionNode{}):          "union",
-	reflect.TypeOf(&updateNode{}):         "update",
-	reflect.TypeOf(&valueGenerator{}):     "generator",
-	reflect.TypeOf(&valuesNode{}):         "values",
-	reflect.TypeOf(&windowNode{}):         "window",
+	reflect.TypeOf(&alterTableNode{}):       "alter table",
+	reflect.TypeOf(&copyNode{}):             "copy",
+	reflect.TypeOf(&createDatabaseNode{}):   "create database",
+	reflect.TypeOf(&createIndexNode{}):      "create index",
+	reflect.TypeOf(&createTableNode{}):      "create table",
+	reflect.TypeOf(&createUserNode{}):       "create user",
+	reflect.TypeOf(&createViewNode{}):       "create view",
+	reflect.TypeOf(&delayedNode{}):          "virtual table",
+	reflect.TypeOf(&deleteNode{}):           "delete",
+	reflect.TypeOf(&distinctNode{}):         "distinct",
+	reflect.TypeOf(&dropDatabaseNode{}):     "drop database",
+	reflect.TypeOf(&dropIndexNode{}):        "drop index",
+	reflect.TypeOf(&dropTableNode{}):        "drop table",
+	reflect.TypeOf(&dropViewNode{}):         "drop view",
+	reflect.TypeOf(&emptyNode{}):            "empty",
+	reflect.TypeOf(&explainDebugNode{}):     "explain debug",
+	reflect.TypeOf(&explainDistSQLNode{}):   "explain dist_sql",
+	reflect.TypeOf(&explainPlanNode{}):      "explain plan",
+	reflect.TypeOf(&explainTraceNode{}):     "explain trace",
+	reflect.TypeOf(&filterNode{}):           "filter",
+	reflect.TypeOf(&groupNode{}):            "group",
+	reflect.TypeOf(&hookFnNode{}):           "plugin",
+	reflect.TypeOf(&indexJoinNode{}):        "index-join",
+	reflect.TypeOf(&insertNode{}):           "insert",
+	reflect.TypeOf(&joinNode{}):             "join",
+	reflect.TypeOf(&limitNode{}):            "limit",
+	reflect.TypeOf(&ordinalityNode{}):       "ordinality",
+	reflect.TypeOf(&relocateNode{}):         "relocate",
+	reflect.TypeOf(&renderNode{}):           "render",
+	reflect.TypeOf(&scanNode{}):             "scan",
+	reflect.TypeOf(&scatterNode{}):          "scatter",
+	reflect.TypeOf(&showRangesNode{}):       "showRanges",
+	reflect.TypeOf(&showFingerprintsNode{}): "showFingerprints",
+	reflect.TypeOf(&sortNode{}):             "sort",
+	reflect.TypeOf(&splitNode{}):            "split",
+	reflect.TypeOf(&unionNode{}):            "union",
+	reflect.TypeOf(&updateNode{}):           "update",
+	reflect.TypeOf(&valueGenerator{}):       "generator",
+	reflect.TypeOf(&valuesNode{}):           "values",
+	reflect.TypeOf(&windowNode{}):           "window",
 }

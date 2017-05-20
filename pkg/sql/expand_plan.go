@@ -155,7 +155,7 @@ func doExpandPlan(
 		origOrdering := n.source.Ordering()
 
 		if len(origOrdering.ordering) > 0 {
-			// TODO(knz/radu) we basically have two simultaneous orderings.
+			// TODO(knz/radu): we basically have two simultaneous orderings.
 			// What we really want is something that orderingInfo cannot
 			// currently express: that the rows are ordered by a set of
 			// columns AND at the same time they are also ordered by a
@@ -218,7 +218,7 @@ func doExpandPlan(
 		n.needSort = (match < len(n.ordering))
 
 	case *distinctNode:
-		// TODO(radu/knz) perhaps we can propagate the DISTINCT
+		// TODO(radu/knz): perhaps we can propagate the DISTINCT
 		// clause as desired ordering/exact match for the source node.
 		n.plan, err = doExpandPlan(ctx, p, params, n.plan)
 		if err != nil {
@@ -248,6 +248,12 @@ func doExpandPlan(
 			n.plan, err = doExpandPlan(ctx, p, params, n.plan)
 		}
 
+	case *splitNode:
+		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
+
+	case *relocateNode:
+		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
+
 	case *valuesNode:
 	case *alterTableNode:
 	case *copyNode:
@@ -260,8 +266,10 @@ func doExpandPlan(
 	case *dropViewNode:
 	case *emptyNode:
 	case *hookFnNode:
-	case *splitNode:
 	case *valueGenerator:
+	case *showRangesNode:
+	case *showFingerprintsNode:
+	case *scatterNode:
 	case nil:
 
 	default:
@@ -312,18 +320,18 @@ func expandRenderNode(
 	if len(r.columns) == len(sourceCols) && r.source.info.viewDesc == nil {
 		// 1) we don't drop renderNodes which also interface to a view, because
 		// CREATE VIEW needs it.
-		// TODO(knz) make this optimization conditional on a flag, which can
+		// TODO(knz): make this optimization conditional on a flag, which can
 		// be set to false by CREATE VIEW.
 		//
 		// 2) we don't drop renderNodes which have a different number of
 		// columns than their sources, because some nodes currently assume
 		// the number of source columns doesn't change between
 		// instantiation and Start() (e.g. groupNode).
-		// TODO(knz) investigate this further and enable the optimization fully.
+		// TODO(knz): investigate this further and enable the optimization fully.
 
 		foundNonTrivialRender := false
 		for i, e := range r.render {
-			if r.columns[i].omitted {
+			if r.columns[i].Omitted {
 				continue
 			}
 			if iv, ok := e.(*parser.IndexedVar); ok && i < len(sourceCols) &&
@@ -339,8 +347,7 @@ func expandRenderNode(
 		}
 	}
 
-	r.ordering = r.computeOrdering(r.source.plan.Ordering())
-
+	r.computeOrdering(r.source.plan.Ordering())
 	return r, nil
 }
 
@@ -520,10 +527,16 @@ func simplifyOrderings(plan planNode, usefulOrdering sqlbase.ColumnOrdering) pla
 		// TODO(radu): in some cases there may be multiple possible n.orderings for
 		// a given source plan ordering; we should pass usefulOrdering to help make
 		// that choice (#13709).
-		n.ordering = n.computeOrdering(n.source.plan.Ordering())
+		n.computeOrdering(n.source.plan.Ordering())
 
 	case *delayedNode:
 		n.plan = simplifyOrderings(n.plan, usefulOrdering)
+
+	case *splitNode:
+		n.rows = simplifyOrderings(n.rows, nil)
+
+	case *relocateNode:
+		n.rows = simplifyOrderings(n.rows, nil)
 
 	case *valuesNode:
 	case *alterTableNode:
@@ -537,8 +550,10 @@ func simplifyOrderings(plan planNode, usefulOrdering sqlbase.ColumnOrdering) pla
 	case *dropViewNode:
 	case *emptyNode:
 	case *hookFnNode:
-	case *splitNode:
 	case *valueGenerator:
+	case *showRangesNode:
+	case *showFingerprintsNode:
+	case *scatterNode:
 
 	default:
 		panic(fmt.Sprintf("unhandled node type: %T", plan))

@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 )
@@ -155,8 +156,15 @@ func (s *SpanSetIterator) SeekReverse(key engine.MVCCKey) {
 }
 
 // Valid implements engine.Iterator.
-func (s *SpanSetIterator) Valid() bool {
-	return !s.invalid && s.err == nil && s.i.Valid()
+func (s *SpanSetIterator) Valid() (bool, error) {
+	if s.err != nil {
+		return false, s.err
+	}
+	ok, err := s.i.Valid()
+	if err != nil {
+		return false, s.err
+	}
+	return ok && !s.invalid, nil
 }
 
 // Next implements engine.Iterator.
@@ -221,14 +229,6 @@ func (s *SpanSetIterator) Less(key engine.MVCCKey) bool {
 	return s.i.Less(key)
 }
 
-// Error implements engine.Iterator.
-func (s *SpanSetIterator) Error() error {
-	if s.err != nil {
-		return s.err
-	}
-	return s.i.Error()
-}
-
 // ComputeStats implements engine.Iterator.
 func (s *SpanSetIterator) ComputeStats(
 	start, end engine.MVCCKey, nowNanos int64,
@@ -279,6 +279,10 @@ func (s spanSetReader) Iterate(
 
 func (s spanSetReader) NewIterator(prefix bool) engine.Iterator {
 	return &SpanSetIterator{s.r.NewIterator(prefix), s.spans, nil, false}
+}
+
+func (s spanSetReader) NewTimeBoundIterator(start, end hlc.Timestamp) engine.Iterator {
+	panic("not implemented")
 }
 
 type spanSetWriter struct {

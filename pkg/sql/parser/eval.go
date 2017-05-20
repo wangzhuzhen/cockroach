@@ -30,9 +30,11 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 var (
@@ -114,7 +116,11 @@ var UnaryOps = map[UnaryOperator]unaryOpOverload{
 			Typ:        TypeInt,
 			ReturnType: TypeInt,
 			fn: func(_ *EvalContext, d Datum) (Datum, error) {
-				return NewDInt(-MustBeDInt(d)), nil
+				i := MustBeDInt(d)
+				if i == math.MinInt64 {
+					return nil, errIntOutOfRange
+				}
+				return NewDInt(-i), nil
 			},
 		},
 		UnaryOp{
@@ -242,15 +248,20 @@ var BinOps = map[BinaryOperator]binOpOverload{
 		},
 	},
 
-	// TODO(pmattis): Overflow/underflow checks?
-
 	Plus: {
 		BinOp{
 			LeftType:   TypeInt,
 			RightType:  TypeInt,
 			ReturnType: TypeInt,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return NewDInt(MustBeDInt(left) + MustBeDInt(right)), nil
+				a, b := MustBeDInt(left), MustBeDInt(right)
+				if b > 0 && a > math.MaxInt64-b {
+					return nil, errIntOutOfRange
+				}
+				if b < 0 && a < math.MinInt64-b {
+					return nil, errIntOutOfRange
+				}
+				return NewDInt(a + b), nil
 			},
 		},
 		BinOp{
@@ -385,7 +396,14 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			RightType:  TypeInt,
 			ReturnType: TypeInt,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return NewDInt(MustBeDInt(left) - MustBeDInt(right)), nil
+				a, b := MustBeDInt(left), MustBeDInt(right)
+				if b < 0 && a > math.MaxInt64+b {
+					return nil, errIntOutOfRange
+				}
+				if b > 0 && a < math.MinInt64+b {
+					return nil, errIntOutOfRange
+				}
+				return NewDInt(a - b), nil
 			},
 		},
 		BinOp{
@@ -529,7 +547,20 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			RightType:  TypeInt,
 			ReturnType: TypeInt,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				return NewDInt(MustBeDInt(left) * MustBeDInt(right)), nil
+				// See Rob Pike's implementation from
+				// https://groups.google.com/d/msg/golang-nuts/h5oSN5t3Au4/KaNQREhZh0QJ
+
+				a, b := MustBeDInt(left), MustBeDInt(right)
+				c := a * b
+				if a == 0 || b == 0 || a == 1 || b == 1 {
+					// ignore
+				} else if a == math.MinInt64 || b == math.MinInt64 {
+					// This test is required to detect math.MinInt64 * -1.
+					return nil, errIntOutOfRange
+				} else if c/b != a {
+					return nil, errIntOutOfRange
+				}
+				return NewDInt(c), nil
 			},
 		},
 		BinOp{
@@ -594,6 +625,15 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: TypeInterval,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return &DInterval{Duration: left.(*DInterval).Duration.Mul(int64(MustBeDInt(right)))}, nil
+			},
+		},
+		BinOp{
+			LeftType:   TypeInterval,
+			RightType:  TypeFloat,
+			ReturnType: TypeInterval,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				r := float64(*right.(*DFloat))
+				return &DInterval{Duration: left.(*DInterval).Duration.MulFloat(r)}, nil
 			},
 		},
 	},
@@ -668,6 +708,18 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, errDivByZero
 				}
 				return &DInterval{Duration: left.(*DInterval).Duration.Div(int64(rInt))}, nil
+			},
+		},
+		BinOp{
+			LeftType:   TypeInterval,
+			RightType:  TypeFloat,
+			ReturnType: TypeInterval,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				r := float64(*right.(*DFloat))
+				if r == 0.0 {
+					return nil, errDivByZero
+				}
+				return &DInterval{Duration: left.(*DInterval).Duration.DivFloat(r)}, nil
 			},
 		},
 	},
@@ -840,6 +892,64 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: TypeInt,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return NewDInt(MustBeDInt(left) >> uint(MustBeDInt(right))), nil
+			},
+		},
+	},
+
+	Pow: {
+		BinOp{
+			LeftType:   TypeInt,
+			RightType:  TypeInt,
+			ReturnType: TypeInt,
+			fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
+				return intPow(MustBeDInt(left), MustBeDInt(right))
+			},
+		},
+		BinOp{
+			LeftType:   TypeFloat,
+			RightType:  TypeFloat,
+			ReturnType: TypeFloat,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				f := math.Pow(float64(*left.(*DFloat)), float64(*right.(*DFloat)))
+				return NewDFloat(DFloat(f)), nil
+			},
+		},
+		BinOp{
+			LeftType:   TypeDecimal,
+			RightType:  TypeDecimal,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := &left.(*DDecimal).Decimal
+				r := &right.(*DDecimal).Decimal
+				dd := &DDecimal{}
+				_, err := DecimalCtx.Pow(&dd.Decimal, l, r)
+				return dd, err
+			},
+		},
+		BinOp{
+			LeftType:   TypeDecimal,
+			RightType:  TypeInt,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := &left.(*DDecimal).Decimal
+				r := MustBeDInt(right)
+				dd := &DDecimal{}
+				dd.SetCoefficient(int64(r))
+				_, err := DecimalCtx.Pow(&dd.Decimal, l, &dd.Decimal)
+				return dd, err
+			},
+		},
+		BinOp{
+			LeftType:   TypeInt,
+			RightType:  TypeDecimal,
+			ReturnType: TypeDecimal,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				l := MustBeDInt(left)
+				r := &right.(*DDecimal).Decimal
+				dd := &DDecimal{}
+				dd.SetCoefficient(int64(l))
+				_, err := DecimalCtx.Pow(&dd.Decimal, &dd.Decimal, r)
+				return dd, err
 			},
 		},
 	},
@@ -1356,8 +1466,8 @@ func isNaN(d Datum) bool {
 	switch t := d.(type) {
 	case *DFloat:
 		return math.IsNaN(float64(*t))
-	// case *DDecimal:
-	// TODO(mjibson) add case when decimals learn about NaN.
+	case *DDecimal:
+		return t.Decimal.Form == apd.NaN
 	default:
 		return false
 	}
@@ -1566,6 +1676,10 @@ type EvalPlanner interface {
 	// QueryRow executes a SQL query string where exactly 1 result row is
 	// expected and returns that row.
 	QueryRow(ctx context.Context, sql string, args ...interface{}) (Datums, error)
+
+	// QualifyWithDatabase resolves a possibly unqualified table name into a
+	// table name that is qualified by database.
+	QualifyWithDatabase(ctx context.Context, t *NormalizableTableName) (*TableName, error)
 }
 
 // contextHolder is a wrapper that returns a Context.
@@ -1573,6 +1687,10 @@ type contextHolder func() context.Context
 
 // EvalContext defines the context in which to evaluate an expression, allowing
 // the retrieval of state such as the node ID or statement start time.
+//
+// ATTENTION: Fields from this struct are also represented in
+// distsqlrun.EvalContext. Make sure to keep the two in sync.
+// TODO(andrei): remove or limit the duplication.
 type EvalContext struct {
 	NodeID roachpb.NodeID
 	// The statement timestamp. May be different for every statement.
@@ -1617,12 +1735,34 @@ type EvalContext struct {
 	SkipNormalize bool
 
 	collationEnv CollationEnvironment
+
+	Mon *mon.MemoryMonitor
+}
+
+// MakeTestingEvalContext returns an EvalContext that includes a MemoryMonitor.
+func MakeTestingEvalContext() EvalContext {
+	ctx := EvalContext{}
+	monitor := mon.MakeMonitor(
+		"test-monitor",
+		nil,           /* curCount */
+		nil,           /* maxHist */
+		-1,            /* increment */
+		math.MaxInt64, /* noteworthy */
+	)
+	monitor.Start(context.Background(), nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	ctx.Mon = &monitor
+	ctx.Ctx = context.Background
+	now := timeutil.Now()
+	ctx.SetTxnTimestamp(now)
+	ctx.SetStmtTimestamp(now)
+	ctx.SetClusterTimestamp(hlc.Timestamp{WallTime: now.Unix()})
+	return ctx
 }
 
 // GetStmtTimestamp retrieves the current statement timestamp as per
 // the evaluation context. The timestamp is guaranteed to be nonzero.
 func (ctx *EvalContext) GetStmtTimestamp() time.Time {
-	// TODO(knz) a zero timestamp should never be read, even during
+	// TODO(knz): a zero timestamp should never be read, even during
 	// Prepare. This will need to be addressed.
 	if !ctx.PrepareOnly && ctx.stmtTimestamp.IsZero() {
 		panic("zero statement timestamp in EvalContext")
@@ -1633,15 +1773,22 @@ func (ctx *EvalContext) GetStmtTimestamp() time.Time {
 // GetClusterTimestamp retrieves the current cluster timestamp as per
 // the evaluation context. The timestamp is guaranteed to be nonzero.
 func (ctx *EvalContext) GetClusterTimestamp() *DDecimal {
-	// TODO(knz) a zero timestamp should never be read, even during
+	// TODO(knz): a zero timestamp should never be read, even during
 	// Prepare. This will need to be addressed.
-	if !ctx.PrepareOnly {
-		if ctx.clusterTimestamp == (hlc.Timestamp{}) {
-			panic("zero cluster timestamp in EvalContext")
-		}
+	if !ctx.PrepareOnly && ctx.clusterTimestamp == (hlc.Timestamp{}) {
+		panic("zero cluster timestamp in EvalContext")
 	}
 
 	return TimestampToDecimal(ctx.clusterTimestamp)
+}
+
+// GetClusterTimestampRaw exposes the clusterTimestamp field. Also see
+// GetClusterTimestamp().
+func (ctx *EvalContext) GetClusterTimestampRaw() hlc.Timestamp {
+	if !ctx.PrepareOnly && ctx.clusterTimestamp == (hlc.Timestamp{}) {
+		panic("zero cluster timestamp in EvalContext")
+	}
+	return ctx.clusterTimestamp
 }
 
 // TimestampToDecimal converts the logical timestamp into a decimal
@@ -1666,7 +1813,7 @@ func TimestampToDecimal(ts hlc.Timestamp) *DDecimal {
 // GetTxnTimestamp retrieves the current transaction timestamp as per
 // the evaluation context. The timestamp is guaranteed to be nonzero.
 func (ctx *EvalContext) GetTxnTimestamp(precision time.Duration) *DTimestampTZ {
-	// TODO(knz) a zero timestamp should never be read, even during
+	// TODO(knz): a zero timestamp should never be read, even during
 	// Prepare. This will need to be addressed.
 	if !ctx.PrepareOnly && ctx.txnTimestamp.IsZero() {
 		panic("zero transaction timestamp in EvalContext")
@@ -1677,12 +1824,21 @@ func (ctx *EvalContext) GetTxnTimestamp(precision time.Duration) *DTimestampTZ {
 // GetTxnTimestampNoZone retrieves the current transaction timestamp as per
 // the evaluation context. The timestamp is guaranteed to be nonzero.
 func (ctx *EvalContext) GetTxnTimestampNoZone(precision time.Duration) *DTimestamp {
-	// TODO(knz) a zero timestamp should never be read, even during
+	// TODO(knz): a zero timestamp should never be read, even during
 	// Prepare. This will need to be addressed.
 	if !ctx.PrepareOnly && ctx.txnTimestamp.IsZero() {
 		panic("zero transaction timestamp in EvalContext")
 	}
 	return MakeDTimestamp(ctx.txnTimestamp, precision)
+}
+
+// GetTxnTimestampRaw exposes the txnTimestamp field. Also see GetTxnTimestamp()
+// and GetTxnTimestampNoZone().
+func (ctx *EvalContext) GetTxnTimestampRaw() time.Time {
+	if !ctx.PrepareOnly && ctx.txnTimestamp.IsZero() {
+		panic("zero transaction timestamp in EvalContext")
+	}
+	return ctx.txnTimestamp
 }
 
 // SetTxnTimestamp sets the corresponding timestamp in the EvalContext.
@@ -1830,7 +1986,7 @@ var regTypeInfos = map[*OidColType]regTypeInfo{
 	oidColTypeRegNamespace: {"pg_namespace", "nspname", "namespace"},
 }
 
-// queryOid looks up the name or OID of an input OID or string in the
+// queryOidWithJoin looks up the name or OID of an input OID or string in the
 // pg_catalog table that the input OidColType belongs to. If the input Datum
 // is a DOid, the relevant table will be queried by OID; if the input is a
 // DString, the table will be queried by its name column.
@@ -1838,7 +1994,9 @@ var regTypeInfos = map[*OidColType]regTypeInfo{
 // The return value is a fresh DOid of the input OidColType with name and OID
 // set to the result of the query. If there was not exactly one result to the
 // query, an error will be returned.
-func queryOid(ctx *EvalContext, typ *OidColType, d Datum) (Datum, error) {
+func queryOidWithJoin(
+	ctx *EvalContext, typ *OidColType, d Datum, joinClause string, additionalWhere string,
+) (*DOid, error) {
 	ret := &DOid{kind: typ}
 	info := regTypeInfos[typ]
 	var queryCol string
@@ -1853,8 +2011,8 @@ func queryOid(ctx *EvalContext, typ *OidColType, d Datum) (Datum, error) {
 	results, err := ctx.Planner.QueryRow(
 		ctx.Ctx(),
 		fmt.Sprintf(
-			"SELECT oid, %s FROM pg_catalog.%s WHERE %s = $1",
-			info.nameCol, info.tableName, queryCol),
+			"SELECT %s.oid, %s FROM pg_catalog.%s %s WHERE %s = $1 %s",
+			info.tableName, info.nameCol, info.tableName, joinClause, queryCol, additionalWhere),
 		d)
 	if err != nil {
 		if _, ok := err.(*MultipleResultsError); ok {
@@ -1868,6 +2026,10 @@ func queryOid(ctx *EvalContext, typ *OidColType, d Datum) (Datum, error) {
 	ret.DInt = results[0].(*DOid).DInt
 	ret.name = AsStringWithFlags(results[1], FmtBareStrings)
 	return ret, nil
+}
+
+func queryOid(ctx *EvalContext, typ *OidColType, d Datum) (*DOid, error) {
+	return queryOidWithJoin(ctx, typ, d, "", "")
 }
 
 // Eval implements the TypedExpr interface.
@@ -1907,16 +2069,24 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 			if *v {
 				res = NewDInt(1)
 			} else {
-				res = NewDInt(0)
+				res = DZero
 			}
 		case *DInt:
 			res = v
 		case *DFloat:
-			f, err := round(float64(*v), 0)
-			if err != nil {
-				panic(fmt.Sprintf("round should never fail with digits hardcoded to 0: %s", err))
+			f := float64(*v)
+			// Use `<=` and `>=` here instead of just `<` and `>` because when
+			// math.MaxInt64 and math.MinInt64 are converted to float64s, they are
+			// rounded to numbers with larger absolute values. Note that the first
+			// next FP value after and strictly greater than float64(math.MinInt64)
+			// is -9223372036854774784 (= float64(math.MinInt64)+513) and the first
+			// previous value and strictly smaller than float64(math.MaxInt64)
+			// is 9223372036854774784 (= float64(math.MaxInt64)-513), and both are
+			// convertible to int without overflow.
+			if math.IsNaN(f) || f <= float64(math.MinInt64) || f >= float64(math.MaxInt64) {
+				return nil, errIntOutOfRange
 			}
-			res = NewDInt(DInt(*f.(*DFloat)))
+			res = NewDInt(DInt(f))
 		case *DDecimal:
 			d := ctx.getTmpDec()
 			_, err := DecimalCtx.ToIntegral(d, &v.Decimal)
@@ -1986,55 +2156,57 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 		}
 
 	case *DecimalColType:
+		var dd DDecimal
+		var err error
+		unset := false
 		switch v := d.(type) {
 		case *DBool:
-			dd := &DDecimal{}
 			if *v {
 				dd.SetCoefficient(1)
 			}
-			return dd, nil
 		case *DInt:
-			dd := &DDecimal{}
 			dd.SetCoefficient(int64(*v))
-			return dd, nil
 		case *DDate:
-			dd := &DDecimal{}
 			dd.SetCoefficient(int64(*v))
-			return dd, nil
 		case *DFloat:
-			dd := &DDecimal{}
-			_, err := dd.SetFloat64(float64(*v))
-			return dd, err
+			_, err = dd.SetFloat64(float64(*v))
 		case *DDecimal:
-			return d, nil
+			// Small optimization to avoid copying into dd in normal case.
+			if typ.Prec == 0 {
+				return d, nil
+			}
+			dd = *v
 		case *DString:
-			return ParseDDecimal(string(*v))
+			err = dd.SetString(string(*v))
 		case *DCollatedString:
-			return ParseDDecimal(v.Contents)
+			err = dd.SetString(v.Contents)
 		case *DTimestamp:
-			var res DDecimal
-			val := &res.Coeff
+			val := &dd.Coeff
 			val.SetInt64(v.Unix())
 			val.Mul(val, big10E6)
 			micros := v.Nanosecond() / int(time.Microsecond)
 			val.Add(val, big.NewInt(int64(micros)))
-			res.Decimal.Exponent = -6
-			return &res, nil
+			dd.Exponent = -6
 		case *DTimestampTZ:
-			var res DDecimal
-			val := &res.Coeff
+			val := &dd.Coeff
 			val.SetInt64(v.Unix())
 			val.Mul(val, big10E6)
 			micros := v.Nanosecond() / int(time.Microsecond)
 			val.Add(val, big.NewInt(int64(micros)))
-			res.Decimal.Exponent = -6
-			return &res, nil
+			dd.Exponent = -6
 		case *DInterval:
-			var res DDecimal
-			val := &res.Coeff
+			val := &dd.Coeff
 			val.SetInt64(v.Nanos / 1000)
-			res.Decimal.Exponent = -6
-			return &res, nil
+			dd.Exponent = -6
+		default:
+			unset = true
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !unset {
+			err = LimitDecimalWidth(&dd.Decimal, typ.Prec, typ.Scale)
+			return &dd, err
 		}
 
 	case *StringColType, *CollatedStringColType, *NameColType:
@@ -2107,7 +2279,7 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 		}
 
 	case *TimestampColType:
-		// TODO(knz) Timestamp from float, decimal.
+		// TODO(knz): Timestamp from float, decimal.
 		switch d := d.(type) {
 		case *DString:
 			return ParseDTimestamp(string(*d), time.Microsecond)
@@ -2125,7 +2297,7 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 		}
 
 	case *TimestampTZColType:
-		// TODO(knz) TimestampTZ from float, decimal.
+		// TODO(knz): TimestampTZ from float, decimal.
 		switch d := d.(type) {
 		case *DString:
 			return ParseDTimestampTZ(string(*d), ctx.GetLocation(), time.Microsecond)
@@ -2142,7 +2314,7 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 		}
 
 	case *IntervalColType:
-		// TODO(knz) Interval from float, decimal.
+		// TODO(knz): Interval from float, decimal.
 		switch v := d.(type) {
 		case *DString:
 			return ParseDInterval(string(*v))
@@ -2161,15 +2333,25 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 			case oidColTypeOid:
 				return &DOid{kind: typ, DInt: v.DInt}, nil
 			default:
-				return queryOid(ctx, typ, v)
+				oid, err := queryOid(ctx, typ, v)
+				if err != nil {
+					oid = NewDOid(v.DInt)
+					oid.kind = typ
+				}
+				return oid, nil
 			}
 		case *DInt:
-			oid := NewDOid(*v)
 			switch typ {
 			case oidColTypeOid:
 				return &DOid{kind: typ, DInt: *v}, nil
 			default:
-				return queryOid(ctx, typ, oid)
+				tmpOid := NewDOid(*v)
+				oid, err := queryOid(ctx, typ, tmpOid)
+				if err != nil {
+					oid = tmpOid
+					oid.kind = typ
+				}
+				return oid, nil
 			}
 		case *DString:
 			s := string(*v)
@@ -2181,6 +2363,12 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 			}
 
 			switch typ {
+			case oidColTypeOid:
+				i, err := ParseDInt(s)
+				if err != nil {
+					return nil, err
+				}
+				return &DOid{kind: typ, DInt: *i}, nil
 			case oidColTypeRegProc, oidColTypeRegProcedure:
 				// Trim procedure type parameters, e.g. `max(int)` becomes `max`.
 				// Postgres only does this when the cast is ::regprocedure, but we're
@@ -2203,6 +2391,24 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 				// Trim type modifiers, e.g. `numeric(10,3)` becomes `numeric`.
 				s = pgSignatureRegexp.ReplaceAllString(s, "$1")
 				return queryOid(ctx, typ, NewDString(s))
+			case oidColTypeRegClass:
+				// Resolving a table name requires looking at the search path to
+				// determine the database that owns it.
+				t := &NormalizableTableName{
+					TableNameReference: UnresolvedName{
+						Name(s),
+					}}
+				tn, err := ctx.Planner.QualifyWithDatabase(ctx.Ctx(), t)
+				if err != nil {
+					return nil, err
+				}
+				// Determining the table's OID requires joining against the databases
+				// table because we only have the database name, not its OID, which is
+				// what is stored in pg_class. This extra join means we can't use
+				// queryOid like everyone else.
+				return queryOidWithJoin(ctx, typ, NewDString(s),
+					"JOIN pg_catalog.pg_namespace ON relnamespace = pg_namespace.oid",
+					fmt.Sprintf("AND nspname = '%s'", tn.Database()))
 			default:
 				return queryOid(ctx, typ, NewDString(s))
 			}
@@ -2353,7 +2559,7 @@ func (expr *FuncExpr) Eval(ctx *EvalContext) (Datum, error) {
 		// If we are facing a retry error, in particular those generated
 		// by crdb_internal.force_retry(), propagate it unchanged, so that
 		// the executor can see it with the right type.
-		if _, ok := err.(*roachpb.RetryableTxnError); ok {
+		if _, ok := err.(*roachpb.HandledRetryableTxnError); ok {
 			return nil, err
 		}
 		return nil, fmt.Errorf("%s(): %v", expr.Func, err)

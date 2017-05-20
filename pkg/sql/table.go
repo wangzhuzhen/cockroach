@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -71,45 +72,6 @@ func GetKeysForTableDescriptor(
 
 // SchemaAccessor provides helper methods for using the SQL schema.
 type SchemaAccessor interface {
-	// getTableNames retrieves the list of qualified names of tables
-	// present in the given database.
-	getTableNames(ctx context.Context, dbDesc *sqlbase.DatabaseDescriptor) (parser.TableNames, error)
-
-	// expandTableGlob expands wildcards from the end of `expr` and
-	// returns the list of matching tables.
-	expandTableGlob(ctx context.Context, expr parser.TablePattern) (parser.TableNames, error)
-
-	// getTableOrViewDesc returns a table descriptor for either a table or view,
-	// or nil if the descriptor is not found.
-	getTableOrViewDesc(ctx context.Context, tn *parser.TableName) (*sqlbase.TableDescriptor, error)
-
-	// getTableDesc returns a table descriptor for a table, or nil if the
-	// descriptor is not found. If you want the "not found" condition to
-	// return an error, use mustGetTableDesc() instead.
-	// Returns an error if the underlying table descriptor actually
-	// represents a view rather than a table.
-	getTableDesc(ctx context.Context, tn *parser.TableName) (*sqlbase.TableDescriptor, error)
-
-	// getViewDesc returns a table descriptor for a table, or nil if the
-	// descriptor is not found.
-	// Returns an error if the underlying table descriptor actually
-	// represents a table rather than a view.
-	getViewDesc(ctx context.Context, tn *parser.TableName) (*sqlbase.TableDescriptor, error)
-
-	// mustGetTableOrViewDesc returns a table descriptor for either a table or
-	// view, or an error if the descriptor is not found.
-	mustGetTableOrViewDesc(
-		ctx context.Context, tn *parser.TableName,
-	) (*sqlbase.TableDescriptor, error)
-
-	// mustGetTableDesc returns a table descriptor for a table, or an error if
-	// the descriptor is not found.
-	mustGetTableDesc(ctx context.Context, tn *parser.TableName) (*sqlbase.TableDescriptor, error)
-
-	// mustGetViewDesc returns a table descriptor for a view, or an error if the
-	// descriptor is not found.
-	mustGetViewDesc(ctx context.Context, tn *parser.TableName) (*sqlbase.TableDescriptor, error)
-
 	// NB: one can use GetTableDescFromID() to retrieve a descriptor for
 	// a table from a transaction using its ID, assuming it was loaded
 	// in the transaction already.
@@ -118,13 +80,6 @@ type SchemaAccessor interface {
 	// exists for the table.
 	notifySchemaChange(id sqlbase.ID, mutationID sqlbase.MutationID)
 
-	// getTableLease acquires a lease for the specified table. The lease will be
-	// released when the planner closes.
-	getTableLease(ctx context.Context, tn *parser.TableName) (*sqlbase.TableDescriptor, error)
-
-	// releaseLeases releases all leases currently held by the planner.
-	releaseLeases(ctx context.Context)
-
 	// writeTableDesc effectively writes a table descriptor to the
 	// database within the current planner transaction.
 	writeTableDesc(ctx context.Context, tableDesc *sqlbase.TableDescriptor) error
@@ -132,12 +87,12 @@ type SchemaAccessor interface {
 
 var _ SchemaAccessor = &planner{}
 
-func (p *planner) getTableOrViewDesc(
-	ctx context.Context, tn *parser.TableName,
-) (*sqlbase.TableDescriptor, error) {
-	return getTableOrViewDesc(ctx, p.txn, &p.session.virtualSchemas, tn)
+func (p *planner) getVirtualTabler() VirtualTabler {
+	return &p.session.virtualSchemas
 }
 
+// getTableOrViewDesc returns a table descriptor for either a table or view,
+// or nil if the descriptor is not found.
 func getTableOrViewDesc(
 	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName,
 ) (*sqlbase.TableDescriptor, error) {
@@ -165,13 +120,12 @@ func getTableOrViewDesc(
 	return &desc, nil
 }
 
-func (p *planner) getTableDesc(
-	ctx context.Context, tn *parser.TableName,
-) (*sqlbase.TableDescriptor, error) {
-	return getTableDesc(ctx, p.txn, &p.session.virtualSchemas, tn)
-}
-
-// getTableDesc implements the SchemaAccessor interface.
+// getTableDesc returns a table descriptor for a table, or nil if the
+// descriptor is not found. If you want the "not found" condition to
+// return an error, use mustGetTableDesc() instead.
+//
+// Returns an error if the underlying table descriptor actually
+// represents a view rather than a table.
 func getTableDesc(
 	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName,
 ) (*sqlbase.TableDescriptor, error) {
@@ -185,11 +139,15 @@ func getTableDesc(
 	return desc, nil
 }
 
-// getViewDesc implements the SchemaAccessor interface.
-func (p *planner) getViewDesc(
-	ctx context.Context, tn *parser.TableName,
+// getViewDesc returns a table descriptor for a table, or nil if the
+// descriptor is not found.
+//
+// Returns an error if the underlying table descriptor actually
+// represents a table rather than a view.
+func getViewDesc(
+	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName,
 ) (*sqlbase.TableDescriptor, error) {
-	desc, err := p.getTableOrViewDesc(ctx, tn)
+	desc, err := getTableOrViewDesc(ctx, txn, vt, tn)
 	if err != nil {
 		return desc, err
 	}
@@ -199,11 +157,13 @@ func (p *planner) getViewDesc(
 	return desc, nil
 }
 
-// mustGetTableOrViewDesc implements the SchemaAccessor interface.
-func (p *planner) mustGetTableOrViewDesc(
-	ctx context.Context, tn *parser.TableName,
+// mustGetTableOrViewDesc returns a table descriptor for either a table or
+// view, or an error if the descriptor is not found. allowAdding when set allows
+// a table descriptor in the ADD state to also be returned.
+func mustGetTableOrViewDesc(
+	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName, allowAdding bool,
 ) (*sqlbase.TableDescriptor, error) {
-	desc, err := p.getTableOrViewDesc(ctx, tn)
+	desc, err := getTableOrViewDesc(ctx, txn, vt, tn)
 	if err != nil {
 		return nil, err
 	}
@@ -211,20 +171,18 @@ func (p *planner) mustGetTableOrViewDesc(
 		return nil, sqlbase.NewUndefinedTableError(tn.String())
 	}
 	if err := filterTableState(desc); err != nil {
-		return nil, err
+		if !allowAdding && err != errTableAdding {
+			return nil, err
+		}
 	}
 	return desc, nil
 }
 
-// mustGetTableDesc implements the SchemaAccessor interface.
-func (p *planner) mustGetTableDesc(
-	ctx context.Context, tn *parser.TableName,
-) (*sqlbase.TableDescriptor, error) {
-	return mustGetTableDesc(ctx, p.txn, &p.session.virtualSchemas, tn)
-}
-
+// mustGetTableDesc returns a table descriptor for a table, or an error if
+// the descriptor is not found. allowAdding when set allows a table descriptor
+// in the ADD state to also be returned.
 func mustGetTableDesc(
-	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName,
+	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName, allowAdding bool,
 ) (*sqlbase.TableDescriptor, error) {
 	desc, err := getTableDesc(ctx, txn, vt, tn)
 	if err != nil {
@@ -234,16 +192,19 @@ func mustGetTableDesc(
 		return nil, sqlbase.NewUndefinedTableError(tn.String())
 	}
 	if err := filterTableState(desc); err != nil {
-		return nil, err
+		if !allowAdding && err != errTableAdding {
+			return nil, err
+		}
 	}
 	return desc, nil
 }
 
-// mustGetViewDesc implements the SchemaAccessor interface.
-func (p *planner) mustGetViewDesc(
-	ctx context.Context, tn *parser.TableName,
+// mustGetViewDesc returns a table descriptor for a view, or an error if the
+// descriptor is not found or descriptor.Dropped().
+func mustGetViewDesc(
+	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName,
 ) (*sqlbase.TableDescriptor, error) {
-	desc, err := p.getViewDesc(ctx, tn)
+	desc, err := getViewDesc(ctx, txn, vt, tn)
 	if err != nil {
 		return nil, err
 	}
@@ -271,16 +232,17 @@ func filterTableState(tableDesc *sqlbase.TableDescriptor) error {
 	return nil
 }
 
-// getTableLease implements the SchemaAccessor interface.
-func (p *planner) getTableLease(
-	ctx context.Context, tn *parser.TableName,
+// getTableLease acquires a lease for the specified table. The lease must
+// be released by calling lc.releaseLeases().
+func (lc *LeaseCollection) getTableLease(
+	ctx context.Context, txn *client.Txn, vt VirtualTabler, tn *parser.TableName,
 ) (*sqlbase.TableDescriptor, error) {
 	if log.V(2) {
 		log.Infof(ctx, "planner acquiring lease on table '%s'", tn)
 	}
 
 	isSystemDB := tn.Database() == sqlbase.SystemDB.Name
-	isVirtualDB := p.session.virtualSchemas.isVirtualDatabase(tn.Database())
+	isVirtualDB := vt.getVirtualDatabaseDesc(tn.Database()) != nil
 	if isSystemDB || isVirtualDB || testDisableTableLeases {
 		// We don't go through the normal lease mechanism for:
 		// - system tables. The system.lease and system.descriptor table, in
@@ -290,17 +252,14 @@ func (p *planner) getTableLease(
 		//   so they cannot be leased. Instead, we simply return the static
 		//   descriptor and rely on the immutability privileges set on the
 		//   descriptors to cause upper layers to reject mutations statements.
-		tbl, err := p.mustGetTableDesc(ctx, tn)
+		tbl, err := mustGetTableDesc(ctx, txn, vt, tn, false /*allowAdding*/)
 		if err != nil {
-			return nil, err
-		}
-		if err := filterTableState(tbl); err != nil {
 			return nil, err
 		}
 		return tbl, nil
 	}
 
-	dbID, err := p.getDatabaseID(ctx, tn.Database())
+	dbID, err := lc.databaseCache.getDatabaseID(ctx, txn, vt, tn.Database())
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +269,7 @@ func (p *planner) getTableLease(
 	// continue to use N to refer to X even if N is renamed during the
 	// transaction.
 	var lease *LeaseState
-	for _, l := range p.session.leases {
+	for _, l := range lc.leases {
 		if parser.ReNormalizeName(l.Name) == tn.TableName.Normalize() &&
 			l.ParentID == dbID {
 			lease = l
@@ -322,9 +281,9 @@ func (p *planner) getTableLease(
 	}
 
 	// If we didn't find a lease or the lease is about to expire, acquire one.
-	if lease == nil || p.removeLeaseIfExpiring(ctx, lease) {
+	if lease == nil || lc.removeLeaseIfExpiring(ctx, txn, lease) {
 		var err error
-		lease, err = p.session.leaseMgr.AcquireByName(ctx, p.txn, dbID, tn.Table())
+		lease, err = lc.leaseMgr.AcquireByName(ctx, txn, dbID, tn.Table())
 		if err != nil {
 			if err == sqlbase.ErrDescriptorNotFound {
 				// Transform the descriptor error into an error that references the
@@ -333,27 +292,27 @@ func (p *planner) getTableLease(
 			}
 			return nil, err
 		}
-		p.session.leases = append(p.session.leases, lease)
+		lc.leases = append(lc.leases, lease)
 		if log.V(2) {
 			log.Infof(ctx, "added lease on table '%s' to planner cache", tn)
 		}
 		// If the lease we just acquired expires before the txn's deadline, reduce
 		// the deadline.
-		p.txn.UpdateDeadlineMaybe(hlc.Timestamp{WallTime: lease.Expiration().UnixNano()})
+		txn.UpdateDeadlineMaybe(hlc.Timestamp{WallTime: lease.Expiration().UnixNano()})
 	}
 	return &lease.TableDescriptor, nil
 }
 
 // getTableLeaseByID is a by-ID variant of getTableLease (i.e. uses same cache).
-func (p *planner) getTableLeaseByID(
-	ctx context.Context, tableID sqlbase.ID,
+func (lc *LeaseCollection) getTableLeaseByID(
+	ctx context.Context, txn *client.Txn, tableID sqlbase.ID,
 ) (*sqlbase.TableDescriptor, error) {
 	if log.V(2) {
 		log.Infof(ctx, "planner acquiring lease on table ID %d", tableID)
 	}
 
 	if testDisableTableLeases {
-		table, err := sqlbase.GetTableDescFromID(ctx, p.txn, tableID)
+		table, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
 		if err != nil {
 			return nil, err
 		}
@@ -366,7 +325,7 @@ func (p *planner) getTableLeaseByID(
 	// First, look to see if we already have a lease for this table -- including
 	// leases acquired via `getTableLease`.
 	var lease *LeaseState
-	for _, l := range p.session.leases {
+	for _, l := range lc.leases {
 		if l.ID == tableID {
 			lease = l
 			if log.V(2) {
@@ -377,9 +336,9 @@ func (p *planner) getTableLeaseByID(
 	}
 
 	// If we didn't find a lease or the lease is about to expire, acquire one.
-	if lease == nil || p.removeLeaseIfExpiring(ctx, lease) {
+	if lease == nil || lc.removeLeaseIfExpiring(ctx, txn, lease) {
 		var err error
-		lease, err = p.session.leaseMgr.Acquire(ctx, p.txn, tableID, 0)
+		lease, err = lc.leaseMgr.Acquire(ctx, txn, tableID, 0)
 		if err != nil {
 			if err == sqlbase.ErrDescriptorNotFound {
 				// Transform the descriptor error into an error that references the
@@ -388,25 +347,26 @@ func (p *planner) getTableLeaseByID(
 			}
 			return nil, err
 		}
-		p.session.leases = append(p.session.leases, lease)
+		lc.leases = append(lc.leases, lease)
 		// If the lease we just acquired expires before the txn's deadline, reduce
 		// the deadline.
-		p.txn.UpdateDeadlineMaybe(hlc.Timestamp{WallTime: lease.Expiration().UnixNano()})
+		txn.UpdateDeadlineMaybe(hlc.Timestamp{WallTime: lease.Expiration().UnixNano()})
 	}
 	return &lease.TableDescriptor, nil
 }
 
 // removeLeaseIfExpiring removes a lease and returns true if it is about to expire.
 // The method also resets the transaction deadline.
-func (p *planner) removeLeaseIfExpiring(ctx context.Context, lease *LeaseState) bool {
-	session := p.session
-	if lease == nil || lease.hasSomeLifeLeft(session.leaseMgr.clock) {
+func (lc *LeaseCollection) removeLeaseIfExpiring(
+	ctx context.Context, txn *client.Txn, lease *LeaseState,
+) bool {
+	if lease == nil || lease.hasSomeLifeLeft(lc.leaseMgr.clock) {
 		return false
 	}
 
 	// Remove the lease from session.leases.
 	idx := -1
-	for i, l := range session.leases {
+	for i, l := range lc.leases {
 		if l == lease {
 			idx = i
 			break
@@ -416,32 +376,33 @@ func (p *planner) removeLeaseIfExpiring(ctx context.Context, lease *LeaseState) 
 		log.Warningf(ctx, "lease (%s) not found", lease)
 		return false
 	}
-	session.leases[idx] = session.leases[len(session.leases)-1]
-	session.leases[len(session.leases)-1] = nil
-	session.leases = session.leases[:len(session.leases)-1]
+	lc.leases[idx] = lc.leases[len(lc.leases)-1]
+	lc.leases[len(lc.leases)-1] = nil
+	lc.leases = lc.leases[:len(lc.leases)-1]
 
-	if err := session.leaseMgr.Release(lease); err != nil {
+	if err := lc.leaseMgr.Release(lease); err != nil {
 		log.Warning(ctx, err)
 	}
 
 	// Reset the deadline so that a new deadline will be set after the lease is acquired.
-	p.txn.ResetDeadline()
-	for _, l := range session.leases {
-		p.txn.UpdateDeadlineMaybe(hlc.Timestamp{WallTime: l.Expiration().UnixNano()})
+	txn.ResetDeadline()
+	for _, l := range lc.leases {
+		txn.UpdateDeadlineMaybe(hlc.Timestamp{WallTime: l.Expiration().UnixNano()})
 	}
 	return true
 }
 
-// getTableNames implements the SchemaAccessor interface.
-func (p *planner) getTableNames(
-	ctx context.Context, dbDesc *sqlbase.DatabaseDescriptor,
+// getTableNames retrieves the list of qualified names of tables
+// present in the given database.
+func getTableNames(
+	ctx context.Context, txn *client.Txn, vt VirtualTabler, dbDesc *sqlbase.DatabaseDescriptor,
 ) (parser.TableNames, error) {
-	if e, ok := p.session.virtualSchemas.getVirtualSchemaEntry(dbDesc.Name); ok {
+	if e, ok := vt.getVirtualSchemaEntry(dbDesc.Name); ok {
 		return e.tableNames(), nil
 	}
 
 	prefix := sqlbase.MakeNameMetadataKey(dbDesc.ID, "")
-	sr, err := p.txn.Scan(ctx, prefix, prefix.PrefixEnd(), 0)
+	sr, err := txn.Scan(ctx, prefix, prefix.PrefixEnd(), 0)
 	if err != nil {
 		return nil, err
 	}
@@ -479,25 +440,9 @@ func (p *planner) notifySchemaChange(id sqlbase.ID, mutationID sqlbase.MutationI
 		tableID:    id,
 		mutationID: mutationID,
 		nodeID:     p.evalCtx.NodeID,
-		leaseMgr:   p.session.leaseMgr,
+		leaseMgr:   p.LeaseMgr(),
 	}
 	p.session.TxnState.schemaChangers.queueSchemaChanger(sc)
-}
-
-// releaseLeases implements the SchemaAccessor interface.
-func (p *planner) releaseLeases(ctx context.Context) {
-	session := p.session
-	if session.leases != nil {
-		if log.V(2) {
-			log.Infof(ctx, "planner releasing %d leases", len(session.leases))
-		}
-		for _, lease := range session.leases {
-			if err := session.leaseMgr.Release(lease); err != nil {
-				log.Warning(ctx, err)
-			}
-		}
-		session.leases = nil
-	}
 }
 
 // writeTableDesc implements the SchemaAccessor interface.
@@ -505,18 +450,28 @@ func (p *planner) writeTableDesc(ctx context.Context, tableDesc *sqlbase.TableDe
 	if isVirtualDescriptor(tableDesc) {
 		panic(fmt.Sprintf("Virtual Descriptors cannot be stored, found: %v", tableDesc))
 	}
+	// Some statements setTestingVerifyMetadata to verify the descriptor they
+	// have written, but if they are followed by other statements that modify
+	// the descriptor the verification of the overwritten descriptor cannot be
+	// done.
+	p.session.setTestingVerifyMetadata(nil)
+
 	return p.txn.Put(
 		ctx, sqlbase.MakeDescMetadataKey(tableDesc.GetID()), sqlbase.WrapDescriptor(tableDesc),
 	)
 }
 
-// expandTableGlob implements the SchemaAccessor interface.
-// The pattern must be already normalized using NormalizeTablePattern().
-func (p *planner) expandTableGlob(
-	ctx context.Context, pattern parser.TablePattern,
+// expandTableGlob expands pattern into a list of tables represented
+// as a parser.TableNames.
+func expandTableGlob(
+	ctx context.Context,
+	txn *client.Txn,
+	vt VirtualTabler,
+	database string,
+	pattern parser.TablePattern,
 ) (parser.TableNames, error) {
 	if t, ok := pattern.(*parser.TableName); ok {
-		if err := t.QualifyWithDatabase(p.session.Database); err != nil {
+		if err := t.QualifyWithDatabase(database); err != nil {
 			return nil, err
 		}
 		return parser.TableNames{*t}, nil
@@ -524,16 +479,16 @@ func (p *planner) expandTableGlob(
 
 	glob := pattern.(*parser.AllTablesSelector)
 
-	if err := glob.QualifyWithDatabase(p.session.Database); err != nil {
+	if err := glob.QualifyWithDatabase(database); err != nil {
 		return nil, err
 	}
 
-	dbDesc, err := p.mustGetDatabaseDesc(ctx, string(glob.Database))
+	dbDesc, err := MustGetDatabaseDesc(ctx, txn, vt, string(glob.Database))
 	if err != nil {
 		return nil, err
 	}
 
-	tableNames, err := p.getTableNames(ctx, dbDesc)
+	tableNames, err := getTableNames(ctx, txn, vt, dbDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -549,18 +504,18 @@ func (p *planner) expandTableGlob(
 func (p *planner) searchAndQualifyDatabase(ctx context.Context, tn *parser.TableName) error {
 	t := *tn
 
-	descFunc := p.getTableLease
+	descFunc := p.session.leases.getTableLease
 	if p.avoidCachedDescriptors {
 		// AS OF SYSTEM TIME queries need to fetch the table descriptor at the
 		// specified time, and never lease anything. The proto transaction already
 		// has its timestamps set correctly so getTableOrViewDesc will fetch with
 		// the correct timestamp.
-		descFunc = p.getTableOrViewDesc
+		descFunc = getTableOrViewDesc
 	}
 
 	if p.session.Database != "" {
 		t.DatabaseName = parser.Name(p.session.Database)
-		desc, err := descFunc(ctx, &t)
+		desc, err := descFunc(ctx, p.txn, p.getVirtualTabler(), &t)
 		if err != nil && !sqlbase.IsUndefinedTableError(err) && !sqlbase.IsUndefinedDatabaseError(err) {
 			return err
 		}
@@ -575,7 +530,7 @@ func (p *planner) searchAndQualifyDatabase(ctx context.Context, tn *parser.Table
 	// the search path instead.
 	for _, database := range p.session.SearchPath {
 		t.DatabaseName = parser.Name(database)
-		desc, err := descFunc(ctx, &t)
+		desc, err := descFunc(ctx, p.txn, p.getVirtualTabler(), &t)
 		if err != nil && !sqlbase.IsUndefinedTableError(err) && !sqlbase.IsUndefinedDatabaseError(err) {
 			return err
 		}
@@ -610,14 +565,14 @@ func (p *planner) getQualifiedTableName(
 // not found or if the index name is ambiguous (i.e. exists in
 // multiple tables).
 func (p *planner) findTableContainingIndex(
-	ctx context.Context, dbName parser.Name, idxName parser.Name,
+	ctx context.Context, txn *client.Txn, vt VirtualTabler, dbName parser.Name, idxName parser.Name,
 ) (result *parser.TableName, err error) {
-	dbDesc, err := p.mustGetDatabaseDesc(ctx, dbName.Normalize())
+	dbDesc, err := MustGetDatabaseDesc(ctx, txn, vt, dbName.Normalize())
 	if err != nil {
 		return nil, err
 	}
 
-	tns, err := p.getTableNames(ctx, dbDesc)
+	tns, err := getTableNames(ctx, txn, vt, dbDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -626,7 +581,9 @@ func (p *planner) findTableContainingIndex(
 	result = nil
 	for i := range tns {
 		tn := &tns[i]
-		tableDesc, err := p.mustGetTableDesc(ctx, tn)
+		tableDesc, err := mustGetTableDesc(
+			ctx, p.txn, p.getVirtualTabler(), tn, true, /*allowAdding*/
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -657,7 +614,7 @@ func (p *planner) expandIndexName(
 	}
 
 	if index.SearchTable {
-		realTableName, err := p.findTableContainingIndex(ctx, tn.DatabaseName, tn.TableName)
+		realTableName, err := p.findTableContainingIndex(ctx, p.txn, p.getVirtualTabler(), tn.DatabaseName, tn.TableName)
 		if err != nil {
 			return nil, err
 		}
@@ -666,4 +623,55 @@ func (p *planner) expandIndexName(
 		tn = realTableName
 	}
 	return tn, nil
+}
+
+// getTableAndIndex returns the table and index descriptors for a table
+// (primary index) or table-with-index. Only one of table and tableWithIndex can
+// be set.  This is useful for statements that have both table and index
+// variants (like `ALTER TABLE/INDEX ... SPLIT AT ...`).
+func (p *planner) getTableAndIndex(
+	ctx context.Context,
+	table *parser.NormalizableTableName,
+	tableWithIndex *parser.TableNameWithIndex,
+	privilege privilege.Kind,
+) (*sqlbase.TableDescriptor, *sqlbase.IndexDescriptor, error) {
+	var tn *parser.TableName
+	var err error
+	if tableWithIndex == nil {
+		// Variant: ALTER TABLE
+		tn, err = table.NormalizeWithDatabaseName(p.session.Database)
+	} else {
+		// Variant: ALTER INDEX
+		tn, err = p.expandIndexName(ctx, tableWithIndex)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	tableDesc, err := getTableDesc(ctx, p.txn, p.getVirtualTabler(), tn)
+	if err != nil {
+		return nil, nil, err
+	}
+	if tableDesc == nil {
+		return nil, nil, sqlbase.NewUndefinedTableError(tn.String())
+	}
+	if err := p.CheckPrivilege(tableDesc, privilege); err != nil {
+		return nil, nil, err
+	}
+
+	// Determine which index to use.
+	var index *sqlbase.IndexDescriptor
+	if tableWithIndex == nil {
+		index = &tableDesc.PrimaryIndex
+	} else {
+		normIdxName := tableWithIndex.Index.Normalize()
+		status, i, err := tableDesc.FindIndexByNormalizedName(normIdxName)
+		if err != nil {
+			return nil, nil, err
+		}
+		if status != sqlbase.DescriptorActive {
+			return nil, nil, errors.Errorf("unknown index %s", normIdxName)
+		}
+		index = &tableDesc.Indexes[i]
+	}
+	return tableDesc, index, nil
 }

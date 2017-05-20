@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -46,14 +47,14 @@ type deleteNode struct {
 //   Notes: postgres requires DELETE. Also requires SELECT for "USING" and "WHERE" with tables.
 //          mysql requires DELETE. Also requires SELECT if a table is used in the "WHERE" clause.
 func (p *planner) Delete(
-	ctx context.Context, n *parser.Delete, desiredTypes []parser.Type, autoCommit bool,
+	ctx context.Context, n *parser.Delete, desiredTypes []parser.Type,
 ) (planNode, error) {
 	tn, err := p.getAliasedTableName(n.Table)
 	if err != nil {
 		return nil, err
 	}
 
-	en, err := p.makeEditNode(ctx, tn, autoCommit, privilege.DELETE)
+	en, err := p.makeEditNode(ctx, tn, privilege.DELETE)
 	if err != nil {
 		return nil, err
 	}
@@ -65,15 +66,15 @@ func (p *planner) Delete(
 		requestedCols = en.tableDesc.Columns
 	}
 
-	fkTables := tablesNeededForFKs(*en.tableDesc, CheckDeletes)
+	fkTables := sqlbase.TablesNeededForFKs(*en.tableDesc, sqlbase.CheckDeletes)
 	if err := p.fillFKTableMap(ctx, fkTables); err != nil {
 		return nil, err
 	}
-	rd, err := makeRowDeleter(p.txn, en.tableDesc, fkTables, requestedCols, checkFKs)
+	rd, err := sqlbase.MakeRowDeleter(p.txn, en.tableDesc, fkTables, requestedCols, sqlbase.CheckFKs)
 	if err != nil {
 		return nil, err
 	}
-	tw := tableDeleter{rd: rd, autoCommit: autoCommit}
+	tw := tableDeleter{rd: rd, autoCommit: p.autoCommit}
 
 	// TODO(knz): Until we split the creation of the node from Start()
 	// for the SelectClause too, we cannot cache this. This is because
@@ -81,7 +82,7 @@ func (p *planner) Delete(
 	// performs index selection. We cannot perform index selection
 	// properly until the placeholder values are known.
 	rows, err := p.SelectClause(ctx, &parser.SelectClause{
-		Exprs: sqlbase.ColumnsSelectors(rd.fetchCols),
+		Exprs: sqlbase.ColumnsSelectors(rd.FetchCols),
 		From:  &parser.From{Tables: []parser.TableExpr{n.Table}},
 		Where: n.Where,
 	}, nil, nil, nil, publicAndNonPublicColumns)
@@ -96,7 +97,7 @@ func (p *planner) Delete(
 	}
 
 	if err := dn.run.initEditNode(
-		ctx, &dn.editNodeBase, rows, n.Returning, desiredTypes); err != nil {
+		ctx, &dn.editNodeBase, rows, &dn.tw, n.Returning, desiredTypes); err != nil {
 		return nil, err
 	}
 
@@ -104,7 +105,7 @@ func (p *planner) Delete(
 }
 
 func (d *deleteNode) Start(ctx context.Context) error {
-	if err := d.run.startEditNode(ctx, &d.editNodeBase, &d.tw); err != nil {
+	if err := d.run.startEditNode(ctx, &d.editNodeBase); err != nil {
 		return err
 	}
 
@@ -116,11 +117,11 @@ func (d *deleteNode) Start(ctx context.Context) error {
 		//
 		// (When explain == explainDebug, we use the slow path so that
 		// each debugVal gets a chance to be reported via Next().)
-		maybeScanNode := d.run.rows
-		if sel, ok := maybeScanNode.(*renderNode); ok {
-			maybeScanNode = sel.source.plan
+		maybeScan := d.run.rows
+		if sel, ok := maybeScan.(*renderNode); ok {
+			maybeScan = sel.source.plan
 		}
-		if scan, ok := maybeScanNode.(*scanNode); ok && canDeleteWithoutScan(d.n, scan, &d.tw) {
+		if scan, ok := maybeScan.(*scanNode); ok && canDeleteWithoutScan(ctx, d.n, scan, &d.tw) {
 			d.run.fastPath = true
 			err := d.fastDelete(ctx, scan)
 			return err
@@ -174,12 +175,13 @@ func (d *deleteNode) Next(ctx context.Context) (bool, error) {
 // Determine if the deletion of `rows` can be done without actually scanning them,
 // i.e. if we do not need to know their values for filtering expressions or a
 // RETURNING clause or for updating secondary indexes.
-func canDeleteWithoutScan(n *parser.Delete, scan *scanNode, td *tableDeleter) bool {
-	ctx := context.TODO()
+func canDeleteWithoutScan(
+	ctx context.Context, n *parser.Delete, scan *scanNode, td *tableDeleter,
+) bool {
 	if !td.fastPathAvailable(ctx) {
 		return false
 	}
-	if parser.HasReturningClause(n.Returning) {
+	if _, ok := n.Returning.(*parser.ReturningExprs); ok {
 		if log.V(2) {
 			log.Infof(ctx, "delete forced to scan: values required for RETURNING")
 		}
@@ -205,7 +207,7 @@ func (d *deleteNode) fastDelete(ctx context.Context, scan *scanNode) error {
 	if err := d.tw.init(d.p.txn); err != nil {
 		return err
 	}
-	rowCount, err := d.tw.fastDelete(context.TODO(), scan)
+	rowCount, err := d.tw.fastDelete(ctx, scan)
 	if err != nil {
 		return err
 	}
@@ -213,7 +215,7 @@ func (d *deleteNode) fastDelete(ctx context.Context, scan *scanNode) error {
 	return nil
 }
 
-func (d *deleteNode) Columns() ResultColumns {
+func (d *deleteNode) Columns() sqlbase.ResultColumns {
 	return d.rh.columns
 }
 
@@ -234,3 +236,7 @@ func (d *deleteNode) DebugValues() debugValues {
 }
 
 func (d *deleteNode) Ordering() orderingInfo { return orderingInfo{} }
+
+func (d *deleteNode) Spans(ctx context.Context) (reads, writes roachpb.Spans, err error) {
+	return d.run.collectSpans(ctx)
+}

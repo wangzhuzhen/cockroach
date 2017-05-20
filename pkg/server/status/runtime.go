@@ -21,15 +21,14 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/dustin/go-humanize"
+	"github.com/elastic/gosigar"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-
-	"github.com/dustin/go-humanize"
-	"github.com/elastic/gosigar"
 )
 
 var (
@@ -50,19 +49,15 @@ var (
 	metaFDOpen         = metric.Metadata{Name: "sys.fd.open", Help: "Process open file descriptors"}
 	metaFDSoftLimit    = metric.Metadata{Name: "sys.fd.softlimit", Help: "Process open FD soft limit"}
 	metaUptime         = metric.Metadata{Name: "sys.uptime", Help: "Process uptime in seconds"}
-
-	// Build information. Placed here for lack of a better location.
-	// Labels for this metric get populated in MakeRuntimeStatSampler
-	metaBuildTimestamp = metric.Metadata{Name: "build.timestamp", Help: "Build information"}
 )
 
 // getCgoMemStats is a function that fetches stats for the C++ portion of the code.
 // We will not necessarily have implementations for all builds, so check for nil first.
 // Returns the following:
-// allocated uint64: bytes allocated by application
-// total     uint64: total bytes requested from system
+// allocated uint: bytes allocated by application
+// total     uint: total bytes requested from system
 // error           : any issues fetching stats. This should be a warning only.
-var getCgoMemStats func() (uint64, uint64, error)
+var getCgoMemStats func(context.Context) (uint, uint, error)
 
 // RuntimeStatSampler is used to periodically sample the runtime environment
 // for useful statistics, performing some rudimentary calculations and storing
@@ -116,6 +111,8 @@ func MakeRuntimeStatSampler(clock *hlc.Clock) RuntimeStatSampler {
 		log.Warningf(context.TODO(), "Could not parse build timestamp: %v", err)
 	}
 
+	// Build information.
+	metaBuildTimestamp := metric.Metadata{Name: "build.timestamp", Help: "Build information"}
 	metaBuildTimestamp.AddLabel("tag", info.Tag)
 	metaBuildTimestamp.AddLabel("go_version", info.GoVersion)
 
@@ -153,7 +150,7 @@ func MakeRuntimeStatSampler(clock *hlc.Clock) RuntimeStatSampler {
 //
 // This method should be called periodically by a higher level system in order
 // to keep runtime statistics current.
-func (rsr *RuntimeStatSampler) SampleEnvironment() {
+func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context) {
 	// Record memory and call stats from the runtime package.
 	// TODO(mrtracy): memory statistics will not include usage from RocksDB.
 	// Determine an appropriate way to compute total memory usage.
@@ -172,11 +169,11 @@ func (rsr *RuntimeStatSampler) SampleEnvironment() {
 	pid := os.Getpid()
 	mem := gosigar.ProcMem{}
 	if err := mem.Get(pid); err != nil {
-		log.Errorf(context.TODO(), "unable to get mem usage: %v", err)
+		log.Errorf(ctx, "unable to get mem usage: %v", err)
 	}
 	cpu := gosigar.ProcTime{}
 	if err := cpu.Get(pid); err != nil {
-		log.Errorf(context.TODO(), "unable to get cpu usage: %v", err)
+		log.Errorf(ctx, "unable to get cpu usage: %v", err)
 	}
 
 	fds := gosigar.ProcFDUsage{}
@@ -184,10 +181,10 @@ func (rsr *RuntimeStatSampler) SampleEnvironment() {
 		if _, ok := err.(gosigar.ErrNotImplemented); ok {
 			if !rsr.fdUsageNotImplemented {
 				rsr.fdUsageNotImplemented = true
-				log.Errorf(context.TODO(), "unable to get file descriptor usage (will not try again): %s", err)
+				log.Warningf(ctx, "unable to get file descriptor usage (will not try again): %s", err)
 			}
 		} else {
-			log.Errorf(context.TODO(), "unable to get file descriptor usage: %s", err)
+			log.Errorf(ctx, "unable to get file descriptor usage: %s", err)
 		}
 	}
 
@@ -207,12 +204,12 @@ func (rsr *RuntimeStatSampler) SampleEnvironment() {
 	rsr.lastStime = newStime
 	rsr.lastPauseTime = ms.PauseTotalNs
 
-	var cgoAllocated, cgoTotal uint64
+	var cgoAllocated, cgoTotal uint
 	if getCgoMemStats != nil {
 		var err error
-		cgoAllocated, cgoTotal, err = getCgoMemStats()
+		cgoAllocated, cgoTotal, err = getCgoMemStats(ctx)
 		if err != nil {
-			log.Warningf(context.TODO(), "problem fetching CGO memory stats: %s, CGO stats will be empty.", err)
+			log.Warningf(ctx, "problem fetching CGO memory stats: %s, CGO stats will be empty.", err)
 		}
 	}
 
@@ -221,13 +218,13 @@ func (rsr *RuntimeStatSampler) SampleEnvironment() {
 
 	// Log summary of statistics to console.
 	cgoRate := float64((numCgoCall-rsr.lastCgoCall)*int64(time.Second)) / dur
-	log.Infof(context.TODO(), "runtime stats: %s RSS, %d goroutines, %s/%s/%s GO alloc/idle/total, %s/%s CGO alloc/total, %.2fcgo/sec, %.2f/%.2f %%(u/s)time, %.2f %%gc (%dx)",
+	log.Infof(ctx, "runtime stats: %s RSS, %d goroutines, %s/%s/%s GO alloc/idle/total, %s/%s CGO alloc/total, %.2fcgo/sec, %.2f/%.2f %%(u/s)time, %.2f %%gc (%dx)",
 		humanize.IBytes(mem.Resident), numGoroutine,
 		humanize.IBytes(goAllocated), humanize.IBytes(ms.HeapIdle-ms.HeapReleased), humanize.IBytes(goTotal),
-		humanize.IBytes(cgoAllocated), humanize.IBytes(cgoTotal),
+		humanize.IBytes(uint64(cgoAllocated)), humanize.IBytes(uint64(cgoTotal)),
 		cgoRate, uPerc, sPerc, pausePerc, ms.NumGC-rsr.lastNumGC)
 	if log.V(2) {
-		log.Infof(context.TODO(), "memstats: %+v", ms)
+		log.Infof(ctx, "memstats: %+v", ms)
 	}
 	rsr.lastCgoCall = numCgoCall
 	rsr.lastNumGC = ms.NumGC

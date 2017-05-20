@@ -21,15 +21,13 @@ import (
 	"os"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/util/caller"
+	"github.com/cockroachdb/cockroach/pkg/util/fileutil"
 )
 
 // TempDir creates a directory and a function to clean it up at the end of the
-// test. If called directly from a test function, pass 0 for depth (which puts
-// the test name in the directory). Otherwise, offset depth appropriately.
-func TempDir(t testing.TB, depth int) (string, func()) {
-	_, _, name := caller.Lookup(depth + 1)
-	dir, err := ioutil.TempDir("", name)
+// test.
+func TempDir(t testing.TB) (string, func()) {
+	dir, err := ioutil.TempDir("", fileutil.EscapeFilename(t.Name()))
 	if err != nil {
 		t.Fatal(err)
 	}

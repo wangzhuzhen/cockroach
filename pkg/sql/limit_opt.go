@@ -38,7 +38,7 @@ import (
 // offset expressions. EXPLAIN also does this, see expandPlan() for
 // explainPlanNode.
 //
-// TODO(radu) Arguably, this interface has room for improvement.  A
+// TODO(radu): Arguably, this interface has room for improvement.  A
 // limitNode may have a hard limit locally which is larger than the
 // soft limit propagated up by nodes downstream. We may want to
 // improve this API to pass both the soft and hard limit.
@@ -156,6 +156,12 @@ func applyLimit(plan planNode, numRows int64, soft bool) {
 			setUnlimited(n.plan)
 		}
 
+	case *splitNode:
+		setUnlimited(n.rows)
+
+	case *relocateNode:
+		setUnlimited(n.rows)
+
 	case *valuesNode:
 	case *alterTableNode:
 	case *copyNode:
@@ -168,8 +174,10 @@ func applyLimit(plan planNode, numRows int64, soft bool) {
 	case *dropViewNode:
 	case *emptyNode:
 	case *hookFnNode:
-	case *splitNode:
 	case *valueGenerator:
+	case *showRangesNode:
+	case *showFingerprintsNode:
+	case *scatterNode:
 
 	default:
 		panic(fmt.Sprintf("unhandled node type: %T", plan))

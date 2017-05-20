@@ -18,6 +18,7 @@ package sqlbase
 
 import (
 	"fmt"
+	"sort"
 	"time"
 	"unicode/utf8"
 
@@ -44,34 +45,48 @@ func incompatibleExprTypeError(
 		context, expectedType, actualType)
 }
 
-// SanitizeVarFreeExpr verifies a default expression is valid, has the
-// correct type and contains no variable expressions.
+// SanitizeVarFreeExpr verifies that an expression is valid, has the correct
+// type and contains no variable expressions. It returns the type-checked and
+// constant-folded expression.
 func SanitizeVarFreeExpr(
 	expr parser.Expr, expectedType parser.Type, context string, searchPath parser.SearchPath,
-) error {
+) (parser.TypedExpr, error) {
 	if parser.ContainsVars(expr) {
-		return exprContainsVarsError(context, expr)
+		return nil, exprContainsVarsError(context, expr)
 	}
 	ctx := parser.SemaContext{SearchPath: searchPath}
 	typedExpr, err := parser.TypeCheck(expr, &ctx, expectedType)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if defaultType := typedExpr.ResolvedType(); !expectedType.Equivalent(defaultType) {
-		return incompatibleExprTypeError(context, expectedType, defaultType)
+	defaultType := typedExpr.ResolvedType()
+	if !expectedType.Equivalent(defaultType) && typedExpr != parser.DNull {
+		// The DEFAULT expression must match the column type exactly unless it is a
+		// constant NULL value.
+		return nil, incompatibleExprTypeError(context, expectedType, defaultType)
 	}
-	return nil
+	return typedExpr, nil
 }
 
 // MakeColumnDefDescs creates the column descriptor for a column, as well as the
 // index descriptor if the column is a primary key or unique.
 // The search path is used for name resolution for DEFAULT expressions.
 func MakeColumnDefDescs(
-	d *parser.ColumnTableDef, searchPath parser.SearchPath,
+	d *parser.ColumnTableDef, searchPath parser.SearchPath, evalCtx *parser.EvalContext,
 ) (*ColumnDescriptor, *IndexDescriptor, error) {
 	col := &ColumnDescriptor{
 		Name:     string(d.Name),
 		Nullable: d.Nullable.Nullability != parser.NotNull && !d.PrimaryKey,
+	}
+
+	// Prevent unsupported array types from falling through.
+	// TODO(jordan): This is ugly and a workaround for incompatibility between
+	// CastTargetToDatumType and structured.go's DatumTypeToColumnType. See #15813
+	switch t := d.Type.(type) {
+	case *parser.ArrayColType:
+		if _, ok := t.ParamType.(*parser.IntColType); !ok {
+			return nil, nil, errors.Errorf("arrays of type %s are unsupported", t.ParamType)
+		}
 	}
 
 	// Set Type.Kind and Type.Locale.
@@ -91,6 +106,10 @@ func MakeColumnDefDescs(
 			col.DefaultExpr = &s
 		}
 	case *parser.FloatColType:
+		// If the precision for this float col was intentionally specified as 0, return an error.
+		if t.Prec == 0 && t.PrecSpecified {
+			return nil, nil, errors.New("precision for type float must be at least 1 bit")
+		}
 		col.Type.Precision = int32(t.Prec)
 	case *parser.DecimalColType:
 		col.Type.Width = int32(t.Scale)
@@ -151,7 +170,7 @@ func MakeColumnDefDescs(
 
 	if d.HasDefaultExpr() {
 		// Verify the default expression type is compatible with the column type.
-		if err := SanitizeVarFreeExpr(
+		if _, err := SanitizeVarFreeExpr(
 			d.DefaultExpr.Expr, colDatumType, "DEFAULT", searchPath,
 		); err != nil {
 			return nil, nil, err
@@ -162,6 +181,24 @@ func MakeColumnDefDescs(
 		); err != nil {
 			return nil, nil, err
 		}
+
+		// Type check and simplify: this performs constant folding and reduces the expression.
+		typedExpr, err := parser.TypeCheck(d.DefaultExpr.Expr, nil, col.Type.ToDatumType())
+		if err != nil {
+			return nil, nil, err
+		}
+		if typedExpr, err = p.NormalizeExpr(evalCtx, typedExpr); err != nil {
+			return nil, nil, err
+		}
+		// Try to evaluate once. If it is aimed to succeed during a
+		// backfill, it must succeed here too. This tries to ensure that
+		// we don't end up failing the evaluation during the schema change
+		// proper.
+		if _, err := typedExpr.Eval(evalCtx); err != nil {
+			return nil, nil, err
+		}
+		d.DefaultExpr.Expr = typedExpr
+
 		s := parser.Serialize(d.DefaultExpr.Expr)
 		col.DefaultExpr = &s
 	}
@@ -181,7 +218,9 @@ func MakeColumnDefDescs(
 	return col, idx, nil
 }
 
-// MakeIndexKeyPrefix returns the key prefix used for the index's data.
+// MakeIndexKeyPrefix returns the key prefix used for the index's data. If you
+// need the corresponding Span, prefer desc.IndexSpan(indexID) or
+// desc.PrimaryIndexSpan().
 func MakeIndexKeyPrefix(desc *TableDescriptor, indexID IndexID) []byte {
 	var key []byte
 	if i, err := desc.FindIndexByID(indexID); err == nil && len(i.Interleave.Ancestors) > 0 {
@@ -213,9 +252,32 @@ func EncodeIndexKey(
 	values []parser.Datum,
 	keyPrefix []byte,
 ) (key []byte, containsNull bool, err error) {
-	key = keyPrefix
-	colIDs := index.ColumnIDs
-	dirs := directions(index.ColumnDirections)
+	return EncodePartialIndexKey(
+		tableDesc,
+		index,
+		len(index.ColumnIDs), /* encode all columns */
+		colMap,
+		values,
+		keyPrefix,
+	)
+}
+
+// EncodePartialIndexKey encodes a partial index key; only the first numCols of
+// index.ColumnIDs are encoded.
+func EncodePartialIndexKey(
+	tableDesc *TableDescriptor,
+	index *IndexDescriptor,
+	numCols int,
+	colMap map[ColumnID]int,
+	values []parser.Datum,
+	keyPrefix []byte,
+) (key []byte, containsNull bool, err error) {
+	colIDs := index.ColumnIDs[:numCols]
+	// We know we will append to the key which will cause the capacity to grow so
+	// make it bigger from the get-go.
+	key = make([]byte, len(keyPrefix), 2*len(keyPrefix))
+	copy(key, keyPrefix)
+	dirs := directions(index.ColumnDirections)[:numCols]
 
 	if len(index.Interleave.Ancestors) > 0 {
 		for i, ancestor := range index.Interleave.Ancestors {
@@ -225,15 +287,25 @@ func EncodeIndexKey(
 				key = encoding.EncodeUvarintAscending(key, uint64(ancestor.IndexID))
 			}
 
+			partial := false
 			length := int(ancestor.SharedPrefixLen)
+			if length > len(colIDs) {
+				length = len(colIDs)
+				partial = true
+			}
 			var n bool
 			key, n, err = EncodeColumns(colIDs[:length], dirs[:length], colMap, values, key)
 			if err != nil {
 				return key, containsNull, err
 			}
-			colIDs, dirs = colIDs[length:], dirs[length:]
 			containsNull = containsNull || n
-
+			if partial {
+				// Early stop. Note that if we had exactly SharedPrefixLen columns
+				// remaining, we want to append the next tableID/indexID pair because
+				// that results in a more specific key.
+				return key, containsNull, nil
+			}
+			colIDs, dirs = colIDs[length:], dirs[length:]
 			// We reuse NotNullDescending (0xfe) as the interleave sentinel.
 			key = encoding.EncodeNotNullDescending(key)
 		}
@@ -257,8 +329,9 @@ func (d directions) get(i int) (encoding.Direction, error) {
 	return encoding.Ascending, nil
 }
 
-// EncodeColumns is a version of EncodeIndexKey that takes ColumnIDs and
-// directions explicitly.
+// EncodeColumns is a version of EncodePartialIndexKey that takes ColumnIDs and
+// directions explicitly. WARNING: unlike EncodePartialIndexKey, EncodeColumns
+// appends directly to keyPrefix.
 func EncodeColumns(
 	columnIDs []ColumnID,
 	directions directions,
@@ -266,11 +339,7 @@ func EncodeColumns(
 	values []parser.Datum,
 	keyPrefix []byte,
 ) (key []byte, containsNull bool, err error) {
-	// We know we will append to the key which will cause the capacity to grow
-	// so make it bigger from the get-go.
-	key = make([]byte, len(keyPrefix), 2*len(keyPrefix))
-	copy(key, keyPrefix)
-
+	key = keyPrefix
 	for colIdx, id := range columnIDs {
 		var val parser.Datum
 		if i, ok := colMap[id]; ok {
@@ -387,7 +456,9 @@ func EncodeDatums(b []byte, d parser.Datums) ([]byte, error) {
 	return b, nil
 }
 
-// EncodeTableKey encodes `val` into `b` and returns the new buffer.
+// EncodeTableKey encodes `val` into `b` and returns the new buffer. The
+// encoded value is guaranteed to be lexicographically sortable, but not
+// guaranteed to be round-trippable during decoding.
 func EncodeTableKey(b []byte, val parser.Datum, dir encoding.Direction) ([]byte, error) {
 	if (dir != encoding.Ascending) && (dir != encoding.Descending) {
 		return nil, errors.Errorf("invalid direction: %d", dir)
@@ -490,8 +561,10 @@ func EncodeTableKey(b []byte, val parser.Datum, dir encoding.Direction) ([]byte,
 	return nil, errors.Errorf("unable to encode table key: %T", val)
 }
 
-// EncodeTableValue encodes `val` into `appendTo` using DatumEncoding_VALUE and
-// returns the new buffer.
+// EncodeTableValue encodes `val` into `appendTo` using DatumEncoding_VALUE
+// and returns the new buffer. The encoded value is guaranteed to round
+// trip and decode exactly to its input, but is not guaranteed to be
+// lexicographically sortable.
 func EncodeTableValue(appendTo []byte, colID ColumnID, val parser.Datum) ([]byte, error) {
 	if val == parser.DNull {
 		return encoding.EncodeNullValue(appendTo, uint32(colID)), nil
@@ -647,7 +720,7 @@ func DecodeIndexKey(
 			}
 
 			length := int(ancestor.SharedPrefixLen)
-			key, err = DecodeKeyVals(a, vals[:length], colDirs[:length], key)
+			key, err = DecodeKeyVals(vals[:length], colDirs[:length], key)
 			if err != nil {
 				return nil, false, err
 			}
@@ -670,7 +743,7 @@ func DecodeIndexKey(
 		return nil, false, nil
 	}
 
-	key, err = DecodeKeyVals(a, vals, colDirs, key)
+	key, err = DecodeKeyVals(vals, colDirs, key)
 	if err != nil {
 		return nil, false, err
 	}
@@ -687,15 +760,12 @@ func DecodeIndexKey(
 // DecodeKeyVals decodes the values that are part of the key. The decoded
 // values are stored in the vals. If this slice is nil, the direction
 // used will default to encoding.Ascending.
-func DecodeKeyVals(
-	a *DatumAlloc, vals []EncDatum, directions []encoding.Direction, key []byte,
-) ([]byte, error) {
+func DecodeKeyVals(vals []EncDatum, directions []encoding.Direction, key []byte) ([]byte, error) {
 	if directions != nil && len(directions) != len(vals) {
 		return nil, errors.Errorf("encoding directions doesn't parallel val: %d vs %d.",
 			len(directions), len(vals))
 	}
 	for j := range vals {
-
 		enc := DatumEncoding_ASCENDING_KEY
 		if directions != nil && (directions[j] == encoding.Descending) {
 			enc = DatumEncoding_DESCENDING_KEY
@@ -754,7 +824,7 @@ func ExtractIndexKey(
 			return nil, errors.Errorf("descriptor did not match key")
 		}
 	} else {
-		key, err = DecodeKeyVals(a, values, dirs, key)
+		key, err = DecodeKeyVals(values, dirs, key)
 		if err != nil {
 			return nil, err
 		}
@@ -777,7 +847,7 @@ func ExtractIndexKey(
 			return nil, err
 		}
 	}
-	_, err = DecodeKeyVals(a, extraValues, dirs, extraKey)
+	_, err = DecodeKeyVals(extraValues, dirs, extraKey)
 	if err != nil {
 		return nil, err
 	}
@@ -990,14 +1060,13 @@ func DecodeTableKey(
 		}
 		return a.NewDFloat(parser.DFloat(f)), rkey, err
 	case parser.TypeDecimal:
-		var d *apd.Decimal
+		var d apd.Decimal
 		if dir == encoding.Ascending {
 			rkey, d, err = encoding.DecodeDecimalAscending(key, nil)
 		} else {
 			rkey, d, err = encoding.DecodeDecimalDescending(key, nil)
 		}
-		dd := a.NewDDecimal(parser.DDecimal{})
-		dd.Set(d)
+		dd := a.NewDDecimal(parser.DDecimal{Decimal: d})
 		return dd, rkey, err
 	case parser.TypeString:
 		var r string
@@ -1062,7 +1131,7 @@ func DecodeTableKey(
 		} else {
 			rkey, i, err = encoding.DecodeVarintDescending(key)
 		}
-		return a.NewDOid(parser.DOid{DInt: parser.DInt(i)}), rkey, err
+		return a.NewDOid(parser.MakeDOid(parser.DInt(i))), rkey, err
 	default:
 		if _, ok := valType.(parser.TCollatedString); ok {
 			var r string
@@ -1101,10 +1170,9 @@ func DecodeTableValue(a *DatumAlloc, valType parser.Type, b []byte) (parser.Datu
 		b, f, err = encoding.DecodeFloatValue(b)
 		return a.NewDFloat(parser.DFloat(f)), b, err
 	case parser.TypeDecimal:
-		var d *apd.Decimal
+		var d apd.Decimal
 		b, d, err = encoding.DecodeDecimalValue(b)
-		dd := a.NewDDecimal(parser.DDecimal{})
-		dd.Set(d)
+		dd := a.NewDDecimal(parser.DDecimal{Decimal: d})
 		return dd, b, err
 	case parser.TypeString:
 		var data []byte
@@ -1137,7 +1205,7 @@ func DecodeTableValue(a *DatumAlloc, valType parser.Type, b []byte) (parser.Datu
 	case parser.TypeOid:
 		var i int64
 		b, i, err = encoding.DecodeIntValue(b)
-		return a.NewDOid(parser.DOid{DInt: parser.DInt(i)}), b, err
+		return a.NewDOid(parser.MakeDOid(parser.DInt(i))), b, err
 	default:
 		if typ, ok := valType.(parser.TCollatedString); ok {
 			var data []byte
@@ -1153,6 +1221,21 @@ type IndexEntry struct {
 	Key   roachpb.Key
 	Value roachpb.Value
 }
+
+// valueEncodedColumn represents a composite or stored column of a secondary
+// index.
+type valueEncodedColumn struct {
+	id          ColumnID
+	isComposite bool
+}
+
+// byID implements sort.Interface for []valueEncodedColumn based on the id
+// field.
+type byID []valueEncodedColumn
+
+func (a byID) Len() int           { return len(a) }
+func (a byID) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a byID) Less(i, j int) bool { return a[i].id < a[j].id }
 
 // EncodeSecondaryIndex encodes key/values for a secondary index. colMap maps
 // ColumnIDs to indices in `values`.
@@ -1202,18 +1285,31 @@ func EncodeSecondaryIndex(
 		// The zero value for an index-key is a 0-length bytes value.
 		entryValue = []byte{}
 	}
+
+	var cols []valueEncodedColumn
+	for _, id := range secondaryIndex.StoreColumnIDs {
+		cols = append(cols, valueEncodedColumn{id: id, isComposite: false})
+	}
+	for _, id := range secondaryIndex.CompositeColumnIDs {
+		cols = append(cols, valueEncodedColumn{id: id, isComposite: true})
+	}
+	sort.Sort(byID(cols))
+
+	var lastColID ColumnID
 	// Composite columns have their contents at the end of the value.
-	for _, colID := range secondaryIndex.CompositeColumnIDs {
-		val := values[colMap[colID]]
-		if val == parser.DNull {
-			entryValue = encoding.EncodeNullAscending(entryValue)
+	for _, col := range cols {
+		val := values[colMap[col.id]]
+		if val == parser.DNull || (col.isComposite && !val.(parser.CompositeDatum).IsComposite()) {
 			continue
 		}
-		switch d := val.(type) {
-		case *parser.DCollatedString:
-			entryValue = encoding.EncodeStringAscending(entryValue, d.Contents)
-		default:
-			panic(fmt.Sprintf("unknown composite encoding for datum %s", d))
+		if lastColID > col.id {
+			panic(fmt.Errorf("cannot write column id %d after %d", col.id, lastColID))
+		}
+		colIDDiff := col.id - lastColID
+		lastColID = col.id
+		entryValue, err = EncodeTableValue(entryValue, colIDDiff, val)
+		if err != nil {
+			return IndexEntry{}, err
 		}
 	}
 	entry.Value.SetBytes(entryValue)
@@ -1385,8 +1481,7 @@ func UnmarshalColumnValue(
 		if err != nil {
 			return nil, err
 		}
-		dd := a.NewDDecimal(parser.DDecimal{})
-		dd.Set(v)
+		dd := a.NewDDecimal(parser.DDecimal{Decimal: v})
 		return dd, nil
 	case ColumnType_STRING:
 		v, err := value.GetBytes()
@@ -1441,7 +1536,7 @@ func UnmarshalColumnValue(
 		if err != nil {
 			return nil, err
 		}
-		return a.NewDOid(parser.DOid{DInt: parser.DInt(v)}), nil
+		return a.NewDOid(parser.MakeDOid(parser.DInt(v))), nil
 	default:
 		return nil, errors.Errorf("unsupported column type: %s", typ.Kind)
 	}
@@ -1468,7 +1563,7 @@ func CheckValueWidth(col ColumnDescriptor, val parser.Datum) error {
 				// data is of variable length up to the maximum length n; longer
 				// strings will be rejected."
 				//
-				// TODO(nvanbenschoten) Because we do not propagate the "varying"
+				// TODO(nvanbenschoten): Because we do not propagate the "varying"
 				// flag on the column type, the best we can do here is conservatively
 				// assume the varying bit type and error only on longer bit strings.
 				mostSignificantBit := int32(0)
@@ -1483,25 +1578,8 @@ func CheckValueWidth(col ColumnDescriptor, val parser.Datum) error {
 		}
 	case ColumnType_DECIMAL:
 		if v, ok := val.(*parser.DDecimal); ok {
-			if col.Type.Precision > 0 {
-				// http://www.postgresql.org/docs/9.5/static/datatype-numeric.html
-				// "If the scale of a value to be stored is greater than
-				// the declared scale of the column, the system will round the
-				// value to the specified number of fractional digits. Then,
-				// if the number of digits to the left of the decimal point
-				// exceeds the declared precision minus the declared scale, an
-				// error is raised."
-
-				_, err := parser.DecimalCtx.Quantize(&v.Decimal, &v.Decimal, -col.Type.Width)
-				if err != nil {
-					return errors.Wrap(err, "rounding decimal column")
-				}
-
-				// Check that the precision is not exceeded.
-				if v.NumDigits() > int64(col.Type.Precision) {
-					return fmt.Errorf("too many digits for type %s (column %q)",
-						col.Type.SQLString(), col.Name)
-				}
+			if err := parser.LimitDecimalWidth(&v.Decimal, int(col.Type.Precision), int(col.Type.Width)); err != nil {
+				return errors.Wrapf(err, "type %s (column %q)", col.Type.SQLString(), col.Name)
 			}
 		}
 	}
@@ -1628,7 +1706,11 @@ func (desc TableDescriptor) collectConstraintInfo(
 			detail := ConstraintDetail{Kind: ConstraintTypeFK}
 			detail.Unvalidated = index.ForeignKey.Validity == ConstraintValidity_Unvalidated
 			if tableLookup != nil {
-				detail.Columns = index.ColumnNames
+				numCols := len(index.ColumnIDs)
+				if index.ForeignKey.SharedPrefixLen > 0 {
+					numCols = int(index.ForeignKey.SharedPrefixLen)
+				}
+				detail.Columns = index.ColumnNames[:numCols]
 				detail.Index = index
 				other, err := tableLookup(index.ForeignKey.Table)
 				if err != nil {

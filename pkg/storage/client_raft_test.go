@@ -73,7 +73,7 @@ func TestStoreRecoverFromEngine(t *testing.T) {
 	key2 := roachpb.Key("z")
 
 	engineStopper := stop.NewStopper()
-	defer engineStopper.Stop()
+	defer engineStopper.Stop(context.TODO())
 	eng := engine.NewInMem(roachpb.Attributes{}, 1<<20)
 	engineStopper.AddCloser(eng)
 	var rangeID2 roachpb.RangeID
@@ -101,7 +101,7 @@ func TestStoreRecoverFromEngine(t *testing.T) {
 	// that both predate and postdate the split.
 	func() {
 		stopper := stop.NewStopper()
-		defer stopper.Stop()
+		defer stopper.Stop(context.TODO())
 		store := createTestStoreWithEngine(t, eng, true, storeCfg, stopper)
 
 		increment := func(rangeID roachpb.RangeID, key roachpb.Key, value int64) (*roachpb.IncrementResponse, *roachpb.Error) {
@@ -162,6 +162,10 @@ func TestStoreRecoverFromEngine(t *testing.T) {
 func TestStoreRecoverWithErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	storeCfg := storage.TestStoreConfig(nil)
+	// Splits can cause our chosen keys to end up on ranges other than range 1,
+	// and trying to handle that complicates the test without providing any
+	// added benefit.
+	storeCfg.TestingKnobs.DisableSplitQueue = true
 	eng := engine.NewInMem(roachpb.Attributes{}, 1<<20)
 	defer eng.Close()
 
@@ -169,12 +173,13 @@ func TestStoreRecoverWithErrors(t *testing.T) {
 
 	func() {
 		stopper := stop.NewStopper()
-		defer stopper.Stop()
+		defer stopper.Stop(context.TODO())
+		keyA := roachpb.Key("a")
 		storeCfg := storeCfg // copy
 		storeCfg.TestingKnobs.TestingEvalFilter =
 			func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 				_, ok := filterArgs.Req.(*roachpb.IncrementRequest)
-				if ok && filterArgs.Req.Header().Key.Equal(roachpb.Key("a")) {
+				if ok && filterArgs.Req.Header().Key.Equal(keyA) {
 					numIncrements++
 				}
 				return nil
@@ -182,14 +187,14 @@ func TestStoreRecoverWithErrors(t *testing.T) {
 		store := createTestStoreWithEngine(t, eng, true, storeCfg, stopper)
 
 		// Write a bytes value so the increment will fail.
-		putArgs := putArgs(roachpb.Key("a"), []byte("asdf"))
+		putArgs := putArgs(keyA, []byte("asdf"))
 		if _, err := client.SendWrapped(context.Background(), rg1(store), putArgs); err != nil {
 			t.Fatal(err)
 		}
 
 		// Try and fail to increment the key. It is important for this test that the
 		// failure be the last thing in the raft log when the store is stopped.
-		incArgs := incrementArgs(roachpb.Key("a"), 42)
+		incArgs := incrementArgs(keyA, 42)
 		if _, err := client.SendWrapped(context.Background(), rg1(store), incArgs); err == nil {
 			t.Fatal("did not get expected error")
 		}
@@ -200,13 +205,14 @@ func TestStoreRecoverWithErrors(t *testing.T) {
 	}
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// Recover from the engine.
 	store := createTestStoreWithEngine(t, eng, false, storeCfg, stopper)
 
 	// Issue a no-op write to lazily initialize raft on the range.
-	incArgs := incrementArgs(roachpb.Key("b"), 0)
+	keyB := roachpb.Key("b")
+	incArgs := incrementArgs(keyB, 0)
 	if _, err := client.SendWrapped(context.Background(), rg1(store), incArgs); err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +245,7 @@ func TestReplicateRange(t *testing.T) {
 	if err := repl.ChangeReplicas(
 		context.Background(),
 		roachpb.ADD_REPLICA,
-		roachpb.ReplicaDescriptor{
+		roachpb.ReplicationTarget{
 			NodeID:  mtc.stores[1].Ident.NodeID,
 			StoreID: mtc.stores[1].Ident.StoreID,
 		},
@@ -325,7 +331,7 @@ func TestRestoreReplicas(t *testing.T) {
 	if err := firstRng.ChangeReplicas(
 		context.Background(),
 		roachpb.ADD_REPLICA,
-		roachpb.ReplicaDescriptor{
+		roachpb.ReplicationTarget{
 			NodeID:  mtc.stores[1].Ident.NodeID,
 			StoreID: mtc.stores[1].Ident.StoreID,
 		},
@@ -427,7 +433,7 @@ func TestFailedReplicaChange(t *testing.T) {
 	if err := repl.ChangeReplicas(
 		context.Background(),
 		roachpb.ADD_REPLICA,
-		roachpb.ReplicaDescriptor{
+		roachpb.ReplicationTarget{
 			NodeID:  mtc.stores[1].Ident.NodeID,
 			StoreID: mtc.stores[1].Ident.StoreID,
 		},
@@ -453,7 +459,7 @@ func TestFailedReplicaChange(t *testing.T) {
 	if err := repl.ChangeReplicas(
 		context.Background(),
 		roachpb.ADD_REPLICA,
-		roachpb.ReplicaDescriptor{
+		roachpb.ReplicationTarget{
 			NodeID:  mtc.stores[1].Ident.NodeID,
 			StoreID: mtc.stores[1].Ident.StoreID,
 		},
@@ -519,7 +525,7 @@ func TestReplicateAfterTruncation(t *testing.T) {
 	if err := repl.ChangeReplicas(
 		context.Background(),
 		roachpb.ADD_REPLICA,
-		roachpb.ReplicaDescriptor{
+		roachpb.ReplicationTarget{
 			NodeID:  mtc.stores[1].Ident.NodeID,
 			StoreID: mtc.stores[1].Ident.StoreID,
 		},
@@ -920,7 +926,7 @@ func TestReplicateAfterRemoveAndSplit(t *testing.T) {
 		return rep2.ChangeReplicas(
 			context.Background(),
 			roachpb.ADD_REPLICA,
-			roachpb.ReplicaDescriptor{
+			roachpb.ReplicationTarget{
 				NodeID:  mtc.stores[2].Ident.NodeID,
 				StoreID: mtc.stores[2].Ident.StoreID,
 			},
@@ -928,8 +934,7 @@ func TestReplicateAfterRemoveAndSplit(t *testing.T) {
 		)
 	}
 
-	expected := "snapshot intersects existing range"
-	if err := replicateRHS(); !testutils.IsError(err, expected) {
+	if err := replicateRHS(); !testutils.IsError(err, storage.IntersectingSnapshotMsg) {
 		t.Fatalf("unexpected error %v", err)
 	}
 
@@ -1318,7 +1323,7 @@ func TestChangeReplicasDescriptorInvariant(t *testing.T) {
 		return repl.ChangeReplicas(
 			context.Background(),
 			roachpb.ADD_REPLICA,
-			roachpb.ReplicaDescriptor{
+			roachpb.ReplicationTarget{
 				NodeID:  mtc.stores[storeNum].Ident.NodeID,
 				StoreID: mtc.stores[storeNum].Ident.StoreID,
 			},
@@ -2030,7 +2035,7 @@ func TestRemovePlaceholderRace(t *testing.T) {
 				if err := repl.ChangeReplicas(
 					ctx,
 					action,
-					roachpb.ReplicaDescriptor{
+					roachpb.ReplicationTarget{
 						NodeID:  mtc.stores[1].Ident.NodeID,
 						StoreID: mtc.stores[1].Ident.StoreID,
 					},
@@ -2072,15 +2077,11 @@ func (ncc *noConfChangeTestHandler) HandleRaftRequest(
 			if err := command.Unmarshal(ccCtx.Payload); err != nil {
 				panic(err)
 			}
-			if command.BatchRequest.RangeID == ncc.rangeID {
-				if ba, ok := command.BatchRequest.GetArg(roachpb.EndTransaction); ok {
-					et := ba.(*roachpb.EndTransactionRequest)
-					if crt := et.InternalCommitTrigger.GetChangeReplicasTrigger(); crt != nil {
-						// We found a configuration change headed for our victim range;
-						// sink it.
-						req.Message.Entries = req.Message.Entries[:i]
-						break
-					}
+			if req.RangeID == ncc.rangeID {
+				if command.ReplicatedEvalResult.ChangeReplicas != nil {
+					// We found a configuration change headed for our victim range;
+					// sink it.
+					req.Message.Entries = req.Message.Entries[:i]
 				}
 			}
 		}
@@ -2135,7 +2136,7 @@ func TestReplicaGCRace(t *testing.T) {
 	if err := repl.ChangeReplicas(
 		ctx,
 		roachpb.ADD_REPLICA,
-		roachpb.ReplicaDescriptor{
+		roachpb.ReplicationTarget{
 			NodeID:  toStore.Ident.NodeID,
 			StoreID: toStore.Ident.StoreID,
 		},
@@ -2192,7 +2193,7 @@ func TestReplicaGCRace(t *testing.T) {
 	if err := repl.ChangeReplicas(
 		ctx,
 		roachpb.REMOVE_REPLICA,
-		roachpb.ReplicaDescriptor{
+		roachpb.ReplicationTarget{
 			NodeID:  toStore.Ident.NodeID,
 			StoreID: toStore.Ident.StoreID,
 		},
@@ -2866,7 +2867,7 @@ func TestRemoveRangeWithoutGC(t *testing.T) {
 
 	testutils.SucceedsSoon(t, func() error {
 		// The Replica object should be removed.
-		if _, err := mtc.stores[0].GetReplica(rangeID); !testutils.IsError(err, "range [0-9]+ was not found") {
+		if _, err := mtc.stores[0].GetReplica(rangeID); !testutils.IsError(err, "r[0-9]+ was not found") {
 			return errors.Errorf("expected replica to be missing; got %v", err)
 		}
 
@@ -3138,9 +3139,12 @@ func TestFailedPreemptiveSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	const expErr = "snapshot failed: unknown peer 3"
-	if err := rep.ChangeReplicas(context.Background(), roachpb.ADD_REPLICA,
-		roachpb.ReplicaDescriptor{NodeID: 3, StoreID: 3},
-		rep.Desc()); !testutils.IsError(err, expErr) {
+	if err := rep.ChangeReplicas(
+		context.Background(),
+		roachpb.ADD_REPLICA,
+		roachpb.ReplicationTarget{NodeID: 3, StoreID: 3},
+		rep.Desc(),
+	); !testutils.IsError(err, expErr) {
 		t.Fatalf("expected %s; got %v", expErr, err)
 	} else if !storage.IsSnapshotError(err) {
 		t.Fatalf("expected preemptive snapshot failed error; got %T: %v", err, err)

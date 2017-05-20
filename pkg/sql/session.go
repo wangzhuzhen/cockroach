@@ -20,16 +20,20 @@ package sql
 import (
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
+	"golang.org/x/net/trace"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -42,26 +46,101 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
-// COCKROACH_TRACE_SQL=duration can be used to log SQL transactions that take
-// longer than duration to complete. For example, COCKROACH_TRACE_SQL=1s will
-// log the trace for any transaction that takes 1s or longer. To log traces for
-// all transactions use COCKROACH_TRACE_SQL=1ns. Note that any positive
-// duration will enable tracing and will slow down all execution because traces
-// are gathered for all transactions even if they are not output.
-var traceSQLDuration = envutil.EnvOrDefaultDuration("COCKROACH_TRACE_SQL", 0)
-var traceSQL = traceSQLDuration > 0
+// traceTxnThreshold can be used to log SQL transactions that take
+// longer than duration to complete. For example, traceTxnThreshold=1s
+// will log the trace for any transaction that takes 1s or longer. To
+// log traces for all transactions use traceTxnThreshold=1ns. Note
+// that any positive duration will enable tracing and will slow down
+// all execution because traces are gathered for all transactions even
+// if they are not output.
+var traceTxnThreshold = settings.RegisterDurationSetting(
+	"sql.trace.txn.enable_threshold",
+	"duration beyond which all transactions are traced (set to 0 to disable)", 0)
 
-// COCKROACH_DISABLE_SQL_EVENT_LOG can be used to disable the event log that is
-// normally kept for every SQL connection. The event log has a non-trivial
-// performance impact.
-var disableSQLEventLog = envutil.EnvOrDefaultBool("COCKROACH_DISABLE_SQL_EVENT_LOG", false)
+// traceSessionEventLogEnabled can be used to enable the event log
+// that is normally kept for every SQL connection. The event log has a
+// non-trivial performance impact and also reveals SQL statements
+// which may be a privacy concern.
+var traceSessionEventLogEnabled = settings.RegisterBoolSetting(
+	"sql.trace.session_eventlog.enabled",
+	"set to true to enable session tracing", false)
 
-// COCKROACH_TRACE_7881 can be used to trace all SQL transactions, in the hope
-// that we'll catch #7881 and dump the current trace for debugging.
-var traceSQLFor7881 = envutil.EnvOrDefaultBool("COCKROACH_TRACE_7881", false)
+// debugTrace7881Enabled causes all SQL transactions to be traced using their
+// own tracer and log, in the hope that we'll catch #7881 and dump the
+// current trace for debugging.
+var debugTrace7881Enabled = envutil.EnvOrDefaultBool("COCKROACH_TRACE_7881", false)
+
+// logStatementsExecuteEnabled causes the Executor to log executed
+// statements and, if any, resulting errors.
+var logStatementsExecuteEnabled = settings.RegisterBoolSetting(
+	"sql.trace.log_statement_execute",
+	"set to true to enable logging of executed statements", false)
 
 // span baggage key used for marking a span
 const keyFor7881Sample = "found#7881"
+
+// DistSQLExecMode controls if and when the Executor uses DistSQL.
+type DistSQLExecMode int64
+
+const (
+	// DistSQLOff means that we never use distSQL.
+	DistSQLOff DistSQLExecMode = iota
+	// DistSQLAuto means that we automatically decide on a case-by-case basis if
+	// we use distSQL.
+	DistSQLAuto
+	// DistSQLOn means that we use distSQL for queries that are supported.
+	DistSQLOn
+	// DistSQLAlways means that we only use distSQL; unsupported queries fail.
+	DistSQLAlways
+)
+
+func (m DistSQLExecMode) String() string {
+	switch m {
+	case DistSQLOff:
+		return "off"
+	case DistSQLAuto:
+		return "auto"
+	case DistSQLOn:
+		return "on"
+	case DistSQLAlways:
+		return "always"
+	default:
+		return fmt.Sprintf("invalid (%d)", m)
+	}
+}
+
+// DistSQLExecModeFromInt converts an int64 into a DistSQLExecMode
+func DistSQLExecModeFromInt(val int64) DistSQLExecMode {
+	return DistSQLExecMode(val)
+}
+
+// DistSQLExecModeFromString converts a string into a DistSQLExecMode
+func DistSQLExecModeFromString(val string) DistSQLExecMode {
+	switch strings.ToUpper(val) {
+	case "OFF":
+		return DistSQLOff
+	case "AUTO":
+		return DistSQLAuto
+	case "ON":
+		return DistSQLOn
+	case "ALWAYS":
+		return DistSQLAlways
+	default:
+		panic(fmt.Sprintf("unknown DistSQL mode %s", val))
+	}
+}
+
+// DistSQLClusterExecMode controls the cluster default for when DistSQL is used.
+var DistSQLClusterExecMode = settings.RegisterEnumSetting(
+	"sql.defaults.distsql",
+	"Default distributed SQL execution mode",
+	"Auto",
+	map[int64]string{
+		int64(DistSQLOff):  "Off",
+		int64(DistSQLAuto): "Auto",
+		int64(DistSQLOn):   "On",
+	},
+)
 
 // Session contains the state of a SQL client connection.
 // Create instances using NewSession().
@@ -82,17 +161,19 @@ type Session struct {
 	DefaultIsolationLevel enginepb.IsolationType
 	// DistSQLMode indicates whether to run queries using the distributed
 	// execution engine.
-	DistSQLMode distSQLExecMode
+	DistSQLMode DistSQLExecMode
 	// Location indicates the current time zone.
 	Location *time.Location
 	// SearchPath is a list of databases that will be searched for a table name
 	// before the database. Currently, this is used only for SELECTs.
 	// Names in the search path must have been normalized already.
 	SearchPath parser.SearchPath
-	// Syntax determine which lexical structure to use for parsing.
-	Syntax parser.Syntax
 	// User is the name of the user logged into the session.
 	User string
+
+	// defaults is used to restore default configuration values into
+	// SET ... TO DEFAULT statements.
+	defaults sessionDefaults
 
 	//
 	// State structures for the logical SQL session.
@@ -119,21 +200,14 @@ type Session struct {
 	// execCfg is the configuration of the Executor that is executing this
 	// session.
 	execCfg *ExecutorConfig
-	// planner is the planner in charge of executing statements within this
-	// session. While the planner type is logically scoped to the execution
-	// of a single statement, this field will be reset and reused between
-	// statements. When necessary, it can be cloned so that future modifications
-	// to the field do not affect a separate stream of statement execution.
-	planner planner
 	// distSQLPlanner is in charge of distSQL physical planning and running
 	// logic.
 	distSQLPlanner *distSQLPlanner
 	// context is the Session's base context, to be used for all
 	// SQL-related logging. See Ctx().
 	context context.Context
-	// finishEventLog indicates whether an event log was started for
-	// this session.
-	finishEventLog bool
+	// eventLog for SQL statements and results.
+	eventLog trace.EventLog
 	// cancel is a method to call when the session terminates, to
 	// release resources associated with the context above.
 	// TODO(andrei): We need to either get rid of this cancel field, or
@@ -143,6 +217,9 @@ type Session struct {
 	// cancelling the individual transactions as soon as they
 	// COMMIT/ROLLBACK.
 	cancel context.CancelFunc
+	// parallelizeQueue is a queue managing all parallelized SQL statements
+	// running in this session.
+	parallelizeQueue ParallelizeQueue
 	// mon tracks memory usage for SQL activity within this session. It
 	// is not directly used, but rather indirectly used via sessionMon
 	// and TxnState.mon. sessionMon tracks session-bound objects like prepared
@@ -156,19 +233,22 @@ type Session struct {
 	// statistics for result sets (which escape transactions).
 	mon        mon.MemoryMonitor
 	sessionMon mon.MemoryMonitor
-	// leases holds the state of per-table leases acquired by the leaseMgr.
-	leases []*LeaseState
-	// leaseMgr manages acquiring and releasing per-table leases.
-	leaseMgr *LeaseManager
-	// systemConfig holds a copy of the latest system config since the last
-	// call to resetForBatch.
-	systemConfig config.SystemConfig
-	// databaseCache is used as a cache for database names.
-	// TODO(andrei): get rid of it and replace it with a leasing system for
-	// database descriptors.
-	databaseCache *databaseCache
+
+	leases LeaseCollection
+
 	// If set, contains the in progress COPY FROM columns.
 	copyFrom *copyNode
+
+	//
+	// Testing state.
+	//
+
+	// If set, called after the Session is done executing the current SQL statement.
+	// It can be used to verify assumptions about how metadata will be asynchronously
+	// updated. Note that this can overwrite a previous callback that was waiting to be
+	// verified, which is not ideal.
+	testingVerifyMetadataFn func(config.SystemConfig) error
+	verifyFnCheckedOnce     bool
 
 	//
 	// Per-session statistics.
@@ -181,10 +261,20 @@ type Session struct {
 	sqlStats *sqlStats
 	// appStats track per-application SQL usage statistics.
 	appStats *appStats
+	// phaseTimes tracks session-level phase times. It is copied-by-value
+	// to each planner in session.newPlanner.
+	phaseTimes phaseTimes
 
 	// noCopy is placed here to guarantee that Session objects are not
 	// copied.
 	noCopy util.NoCopy
+}
+
+// sessionDefaults mirrors fields in Session, for restoring default
+// configuration values in SET ... TO DEFAULT statements.
+type sessionDefaults struct {
+	applicationName string
+	database        string
 }
 
 // SessionArgs contains arguments for creating a new Session with NewSession().
@@ -200,44 +290,53 @@ func NewSession(
 	ctx context.Context, args SessionArgs, e *Executor, remote net.Addr, memMetrics *MemoryMetrics,
 ) *Session {
 	ctx = e.AnnotateCtx(ctx)
-	cfg, cache := e.getSystemConfig()
+	distSQLMode := DistSQLExecModeFromInt(DistSQLClusterExecMode.Get())
+	if e.cfg.TestingKnobs.OverrideDistSQLMode != nil {
+		distSQLMode = DistSQLExecModeFromInt(e.cfg.TestingKnobs.OverrideDistSQLMode.Get())
+	}
 	s := &Session{
-		Database:       args.Database,
-		SearchPath:     parser.SearchPath{"pg_catalog"},
-		Location:       time.UTC,
-		User:           args.User,
-		virtualSchemas: e.virtualSchemas,
-		execCfg:        &e.cfg,
-		distSQLPlanner: e.distSQLPlanner,
-		leaseMgr:       e.cfg.LeaseManager,
-		systemConfig:   cfg,
-		databaseCache:  cache,
-		memMetrics:     memMetrics,
-		sqlStats:       &e.sqlStats,
+		Database:         args.Database,
+		DistSQLMode:      distSQLMode,
+		SearchPath:       sqlbase.DefaultSearchPath,
+		Location:         time.UTC,
+		User:             args.User,
+		virtualSchemas:   e.virtualSchemas,
+		execCfg:          &e.cfg,
+		distSQLPlanner:   e.distSQLPlanner,
+		parallelizeQueue: MakeParallelizeQueue(NewSpanBasedDependencyAnalyzer()),
+		memMetrics:       memMetrics,
+		sqlStats:         &e.sqlStats,
+		defaults: sessionDefaults{
+			applicationName: args.ApplicationName,
+			database:        args.Database,
+		},
+		leases: LeaseCollection{
+			leaseMgr:      e.cfg.LeaseManager,
+			databaseCache: e.getDatabaseCache(),
+		},
 	}
-	s.planner = planner{
-		session: s,
-	}
-	s.planner.phaseTimes[sessionInit] = timeutil.Now()
+	s.phaseTimes[sessionInit] = timeutil.Now()
 	s.resetApplicationName(args.ApplicationName)
 	s.PreparedStatements = makePreparedStatements(s)
 	s.PreparedPortals = makePreparedPortals(s)
 
-	if !disableSQLEventLog && opentracing.SpanFromContext(ctx) == nil {
+	if traceSessionEventLogEnabled.Get() {
 		remoteStr := "<admin>"
 		if remote != nil {
 			remoteStr = remote.String()
 		}
-		// Set up an EventLog for session events.
-		ctx = log.WithEventLog(ctx, fmt.Sprintf("sql [%s]", args.User), remoteStr)
-		s.finishEventLog = true
+		s.eventLog = trace.NewEventLog(fmt.Sprintf("sql [%s]", args.User), remoteStr)
 	}
 	s.context, s.cancel = context.WithCancel(ctx)
 
 	return s
 }
 
-// Finish releases resources held by the Session.
+// Finish releases resources held by the Session. It is called by the Session's
+// main goroutine, so no synchronous queries will be in-flight during the
+// method's execution. However, it could be called when asynchronous queries are
+// operating in the background in the case of parallelized statements, which
+// is why we make sure to drain background statements.
 func (s *Session) Finish(e *Executor) {
 	if s.mon == (mon.MemoryMonitor{}) {
 		// This check won't catch the cases where Finish is never called, but it's
@@ -246,6 +345,20 @@ func (s *Session) Finish(e *Executor) {
 		panic("session.Finish: session monitors were never initialized. Missing call " +
 			"to session.StartMonitor?")
 	}
+
+	// Make sure that no statements remain in the ParallelizeQueue. If no statements
+	// are in the queue, this will be a no-op. If there are statements in the
+	// queue, they would have eventually drained on their own, but if we don't
+	// wait here, we risk alarming the MemoryMonitor. We ignore the error because
+	// it will only ever be non-nil if there are statements in the queue, meaning
+	// that the Session was abandoned in the middle of a transaction, in which
+	// case the error doesn't matter.
+	//
+	// TODO(nvanbenschoten): Once we have better support for cancelling ongoing
+	// statement execution by the infrastructure added to support CancelRequest,
+	// we should try to actively drain this queue instead of passively waiting
+	// for it to drain.
+	_ = s.parallelizeQueue.Wait()
 
 	// If we're inside a txn, roll it back.
 	if s.TxnState.State.kvTxnIsOpen() {
@@ -259,14 +372,15 @@ func (s *Session) Finish(e *Executor) {
 	// Cleanup leases. We might have unreleased leases if we're finishing the
 	// session abruptly in the middle of a transaction, or, until #7648 is
 	// addressed, there might be leases accumulated by preparing statements.
-	s.planner.releaseLeases(s.context)
+	s.leases.releaseLeases(s.context)
 
 	s.ClearStatementsAndPortals(s.context)
 	s.sessionMon.Stop(s.context)
 	s.mon.Stop(s.context)
 
-	if s.finishEventLog {
-		log.FinishEventLog(s.context)
+	if s.eventLog != nil {
+		s.eventLog.Finish()
+		s.eventLog = nil
 	}
 
 	// This will stop the heartbeating of the of the txn record.
@@ -306,6 +420,116 @@ func (s *Session) hijackCtx(ctx context.Context) func() {
 	return s.TxnState.hijackCtx(ctx)
 }
 
+// newPlanner creates a planner inside the scope of the given Session. The
+// statement executed by the planner will be executed in txn. The planner
+// should only be used to execute one statement.
+func (s *Session) newPlanner(e *Executor, txn *client.Txn) *planner {
+	p := &planner{
+		session: s,
+		// phaseTimes is an array, not a slice, so this performs a copy-by-value.
+		phaseTimes: s.phaseTimes,
+	}
+
+	p.semaCtx = parser.MakeSemaContext(s.User == security.RootUser)
+	p.semaCtx.Location = &s.Location
+	p.semaCtx.SearchPath = s.SearchPath
+
+	p.evalCtx = s.evalCtx()
+	p.evalCtx.Planner = p
+	if e != nil {
+		p.evalCtx.NodeID = e.cfg.NodeID.Get()
+		p.evalCtx.ReCache = e.reCache
+	}
+
+	p.setTxn(txn)
+
+	return p
+}
+
+// evalCtx creates a parser.EvalContext from the Session's current configuration.
+func (s *Session) evalCtx() parser.EvalContext {
+	return parser.EvalContext{
+		Location:   &s.Location,
+		Database:   s.Database,
+		SearchPath: s.SearchPath,
+		Ctx:        s.Ctx,
+		Mon:        &s.TxnState.mon,
+	}
+}
+
+// resetForBatch prepares the Session for executing a new batch of statements.
+func (s *Session) resetForBatch(e *Executor) {
+	// Update the database cache to a more recent copy, so that we can use tables
+	// that we created in previous batches of the same transaction.
+	s.leases.databaseCache = e.getDatabaseCache()
+	s.TxnState.schemaChangers.curGroupNum++
+}
+
+// releaseLeases releases all leases currently held by the Session.
+func (lc *LeaseCollection) releaseLeases(ctx context.Context) {
+	if lc.leases != nil {
+		if log.V(2) {
+			log.VEventf(ctx, 2, "releasing %d leases", len(lc.leases))
+		}
+		for _, lease := range lc.leases {
+			if err := lc.leaseMgr.Release(lease); err != nil {
+				log.Warning(ctx, err)
+			}
+		}
+		lc.leases = nil
+	}
+}
+
+// setTestingVerifyMetadata sets a callback to be called after the Session
+// is done executing the current SQL statement. It can be used to verify
+// assumptions about how metadata will be asynchronously updated.
+// Note that this can overwrite a previous callback that was waiting to be
+// verified, which is not ideal.
+func (s *Session) setTestingVerifyMetadata(fn func(config.SystemConfig) error) {
+	s.testingVerifyMetadataFn = fn
+	s.verifyFnCheckedOnce = false
+}
+
+// checkTestingVerifyMetadataInitialOrDie verifies that the metadata callback,
+// if one was set, fails. This validates that we need a gossip update for it to
+// eventually succeed.
+// No-op if we've already done an initial check for the set callback.
+// Gossip updates for the system config are assumed to be blocked when this is
+// called.
+func (s *Session) checkTestingVerifyMetadataInitialOrDie(e *Executor, stmts parser.StatementList) {
+	if !s.execCfg.TestingKnobs.WaitForGossipUpdate {
+		return
+	}
+	// If there's nothinging to verify, or we've already verified the initial
+	// condition, there's nothing to do.
+	if s.testingVerifyMetadataFn == nil || s.verifyFnCheckedOnce {
+		return
+	}
+	if s.testingVerifyMetadataFn(e.systemConfig) == nil {
+		panic(fmt.Sprintf(
+			"expected %q (or the statements before them) to require a "+
+				"gossip update, but they did not", stmts))
+	}
+	s.verifyFnCheckedOnce = true
+}
+
+// checkTestingVerifyMetadataOrDie verifies the metadata callback, if one was set.
+// Gossip updates for the system config are assumed to be blocked when this is called.
+func (s *Session) checkTestingVerifyMetadataOrDie(e *Executor, stmts parser.StatementList) {
+	if !s.execCfg.TestingKnobs.WaitForGossipUpdate ||
+		s.testingVerifyMetadataFn == nil {
+		return
+	}
+	if !s.verifyFnCheckedOnce {
+		panic("initial state of the condition to verify was not checked")
+	}
+
+	for s.testingVerifyMetadataFn(e.systemConfig) != nil {
+		e.waitForConfigUpdate()
+	}
+	s.testingVerifyMetadataFn = nil
+}
+
 // TxnStateEnum represents the state of a SQL txn.
 type TxnStateEnum int
 
@@ -342,12 +566,6 @@ type txnState struct {
 	// Ctx is the context for everything running in this SQL txn.
 	Ctx context.Context
 
-	// retrying is used to work around the non-idempotence of SAVEPOINT
-	// queries.
-	//
-	// See the comment at the site of its use for more detail.
-	retrying bool
-
 	// If set, the user declared the intention to retry the txn in case of retriable
 	// errors. The txn will enter a RestartWait state in case of such errors.
 	retryIntent bool
@@ -366,7 +584,7 @@ type txnState struct {
 	schemaChangers schemaChangerCollection
 
 	sp opentracing.Span
-	// When COCKROACH_TRACE_SQL is enabled, trace accumulates spans as
+	// When sql.trace.txn.threshold is >0, trace accumulates spans as
 	// they're closed. All the spans pertain to the current txn.
 	trace *tracing.RecordedTrace
 
@@ -391,7 +609,6 @@ func (ts *txnState) resetForNewSQLTxn(e *Executor, s *Session) {
 	}
 
 	// Reset state vars to defaults.
-	ts.retrying = false
 	ts.retryIntent = false
 	ts.autoRetry = false
 	ts.commitSeen = false
@@ -403,13 +620,13 @@ func (ts *txnState) resetForNewSQLTxn(e *Executor, s *Session) {
 	// TODO(andrei): figure out how to close these spans on server shutdown? Ties
 	// into a larger discussion about how to drain SQL and rollback open txns.
 	ctx := s.context
-	if traceSQL {
+	if traceTxnThreshold.Get() > 0 {
 		var err error
 		ctx, ts.trace, err = tracing.StartSnowballTrace(ctx, "traceSQL")
 		if err != nil {
 			log.Fatalf(ctx, "unable to create snowball tracer: %s", err)
 		}
-	} else if traceSQLFor7881 {
+	} else if debugTrace7881Enabled {
 		var err error
 		ctx, ts.trace, err = tracing.NewTracerAndSpanFor7881(ctx)
 		if err != nil {
@@ -455,11 +672,11 @@ func (ts *txnState) willBeRetried() bool {
 // the client.Txn being done.
 func (ts *txnState) resetStateAndTxn(state TxnStateEnum) {
 	if state != NoTxn && state != Aborted && state != CommitWait {
-		panic(fmt.Sprintf("resetStateAndTxn called with unsupported state: %s", state))
+		panic(fmt.Sprintf("resetStateAndTxn called with unsupported state: %v", state))
 	}
 	if ts.txn != nil && !ts.txn.IsFinalized() {
 		panic(fmt.Sprintf(
-			"attempting to move SQL txn to state %s inconsistent with KV txn state: %s "+
+			"attempting to move SQL txn to state %v inconsistent with KV txn state: %s "+
 				"(finalized: false)", state, ts.txn.Proto().Status))
 	}
 	ts.State = state
@@ -478,11 +695,13 @@ func (ts *txnState) finishSQLTxn(sessionCtx context.Context) {
 	sampledFor7881 := (ts.sp.BaggageItem(keyFor7881Sample) != "")
 	ts.sp.Finish()
 	ts.sp = nil
-	if (traceSQL && timeutil.Since(ts.sqlTimestamp) >= traceSQLDuration) ||
-		(traceSQLFor7881 && sampledFor7881) {
-		dump := tracing.FormatRawSpans(ts.trace.GetSpans())
-		if len(dump) > 0 {
-			log.Infof(sessionCtx, "SQL trace:\n%s", dump)
+	if ts.trace != nil {
+		durThreshold := traceTxnThreshold.Get()
+		if sampledFor7881 || (durThreshold > 0 && timeutil.Since(ts.sqlTimestamp) >= durThreshold) {
+			dump := tracing.FormatRawSpans(ts.trace.GetSpans())
+			if len(dump) > 0 {
+				log.Infof(sessionCtx, "SQL trace:\n%s", dump)
+			}
 		}
 	}
 }
@@ -495,9 +714,9 @@ func (ts *txnState) updateStateAndCleanupOnErr(err error, e *Executor) {
 	if err == nil {
 		panic("updateStateAndCleanupOnErr called with no error")
 	}
-	if retErr, ok := err.(*roachpb.RetryableTxnError); !ok ||
+	if retErr, ok := err.(*roachpb.HandledRetryableTxnError); !ok ||
 		!ts.willBeRetried() ||
-		!ts.txn.IsRetryableErrMeantForTxn(retErr) {
+		!ts.txn.IsRetryableErrMeantForTxn(*retErr) {
 
 		// We can't or don't want to retry this txn, so the txn is over.
 		e.TxnAbortCount.Inc(1)
@@ -566,13 +785,10 @@ func (scc *schemaChangerCollection) queueSchemaChanger(schemaChanger SchemaChang
 //    schema changes we're about to execute. Results corresponding to the
 //    schema change statements will be changed in case an error occurs.
 func (scc *schemaChangerCollection) execSchemaChanges(
-	ctx context.Context, e *Executor, planMaker *planner, results ResultList,
+	ctx context.Context, e *Executor, session *Session, results ResultList,
 ) {
-	if planMaker.txn != nil {
-		panic("trying to execute schema changes while still in a transaction")
-	}
 	// Release the leases once a transaction is complete.
-	planMaker.releaseLeases(ctx)
+	session.leases.releaseLeases(ctx)
 	if e.cfg.SchemaChangerTestingKnobs.SyncFilter != nil {
 		e.cfg.SchemaChangerTestingKnobs.SyncFilter(TestingSchemaChangerCollection{scc})
 	}
@@ -584,12 +800,13 @@ func (scc *schemaChangerCollection) execSchemaChanges(
 		sc.testingKnobs = e.cfg.SchemaChangerTestingKnobs
 		sc.distSQLPlanner = e.distSQLPlanner
 		for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
-			if err := sc.exec(ctx); err != nil {
-				if err != errExistingSchemaChangeLease {
+			evalCtx := createSchemaChangeEvalCtx(e.cfg.Clock.Now())
+			if err := sc.exec(ctx, evalCtx); err != nil {
+				if shouldLogSchemaChangeError(err) {
 					log.Warningf(ctx, "Error executing schema change: %s", err)
 				}
 				if err == sqlbase.ErrDescriptorNotFound {
-				} else if sqlbase.IsIntegrityConstraintError(err) {
+				} else if sqlbase.IsPermanentSchemaChangeError(err) {
 					// All constraint violations can be reported; we report it as the result
 					// corresponding to the statement that enqueued this changer.
 					// There's some sketchiness here: we assume there's a single result

@@ -12,7 +12,7 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-// +build check
+// +build lint
 
 package build_test
 
@@ -139,8 +139,10 @@ func TestStyle(t *testing.T) {
 
 		if err := stream.ForEach(stream.Sequence(
 			filter,
-			stream.GrepNot(`^cmd/`),
-			stream.GrepNot(`^(build/style_test\.go|ccl/sqlccl/backup_cloud_test\.go|ccl/storageccl/export_storage_test\.go|acceptance(/.*)?/\w+\.go)\b`),
+			stream.GrepNot(`^cmd(/.*)?/\w+\.go\b`),
+			stream.GrepNot(`^build/style_test\.go\b`),
+			stream.GrepNot(`^ccl/(sqlccl/backup_cloud|storageccl/export_storage|acceptanceccl/backup)_test\.go\b`),
+			stream.GrepNot(`^acceptance(/.*)?/\w+\.go\b`),
 			stream.GrepNot(`^util/(log|envutil|sdnotify)/\w+\.go\b`),
 		), func(s string) {
 			t.Errorf(`%s <- forbidden; use "envutil" instead`, s)
@@ -171,6 +173,30 @@ func TestStyle(t *testing.T) {
 			stream.GrepNot(`^util/syncutil/mutex_sync\.go\b`),
 		), func(s string) {
 			t.Errorf(`%s <- forbidden; use "syncutil.{,RW}Mutex" instead`, s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestTodoStyle", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `\sTODO\([^)]*\)[^:]`, "--", "*.go")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf(`%s <- use 'TODO(...): ' instead`, s)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -500,30 +526,37 @@ func TestStyle(t *testing.T) {
 			}
 			return nil
 		})
+		settingsPkgPrefix := `github.com/cockroachdb/cockroach/pkg/settings`
 		if err := stream.ForEach(stream.Sequence(
 			filter,
 			stream.Sort(),
 			stream.Uniq(),
 			stream.GrepNot(`cockroach/pkg/cmd/`),
-			stream.Grep(` (github\.com/golang/protobuf/proto|github\.com/satori/go\.uuid|log|path|context)$`),
+			stream.Grep(`^`+settingsPkgPrefix+`: | (github\.com/golang/protobuf/proto|github\.com/satori/go\.uuid|log|path|context|syscall)$`),
+			stream.GrepNot(`cockroach/pkg/(cli|security): syscall$`),
 			stream.GrepNot(`cockroach/pkg/(base|security|util/(log|randutil|stop)): log$`),
 			stream.GrepNot(`cockroach/pkg/(server/serverpb|ts/tspb): github\.com/golang/protobuf/proto$`),
+			stream.GrepNot(`cockroach/pkg/util/caller: path$`),
 			stream.GrepNot(`cockroach/pkg/util/uuid: github\.com/satori/go\.uuid$`),
 		), func(s string) {
-			if strings.HasSuffix(s, " path") {
+			switch {
+			case strings.HasSuffix(s, " path"):
 				t.Errorf(`%s <- please use "path/filepath" instead of "path"`, s)
-			}
-			if strings.HasSuffix(s, " log") {
+			case strings.HasSuffix(s, " log"):
 				t.Errorf(`%s <- please use "util/log" instead of "log"`, s)
-			}
-			if strings.HasSuffix(s, " github.com/golang/protobuf/proto") {
+			case strings.HasSuffix(s, " github.com/golang/protobuf/proto"):
 				t.Errorf(`%s <- please use "github.com/gogo/protobuf/proto" instead of "github.com/golang/protobuf/proto"`, s)
-			}
-			if strings.HasSuffix(s, " github.com/satori/go.uuid") {
+			case strings.HasSuffix(s, " github.com/satori/go.uuid"):
 				t.Errorf(`%s <- please use "util/uuid" instead of "github.com/satori/go.uuid"`, s)
-			}
-			if strings.HasSuffix(s, " context") {
+			case strings.HasSuffix(s, " context"):
 				t.Errorf(`%s <- please use "golang.org/x/net/context" instead of "context"`, s)
+			case strings.HasSuffix(s, " syscall"):
+				t.Errorf(`%s <- please use "golang.org/x/sys" instead of "syscall"`, s)
+			case strings.HasPrefix(s, settingsPkgPrefix+": github.com/cockroachdb/cockroach"):
+				if !strings.HasSuffix(s, "testutils") && !strings.HasSuffix(s, "humanizeutil") &&
+					!strings.HasSuffix(s, settingsPkgPrefix) {
+					t.Errorf("%s <- please don't add CRDB dependencies to settings pkg", s)
+				}
 			}
 		}); err != nil {
 			t.Error(err)

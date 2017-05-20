@@ -375,7 +375,9 @@ func (s LeaseStore) Publish(
 			}
 
 			// Write the updated descriptor.
-			txn.SetSystemConfigTrigger()
+			if err := txn.SetSystemConfigTrigger(); err != nil {
+				return err
+			}
 			b := txn.NewBatch()
 			b.Put(descKey, desc)
 			if logEvent != nil {
@@ -550,7 +552,7 @@ type tableState struct {
 	deleted bool
 }
 
-// acquire returns a lease at the specifies version. The lease will have its
+// acquire returns a lease at the specified version. The lease will have its
 // refcount incremented, so the caller is responsible to call release() on it.
 func (t *tableState) acquire(
 	ctx context.Context, txn *client.Txn, version sqlbase.DescriptorVersion, m *LeaseManager,
@@ -614,6 +616,10 @@ func (t *tableState) acquireFromStoreLocked(
 		return nil
 	}
 
+	event := m.testingKnobs.LeaseStoreTestingKnobs.LeaseAcquiringEvent
+	if event != nil {
+		event(t.id, txn)
+	}
 	s, err := t.acquireNodeLease(ctx, txn, version, m, parser.DTimestamp{})
 	if err != nil {
 		return err
@@ -660,7 +666,7 @@ func (t *tableState) acquireFreshestFromStoreLocked(
 
 // releaseInactiveLeases releases the leases in t.active.data with refcount 0.
 // t.mu must be locked.
-func (t *tableState) releaseInactiveLeases(store LeaseStore) {
+func (t *tableState) releaseInactiveLeases(m *LeaseManager) {
 	// A copy of t.active.data must be made since t.active.data will be changed
 	// by `removeLease`.
 	for _, lease := range append([]*LeaseState(nil), t.active.data...) {
@@ -668,7 +674,7 @@ func (t *tableState) releaseInactiveLeases(store LeaseStore) {
 			lease.mu.Lock()
 			defer lease.mu.Unlock()
 			if lease.refcount == 0 {
-				t.removeLease(lease, store)
+				t.removeLease(lease, m)
 			}
 		}()
 	}
@@ -767,20 +773,28 @@ func (t *tableState) release(lease *LeaseState, m *LeaseManager) error {
 		return s.released
 	}
 	if decRefcount(s) {
-		t.removeLease(s, m.LeaseStore)
+		t.removeLease(s, m)
 	}
 	return nil
 }
 
 // t.mu needs to be locked.
-func (t *tableState) removeLease(lease *LeaseState, store LeaseStore) {
+func (t *tableState) removeLease(lease *LeaseState, m *LeaseManager) {
 	t.active.remove(lease)
 	t.tableNameCache.remove(lease)
+
+	ctx := context.TODO()
+	if m.isDraining() {
+		// Release synchronously to guarantee release before exiting.
+		m.LeaseStore.Release(ctx, t.stopper, lease)
+		return
+	}
+
 	// Release to the store asynchronously, without the tableState lock.
-	if err := t.stopper.RunAsyncTask(context.TODO(), func(ctx context.Context) {
-		store.Release(ctx, t.stopper, lease)
+	if err := t.stopper.RunAsyncTask(ctx, func(ctx context.Context) {
+		m.LeaseStore.Release(ctx, t.stopper, lease)
 	}); err != nil {
-		log.Warningf(context.TODO(), "error: %s, not releasing lease: %q", err, lease)
+		log.Warningf(ctx, "error: %s, not releasing lease: %q", err, lease)
 	}
 }
 
@@ -823,7 +837,7 @@ func (t *tableState) purgeOldLeases(
 			if deleted {
 				t.deleted = true
 			}
-			t.releaseInactiveLeases(m.LeaseStore)
+			t.releaseInactiveLeases(m)
 			return nil
 		}
 		return err
@@ -842,6 +856,9 @@ type LeaseStoreTestingKnobs struct {
 	// Called after a lease is removed from the store, with any operation error.
 	// See LeaseRemovalTracker.
 	LeaseReleasedEvent func(lease *LeaseState, err error)
+	// Called just before a lease is about to be acquired by the store. Gives
+	// access to the txn doing the acquiring.
+	LeaseAcquiringEvent func(tableID sqlbase.ID, txn *client.Txn)
 	// Called after a lease is acquired, with any operation error.
 	LeaseAcquiredEvent func(lease *LeaseState, err error)
 	// Allow the use of expired leases.
@@ -1195,7 +1212,7 @@ func (m *LeaseManager) SetDraining(drain bool) {
 	defer m.mu.Unlock()
 	for _, t := range m.mu.tables {
 		t.mu.Lock()
-		t.releaseInactiveLeases(m.LeaseStore)
+		t.releaseInactiveLeases(m)
 		t.mu.Unlock()
 	}
 }
@@ -1215,8 +1232,8 @@ func (m *LeaseManager) findTableState(tableID sqlbase.ID, create bool) *tableSta
 // RefreshLeases starts a goroutine that refreshes the lease manager
 // leases for tables received in the latest system configuration via gossip.
 func (m *LeaseManager) RefreshLeases(s *stop.Stopper, db *client.DB, gossip *gossip.Gossip) {
-	s.RunWorker(func() {
-		ctx := context.TODO()
+	ctx := context.TODO()
+	s.RunWorker(ctx, func(ctx context.Context) {
 		descKeyPrefix := keys.MakeTablePrefix(uint32(sqlbase.DescriptorTable.ID))
 		gossipUpdateC := gossip.RegisterSystemConfigChannel()
 		for {
@@ -1275,4 +1292,17 @@ func (m *LeaseManager) RefreshLeases(s *stop.Stopper, db *client.DB, gossip *gos
 			}
 		}
 	})
+}
+
+// LeaseCollection is a collection of leases held by a single session that
+// serves SQL requests, or a background job using a table descriptor.
+type LeaseCollection struct {
+	// leases holds the state of per-table leases acquired by the leaseMgr.
+	leases []*LeaseState
+	// leaseMgr manages acquiring and releasing per-table leases.
+	leaseMgr *LeaseManager
+	// databaseCache is used as a cache for database names.
+	// TODO(andrei): get rid of it and replace it with a leasing system for
+	// database descriptors.
+	databaseCache *databaseCache
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -34,7 +35,7 @@ import (
 type sortNode struct {
 	p        *planner
 	plan     planNode
-	columns  ResultColumns
+	columns  sqlbase.ResultColumns
 	ordering sqlbase.ColumnOrdering
 
 	needSort     bool
@@ -172,36 +173,15 @@ func (p *planner) orderBy(
 			}
 		}
 
-		if s != nil {
-			// Try to optimize constant sorts. For this we need to resolve
-			// names to IndexedVars then see if there were any row-dependent
-			// expressions found in the sort expression.
-			sortExpr := expr
-			if index != -1 {
-				// We found a render above, so fetch it. This is needed
-				// because if the sort expression is a reference to a render
-				// alias, resolveNames below would be incorrect.
-				sortExpr = s.render[index]
-			}
-			_, hasRowDependentValues, err := p.resolveNames(sortExpr, s.sourceInfo, s.ivarHelper)
-			if err != nil {
-				return nil, err
-			}
-			if !hasRowDependentValues {
-				// No sorting needed!
-				continue
-			}
-		}
-
 		// Finally, if we haven't found anything so far, we really
 		// need a new render.
-		// TODO(knz/dan) currently this is only possible for renderNode.
+		// TODO(knz/dan): currently this is only possible for renderNode.
 		// If we are dealing with a UNION or something else we would need
 		// to fabricate an intermediate renderNode to add the new render.
 		if index == -1 && s != nil {
-			cols, exprs, hasStar, err := p.computeRender(
+			cols, exprs, hasStar, err := p.computeRenderAllowingStars(
 				ctx, parser.SelectExpr{Expr: expr}, parser.TypeAny,
-				s.source.info, s.ivarHelper, true)
+				s.sourceInfo, s.ivarHelper, autoGenerateRenderOutputName)
 			if err != nil {
 				return nil, err
 			}
@@ -212,7 +192,7 @@ func (p *planner) orderBy(
 				continue
 			}
 
-			colIdxs := s.addOrMergeRenders(cols, exprs, true)
+			colIdxs := s.addOrReuseRenders(cols, exprs, true)
 			for i := 0; i < len(colIdxs)-1; i++ {
 				// If more than 1 column were expanded, turn them into sort columns too.
 				// Except the last one, which will be added below.
@@ -230,7 +210,7 @@ func (p *planner) orderBy(
 	}
 
 	if ordering == nil {
-		// All the sort expressions are constant. Simply drop the sort node.
+		// No ordering; simply drop the sort node.
 		return nil, nil
 	}
 	return &sortNode{p: p, columns: columns, ordering: ordering}, nil
@@ -271,7 +251,7 @@ func (p *planner) colIndex(numOriginalCols int, expr parser.Expr, context string
 	return int(ord), nil
 }
 
-func (n *sortNode) Columns() ResultColumns {
+func (n *sortNode) Columns() sqlbase.ResultColumns {
 	return n.columns
 }
 
@@ -351,6 +331,10 @@ func (n *sortNode) DebugValues() debugValues {
 		panic(fmt.Sprintf("node not in debug mode (mode %d)", n.explain))
 	}
 	return n.debugVals
+}
+
+func (n *sortNode) Spans(ctx context.Context) (_, _ roachpb.Spans, _ error) {
+	return n.plan.Spans(ctx)
 }
 
 func (n *sortNode) Start(ctx context.Context) error {
@@ -563,7 +547,7 @@ func (ss *iterativeSortStrategy) Close(ctx context.Context) {
 // The strategy is intended to be used when exactly k values need to be sorted,
 // where k is known before sorting begins.
 //
-// TODO(nvanbenschoten) There are better algorithms that can achieve a sorted
+// TODO(nvanbenschoten): There are better algorithms that can achieve a sorted
 // top k in a worst-case time complexity of O(n + k*log(k)) while maintaining
 // a worst-case space complexity of O(k). For instance, the top k can be found
 // in linear time, and then this can be sorted in linearithmic time.

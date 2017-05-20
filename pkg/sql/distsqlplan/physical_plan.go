@@ -105,6 +105,15 @@ type PhysicalPlan struct {
 	// reason of correctly merging the streams later (see AddProjection); we don't
 	// want to pay this cost if we don't have multiple streams to merge.
 	MergeOrdering distsqlrun.Ordering
+
+	// Used internally for numbering stages.
+	stageCounter int32
+}
+
+// NewStageID creates a stage identifier that can be used in processor specs.
+func (p *PhysicalPlan) NewStageID() int32 {
+	p.stageCounter++
+	return p.stageCounter
 }
 
 // AddProcessor adds a processor to a PhysicalPlan and returns the index that
@@ -134,6 +143,7 @@ func (p *PhysicalPlan) AddNoGroupingStage(
 	outputTypes []sqlbase.ColumnType,
 	newOrdering distsqlrun.Ordering,
 ) {
+	stageID := p.NewStageID()
 	for i, resultProc := range p.ResultRouters {
 		prevProc := &p.Processors[resultProc]
 
@@ -149,6 +159,7 @@ func (p *PhysicalPlan) AddNoGroupingStage(
 				Output: []distsqlrun.OutputRouterSpec{{
 					Type: distsqlrun.OutputRouterSpec_PASS_THROUGH,
 				}},
+				StageID: stageID,
 			},
 		}
 
@@ -215,12 +226,13 @@ func (p *PhysicalPlan) AddSingleGroupStage(
 			Output: []distsqlrun.OutputRouterSpec{{
 				Type: distsqlrun.OutputRouterSpec_PASS_THROUGH,
 			}},
+			StageID: p.NewStageID(),
 		},
 	}
 
 	pIdx := p.AddProcessor(proc)
 
-	// Connect the result routers to the no-op processor.
+	// Connect the result routers to the processor.
 	p.MergeResultStreams(p.ResultRouters, 0, p.MergeOrdering, pIdx, 0)
 
 	// We now have a single result stream.
@@ -240,7 +252,8 @@ func (p *PhysicalPlan) GetLastStagePost() distsqlrun.PostProcessSpec {
 	// verify this assumption.
 	for i := 1; i < len(p.ResultRouters); i++ {
 		pi := &p.Processors[p.ResultRouters[i]].Spec.Post
-		if pi.Filter != post.Filter || len(pi.OutputColumns) != len(post.OutputColumns) {
+		if pi.Filter != post.Filter || pi.Projection != post.Projection ||
+			len(pi.OutputColumns) != len(post.OutputColumns) {
 			panic(fmt.Sprintf("inconsistent post-processing: %v vs %v", post, pi))
 		}
 		for j, col := range pi.OutputColumns {
@@ -314,13 +327,14 @@ func (p *PhysicalPlan) AddProjection(columns []uint32) {
 	} else {
 		// There is no existing rendering; we can use OutputColumns to set the
 		// projection.
-		if post.OutputColumns != nil {
+		if post.Projection {
 			// We already had a projection: compose it with the new one.
 			for i, c := range columns {
 				columns[i] = post.OutputColumns[c]
 			}
 		}
 		post.OutputColumns = columns
+		post.Projection = true
 	}
 
 	p.SetLastStagePost(post, newResultTypes)
@@ -396,7 +410,10 @@ func (p *PhysicalPlan) AddRendering(
 		)
 	}
 
-	compositeMap := reverseProjection(post.OutputColumns, indexVarMap)
+	compositeMap := indexVarMap
+	if post.Projection {
+		compositeMap = reverseProjection(post.OutputColumns, indexVarMap)
+	}
 	post.RenderExprs = make([]distsqlrun.Expression, len(exprs))
 	for i, e := range exprs {
 		post.RenderExprs[i] = MakeExpression(e, compositeMap)
@@ -420,7 +437,7 @@ func (p *PhysicalPlan) AddRendering(
 
 				// The new expression refers to column post.OutputColumns[c.ColIdx].
 				internalColIdx := c.ColIdx
-				if post.OutputColumns != nil {
+				if post.Projection {
 					internalColIdx = post.OutputColumns[internalColIdx]
 				}
 				newExpr := MakeExpression(&parser.IndexedVar{Idx: int(internalColIdx)}, nil)
@@ -435,6 +452,7 @@ func (p *PhysicalPlan) AddRendering(
 		p.MergeOrdering.Columns = newOrdering
 	}
 
+	post.Projection = false
 	post.OutputColumns = nil
 	p.SetLastStagePost(post, outTypes)
 }
@@ -449,8 +467,7 @@ func (p *PhysicalPlan) AddRendering(
 //               processor.
 //   outputColumns is the list of output columns in the processor's
 //                 PostProcessSpec; it is effectively a mapping from the output
-//                 schema to the internal schema of a processor. If nil, an
-//                 identity mapping is assumed.
+//                 schema to the internal schema of a processor.
 //
 // Result: a "composite map" that maps the planNode columns to the internal
 //         columns of the processor.
@@ -485,10 +502,6 @@ func (p *PhysicalPlan) AddRendering(
 func reverseProjection(outputColumns []uint32, indexVarMap []int) []int {
 	if indexVarMap == nil {
 		panic("no indexVarMap")
-	}
-	if len(outputColumns) == 0 {
-		// No projection.
-		return indexVarMap
 	}
 	compositeMap := make([]int, len(indexVarMap))
 	for i, col := range indexVarMap {
@@ -525,7 +538,10 @@ func (p *PhysicalPlan) AddFilter(expr parser.TypedExpr, indexVarMap []int) {
 		)
 	}
 
-	compositeMap := reverseProjection(post.OutputColumns, indexVarMap)
+	compositeMap := indexVarMap
+	if post.Projection {
+		compositeMap = reverseProjection(post.OutputColumns, indexVarMap)
+	}
 	filter := MakeExpression(expr, compositeMap)
 	if post.Filter.Expr != "" {
 		filter.Expr = fmt.Sprintf("(%s) AND (%s)", post.Filter.Expr, filter.Expr)
@@ -703,6 +719,15 @@ func MergePlans(
 		mergedPlan.Streams[i].SourceProcessor += rightProcStart
 		mergedPlan.Streams[i].DestProcessor += rightProcStart
 	}
+
+	// Renumber the stages from the right plan.
+	for i := rightProcStart; int(i) < len(mergedPlan.Processors); i++ {
+		s := &mergedPlan.Processors[i].Spec
+		if s.StageID != 0 {
+			s.StageID += left.stageCounter
+		}
+	}
+	mergedPlan.stageCounter = left.stageCounter + right.stageCounter
 
 	leftRouters = left.ResultRouters
 	rightRouters = append([]ProcessorIdx(nil), right.ResultRouters...)

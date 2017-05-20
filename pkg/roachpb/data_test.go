@@ -290,8 +290,8 @@ func TestSetGetChecked(t *testing.T) {
 	}
 	if r, err := v.GetDecimal(); err != nil {
 		t.Fatal(err)
-	} else if dec.Cmp(r) != 0 {
-		t.Errorf("set %s on a value and extracted it, expected %s back, but got %s", dec, dec, r)
+	} else if dec.Cmp(&r) != 0 {
+		t.Errorf("set %s on a value and extracted it, expected %s back, but got %s", dec, dec, &r)
 	}
 
 	if err := v.SetProto(&Value{}); err != nil {
@@ -410,7 +410,7 @@ var nonZeroTxn = Transaction{
 	},
 	Name:               "name",
 	Status:             COMMITTED,
-	LastHeartbeat:      &hlc.Timestamp{WallTime: 1, Logical: 2},
+	LastHeartbeat:      makeTS(1, 2),
 	OrigTimestamp:      makeTS(30, 31),
 	MaxTimestamp:       makeTS(40, 41),
 	ObservedTimestamps: []ObservedTimestamp{{NodeID: 1, Timestamp: makeTS(1, 2)}},
@@ -629,8 +629,8 @@ func TestLeaseEquivalence(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		if err := tc.l.Equivalent(tc.ol); tc.expSuccess != (err == nil) {
-			t.Errorf("%d: expected success? %t; got %s", i, tc.expSuccess, err)
+		if ok := tc.l.Equivalent(tc.ol); tc.expSuccess != ok {
+			t.Errorf("%d: expected success? %t; got %t", i, tc.expSuccess, ok)
 		}
 	}
 }
@@ -1030,7 +1030,7 @@ func TestValuePrettyPrint(t *testing.T) {
 		{floatValue, "/FLOAT/6.28"},
 		{timeValue, "/TIME/2016-06-29T16:02:50.000000005Z"},
 		{decimalValue, "/DECIMAL/6.28"},
-		{durationValue, "/DURATION/1m2d3ns"},
+		{durationValue, "/DURATION/1mon2d3ns"},
 		{MakeValueFromBytes([]byte{0x1, 0x2, 0xF, 0xFF}), "/BYTES/01020fff"},
 		{MakeValueFromString("foo"), "/BYTES/foo"},
 		{tupleValue, "/TUPLE/1:1:Int/8/2:3:Bytes/foo"},

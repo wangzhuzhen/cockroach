@@ -65,10 +65,15 @@ type Farmer struct {
 	// state.
 	StateFile string
 	// AddVars are additional Terraform variables to be set during calls to Add.
-	AddVars     map[string]string
+	AddVars map[string]string
+	// AddFlags are additional command-line flags to be passed to the cockroachdb
+	// process.
+	AddFlags    []string
 	KeepCluster string
 	nodes       []node
-	RPCContext  *rpc.Context
+	// RPCContext is used to open an ExternalClient which provides a KV connection
+	// to the cluster by gRPC.
+	RPCContext *rpc.Context
 }
 
 func (f *Farmer) refresh() {
@@ -102,6 +107,25 @@ func (f *Farmer) NumNodes() int {
 	return len(f.nodes)
 }
 
+// AddEnvVar adds an environment variable to supervisord.conf when starting cockroach.
+func (f *Farmer) AddEnvVar(key, value string) {
+	s := fmt.Sprintf("%s=%s", key, value)
+	// This is a Terraform variable defined in acceptance/terraform/variables.tf
+	// and passed through to the supervisor.conf file through
+	// acceptance/terraform/main.tf.
+	const envVar = "cockroach_env"
+	if env := f.AddVars[envVar]; env == "" {
+		f.AddVars[envVar] = s
+	} else {
+		f.AddVars[envVar] += "," + s
+	}
+}
+
+// AddFlag add a command-line flag to include when starting cockroach.
+func (f *Farmer) AddFlag(flagVal string) {
+	f.AddFlags = append(f.AddFlags, flagVal)
+}
+
 // Add provisions the given number of nodes.
 func (f *Farmer) Add(nodes int) error {
 	nodes += f.NumNodes()
@@ -112,19 +136,13 @@ func (f *Farmer) Add(nodes int) error {
 
 	// Disable update checks for test clusters by setting the required environment
 	// variable.
-	const skipCheck = "COCKROACH_SKIP_UPDATE_CHECK=1"
-	// This is a Terraform variable defined in acceptance/terraform/variables.tf
-	// and passed through to the supervisor.conf file through
-	// acceptance/terraform/main.tf.
-	const envVar = "cockroach_env"
-	if env := f.AddVars[envVar]; env == "" {
-		f.AddVars[envVar] = skipCheck
-	} else {
-		f.AddVars[envVar] += "," + skipCheck
-	}
+	f.AddEnvVar("COCKROACH_SKIP_UPDATE_CHECK", "1")
 
 	for v, val := range f.AddVars {
 		args = append(args, fmt.Sprintf(`-var=%s="%s"`, v, val))
+	}
+	if len(f.AddFlags) > 0 {
+		args = append(args, fmt.Sprintf("cockroach_flags=%q", strings.Join(f.AddFlags, " ")))
 	}
 
 	if nodes == 0 {

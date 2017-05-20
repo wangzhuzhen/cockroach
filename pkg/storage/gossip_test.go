@@ -43,7 +43,7 @@ func TestGossipFirstRange(t *testing.T) {
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 		})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	errors := make(chan error)
 	descs := make(chan *roachpb.RangeDescriptor)
@@ -156,10 +156,18 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 
 	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationAuto,
+			// Use manual replication so that we can ensure the range is properly
+			// replicated to all three nodes before stopping one of them.
+			ReplicationMode: base.ReplicationManual,
 			ServerArgs:      serverArgs,
 		})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
+
+	// Ensure that the first range is fully replicated before moving on.
+	firstRangeKey := keys.MinKey
+	if _, err := tc.AddReplicas(firstRangeKey, tc.Target(1), tc.Target(2)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Take down a node other than the first node and replace it with a new one.
 	// Replacing the first node would be better from an adversarial testing
@@ -170,8 +178,11 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 	newServerArgs.Addr = tc.Servers[oldNodeIdx].ServingAddr()
 	newServerArgs.PartOfCluster = true
 	newServerArgs.JoinAddr = tc.Servers[1].ServingAddr()
+	log.Infof(ctx, "stopping server %d", oldNodeIdx)
 	tc.StopServer(oldNodeIdx)
-	tc.AddServer(t, newServerArgs)
+	if err := tc.AddServer(t, newServerArgs); err != nil {
+		t.Fatal(err)
+	}
 	tc.WaitForStores(t, tc.Server(1).Gossip())
 
 	// Ensure that all servers still running are responsive. If the two remaining

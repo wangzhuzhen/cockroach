@@ -41,7 +41,7 @@ func TestDatabaseDescriptor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := createTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
 
 	expectedCounter := int64(keys.MaxReservedDescID + 1)
@@ -92,7 +92,7 @@ func TestDatabaseDescriptor(t *testing.T) {
 	if kvs, err := kvDB.Scan(ctx, start, start.PrefixEnd(), 0); err != nil {
 		t.Fatal(err)
 	} else {
-		migrationDescriptors, err := migrations.AdditionalInitialDescriptors(ctx, kvDB)
+		migrationDescriptors, _, err := migrations.AdditionalInitialDescriptors(ctx, kvDB)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -250,7 +250,6 @@ func verifyTables(
 // correctly filled.
 func TestParallelCreateTables(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("#13504 Test is flaky under stress.")
 
 	// This number has to be around 10 or else testrace will take too long to
 	// finish.
@@ -258,7 +257,7 @@ func TestParallelCreateTables(t *testing.T) {
 	const numberOfNodes = 3
 
 	tc := testcluster.StartTestCluster(t, numberOfNodes, base.TestClusterArgs{})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	if _, err := tc.ServerConn(0).Exec(`CREATE DATABASE "test"`); err != nil {
 		t.Fatal(err)
@@ -311,7 +310,7 @@ func TestParallelCreateConflictingTables(t *testing.T) {
 	const numberOfNodes = 3
 
 	tc := testcluster.StartTestCluster(t, numberOfNodes, base.TestClusterArgs{})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	if _, err := tc.ServerConn(0).Exec(`CREATE DATABASE "test"`); err != nil {
 		t.Fatal(err)

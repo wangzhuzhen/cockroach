@@ -18,12 +18,14 @@
 package distsqlrun
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -258,7 +260,8 @@ type ProducerMetadata struct {
 	// there's consumers out there that extract the error and, if there is one,
 	// forward it in isolation and drop the rest of the record.
 	Ranges []roachpb.RangeInfo
-	Err    error
+	// TODO(vivek): change to type Error
+	Err error
 }
 
 // Empty returns true if none of the fields in metadata are populated.
@@ -601,7 +604,53 @@ func SetFlowRequestTrace(ctx context.Context, req *SetupFlowRequest) error {
 	if sp == nil {
 		return nil
 	}
-	req.TraceContext = &tracing.SpanContextCarrier{}
 	tracer := sp.Tracer()
+	if _, ok := tracer.(opentracing.NoopTracer); ok {
+		return nil
+	}
+	req.TraceContext = &tracing.SpanContextCarrier{}
 	return tracer.Inject(sp.Context(), basictracer.Delegator, req.TraceContext)
+}
+
+// String implements fmt.Stringer.
+func (e *Error) String() string {
+	if err := e.ErrorDetail(); err != nil {
+		return err.Error()
+	}
+	return "<nil>"
+}
+
+// NewError creates an Error from an error, to be sent on the wire. It will
+// recognize certain errors and marshall them accordingly, and everything
+// unrecognized is turned into a PGError with code "internal".
+func NewError(err error) *Error {
+	if pgErr, ok := pgerror.GetPGCause(err); ok {
+		return &Error{Detail: &Error_PGError{PGError: pgErr}}
+	} else if retryErr, ok := err.(*roachpb.UnhandledRetryableError); ok {
+		return &Error{
+			Detail: &Error_RetryableTxnError{
+				RetryableTxnError: retryErr,
+			}}
+	} else {
+		// Anything unrecognized is an "internal error".
+		return &Error{
+			Detail: &Error_PGError{
+				PGError: pgerror.NewError(
+					pgerror.CodeInternalError, err.Error()).(*pgerror.Error)}}
+	}
+}
+
+// ErrorDetail returns the payload as a Go error.
+func (e *Error) ErrorDetail() error {
+	if e == nil {
+		return nil
+	}
+	switch t := e.Detail.(type) {
+	case *Error_PGError:
+		return t.PGError
+	case *Error_RetryableTxnError:
+		return t.RetryableTxnError
+	default:
+		panic(fmt.Sprintf("bad error detail: %+v", t))
+	}
 }

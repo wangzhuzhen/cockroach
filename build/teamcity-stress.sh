@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
+export BUILDER_HIDE_GOPATH_SRC=1
+
 mkdir -p artifacts
 
 exit_status=0
+
+build/builder.sh go install ./pkg/cmd/github-post
+
 build/builder.sh env \
-		 COCKROACH_PROPOSER_EVALUATED_KV="${COCKROACH_PROPOSER_EVALUATED_KV:-false}" \
 		 make stress \
 		 PKG="$PKG" GOFLAGS="${GOFLAGS:-}" TAGS="${TAGS:-}" \
 		 TESTTIMEOUT=30m TESTFLAGS='-test.v' \
@@ -20,7 +24,6 @@ if [ $exit_status -ne 0 ]; then
 		     BUILD_VCS_NUMBER="$BUILD_VCS_NUMBER" \
 		     TC_BUILD_ID="$TC_BUILD_ID" \
 		     TC_SERVER_URL="$TC_SERVER_URL" \
-		     COCKROACH_PROPOSER_EVALUATED_KV="${COCKROACH_PROPOSER_EVALUATED_KV:-false}" \
 		     PKG="$PKG" GOFLAGS="${GOFLAGS:-}" TAGS="${TAGS:-}" \
 		     github-post < artifacts/stress.log
 fi;

@@ -136,6 +136,10 @@ message ConditionalPutResponse {
 message InitPutRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   optional Value value = 2 [(gogoproto.nullable) = false];
+  // NOTE: For internal use only! Set to indicate that the put is
+  // writing to virgin keyspace and no reads are necessary to
+  // rationalize MVCC.
+  optional bool blind = 3 [(gogoproto.nullable) = false];
 }
 
 // A InitPutResponse is the return value from the InitPut() method.
@@ -249,35 +253,6 @@ message CheckConsistencyResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
-// ChangeFrozenRequest idempotently freezes or unfreezes all of the Ranges whose
-// whose StartKey is contained in the specified range.
-// For example with ranges [a,c), [c,g) and [g,z), a request for [b,e) would
-// affect [c,g) only.
-message ChangeFrozenRequest {
-  optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  optional bool frozen = 2 [(gogoproto.nullable) = false];
-  // When freezing, the version all Replicas be running. On mismatch, the Replica
-  // must stall itself as it may already have diverged due to version skew.
-  optional string must_version = 3 [(gogoproto.nullable) = false];
-}
-
-// ChangeFrozenResponse is the return value from the ChangeFrozen() method.
-message ChangeFrozenResponse {
-  optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  // The number of Ranges whose state changed (i.e. from unfrozen to frozen or
-  // vice versa) as a result of the operation.
-  optional int64 ranges_affected = 2 [(gogoproto.nullable) = false];
-  // The StartKey of the first Range (i.e. the one sorting first) encountered
-  // during execution (regardless of whether the command had any effect on that
-  // specific Range).
-  optional bytes min_start_key = 3 [(gogoproto.casttype) = "RKey"];
-  // The StoreIDs to which this request applies (i.e. all StoreIDs which had
-  // a Replica on which the command should execute, even when already
-  // frozen).
-  map<int32, int32> stores = 4 [(gogoproto.nullable) = false,
-      (gogoproto.castkey) = "StoreID", (gogoproto.castvalue) = "NodeID"];
-}
-
 // A BeginTransactionRequest is the argument to the BeginTransaction() method.
 message BeginTransactionRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
@@ -302,6 +277,10 @@ message EndTransactionRequest {
   optional InternalCommitTrigger internal_commit_trigger = 4;
   // List of intents written by the transaction.
   repeated Span intent_spans = 5 [(gogoproto.nullable) = false];
+  // Requires that the transaction completes as a 1 phase commit. This
+  // guarantees that all writes are to the same range and that no
+  // intents are left in the event of an error.
+  optional bool require_1pc = 6 [(gogoproto.nullable) = false, (gogoproto.customname) = "Require1PC"];
 }
 
 // An EndTransactionResponse is the return value from the
@@ -381,6 +360,19 @@ message AdminTransferLeaseRequest {
 }
 
 message AdminTransferLeaseResponse {
+  optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+// An AdminChangeReplicasRequest is the argument to the AdminChangeReplicas()
+// method. A change replicas operation allows adding or removing a set of
+// replicas for a range.
+message AdminChangeReplicasRequest {
+  optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  optional ReplicaChangeType change_type = 2 [(gogoproto.nullable) = false];
+  repeated ReplicationTarget targets = 3 [(gogoproto.nullable) = false];
+}
+
+message AdminChangeReplicasResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
@@ -550,7 +542,8 @@ message QueryTxnRequest {
 // A QueryTxnResponse is the return value from the QueryTxn() method.
 message QueryTxnResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  // Contains the current state of the queried transaction.
+  // Contains the current state of the queried transaction. If the queried
+  // transaction record does not exist, this will be empty.
   optional Transaction queried_txn = 2 [(gogoproto.nullable) = false];
   // Specifies a list of transaction IDs which are waiting on the txn.
   repeated bytes waiting_txns = 3 [(gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"];
@@ -649,7 +642,7 @@ message RequestLeaseRequest {
   optional Lease lease = 2 [(gogoproto.nullable) = false];
   // The previous lease is specified by the caller to verify
   // it has not changed when executing this command.
-  optional Lease prev_lease = 3;
+  optional Lease prev_lease = 3 [(gogoproto.nullable) = false];
 }
 
 // A TransferLeaseRequest represents the arguments to the TransferLease()
@@ -669,7 +662,7 @@ message TransferLeaseRequest {
   optional Lease lease = 2 [(gogoproto.nullable) = false];
   // The previous lease is specified by the caller to verify
   // it has not changed when executing this command.
-  optional Lease prev_lease = 3;
+  optional Lease prev_lease = 3 [(gogoproto.nullable) = false];
 }
 
 // LeaseInfoRequest is the argument to the LeaseInfo() method, for getting
@@ -683,9 +676,8 @@ message LeaseInfoRequest{
 message LeaseInfoResponse{
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // The last lease known by the replica serving the request. It can also be the
-  // tentative future lease, if a lease transfer is in progress. It will be
-  // missing if the replica wasn't aware of any lease.
-  optional Lease lease = 2 [(gogoproto.nullable) = true];
+  // tentative future lease, if a lease transfer is in progress.
+  optional Lease lease = 2 [(gogoproto.nullable) = false];
 }
 
 // A RequestLeaseResponse is the response to a RequestLease() or TransferLease()
@@ -724,12 +716,6 @@ message DeprecatedVerifyChecksumRequest {
 
 message DeprecatedVerifyChecksumResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-}
-
-// KeyRewrite is rule to replace one prefix (if matching) with another.
-message KeyRewrite {
-  optional bytes old_prefix = 1;
-  optional bytes new_prefix = 2;
 }
 
 enum ExportStorageProvider {
@@ -831,15 +817,46 @@ message ImportRequest {
   repeated File files = 2 [(gogoproto.nullable) = false];
   // DataSpan is the pre-rewrite keyrange of the data in `Files`.
   optional Span data_span = 3 [(gogoproto.nullable) = false];
-  // KeyRewrites contains rules to transform keys which will be run on all
-  // imported data. Any kv entry not matching one of these rules will not be
-  // imported.
-  repeated KeyRewrite key_rewrites = 4 [(gogoproto.nullable) = false];
+  reserved 4;
+  message TableRekey {
+    // OldID is the previous ID of `new_desc`.
+    optional uint32 old_id = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "OldID"];
+    // NewDesc is an encoded Descriptor message.
+    optional bytes new_desc = 2;
+  }
+  // Rekeys contains the descriptors for the data being Imported and the
+  // previous ID for each (which is the ID used in the source data pointed to by
+  // `files`).
+  // TODO(dan): This field is a superset of the information represented by
+  // `key_rewrites` and will supercede it once rekeying of interleaved tables is
+  // fixed.
+  repeated TableRekey rekeys = 5 [(gogoproto.nullable) = false];
 }
 
 // ImportResponse is the response to a Import() operation.
 message ImportResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  optional int64 data_size = 2 [(gogoproto.nullable) = false];
+}
+
+// AdminScatterRequest is the argument to the AdminScatter() method, which moves
+// replicas and leaseholders for a selection of ranges. Scatter is best-effort;
+// ranges that cannot be moved will include an error detail in the response and
+// won't fail the request.
+message AdminScatterRequest {
+  optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+// ScatterResponse is the response to a Scatter() operation.
+message AdminScatterResponse {
+  optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+
+  message Range {
+    optional Span span = 1 [(gogoproto.nullable) = false];
+    // Error will be nil if this range was successfully scattered.
+    optional Error error = 2;
+  }
+  repeated Range ranges = 2 [(gogoproto.nullable) = false];
 }
 
 // A RequestUnion contains exactly one of the optional requests.
@@ -867,6 +884,7 @@ message RequestUnion {
   optional AdminSplitRequest admin_split = 10;
   optional AdminMergeRequest admin_merge = 11;
   optional AdminTransferLeaseRequest admin_transfer_lease = 29;
+  optional AdminChangeReplicasRequest admin_change_replicas = 35;
   optional HeartbeatTxnRequest heartbeat_txn = 12;
   optional GCRequest gc = 13;
   optional PushTxnRequest push_txn = 14;
@@ -882,13 +900,14 @@ message RequestUnion {
   optional CheckConsistencyRequest check_consistency = 24;
   optional NoopRequest noop = 25;
   optional InitPutRequest init_put = 26;
-  optional ChangeFrozenRequest change_frozen = 27;
+  reserved 27;
   optional TransferLeaseRequest transfer_lease = 28;
   optional LeaseInfoRequest lease_info = 30;
   optional WriteBatchRequest write_batch = 31;
   optional ExportRequest export = 32;
   optional ImportRequest import = 34;
   optional QueryTxnRequest query_txn = 33;
+  optional AdminScatterRequest admin_scatter = 36;
 }
 
 // A ResponseUnion contains exactly one of the optional responses.
@@ -913,6 +932,7 @@ message ResponseUnion {
   optional AdminSplitResponse admin_split = 10;
   optional AdminMergeResponse admin_merge = 11;
   optional AdminTransferLeaseResponse admin_transfer_lease = 29;
+  optional AdminChangeReplicasResponse admin_change_replicas = 35;
   optional HeartbeatTxnResponse heartbeat_txn = 12;
   optional GCResponse gc = 13;
   optional PushTxnResponse push_txn = 14;
@@ -928,13 +948,14 @@ message ResponseUnion {
   optional CheckConsistencyResponse check_consistency = 24;
   optional NoopResponse noop = 25;
   optional InitPutResponse init_put = 26;
-  optional ChangeFrozenResponse change_frozen = 27;
+  reserved 27;
   reserved 28; // TransferLease and RequestLease both use RequestLeaseResponse
   optional LeaseInfoResponse lease_info = 30;
   optional WriteBatchResponse write_batch = 31;
   optional ExportResponse export = 32;
   optional ImportResponse import = 34;
   optional QueryTxnResponse query_txn = 33;
+  optional AdminScatterResponse admin_scatter = 36;
 }
 
 // A Header is attached to a BatchRequest, encapsulating routing and auxiliary

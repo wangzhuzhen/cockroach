@@ -36,14 +36,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -102,7 +103,7 @@ func debugURL(s serverutils.TestServerInterface) string {
 func TestAdminDebugExpVar(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	jI, err := getJSON(s, debugURL(s)+"vars")
 	if err != nil {
@@ -122,7 +123,7 @@ func TestAdminDebugExpVar(t *testing.T) {
 func TestAdminDebugMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	jI, err := getJSON(s, debugURL(s)+"metrics")
 	if err != nil {
@@ -142,7 +143,7 @@ func TestAdminDebugMetrics(t *testing.T) {
 func TestAdminDebugPprof(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	body, err := getText(s, debugURL(s)+"pprof/block")
 	if err != nil {
@@ -158,7 +159,7 @@ func TestAdminDebugPprof(t *testing.T) {
 func TestAdminDebugTrace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	tc := []struct {
 		segment, search string
@@ -183,7 +184,7 @@ func TestAdminDebugTrace(t *testing.T) {
 func TestAdminDebugRedirect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	expURL := debugURL(s)
 	origURL := expURL + "incorrect"
@@ -223,7 +224,7 @@ func TestAdminDebugRedirect(t *testing.T) {
 func TestAdminAPIDatabases(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
 	ac := log.AmbientContext{Tracer: tracing.NewTracer()}
@@ -318,10 +319,10 @@ func TestAdminAPIDatabases(t *testing.T) {
 func TestAdminAPIDatabaseDoesNotExist(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	const errPattern = "database.+does not exist"
-	if err := getAdminJSONProto(s, "databases/I_DO_NOT_EXIST", nil); !testutils.IsError(err, errPattern) {
+	if err := getAdminJSONProto(s, "databases/i_do_not_exist", nil); !testutils.IsError(err, errPattern) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, errPattern)
 	}
 }
@@ -329,7 +330,7 @@ func TestAdminAPIDatabaseDoesNotExist(t *testing.T) {
 func TestAdminAPIDatabaseVirtual(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	const errPattern = `\\"information_schema\\" is a virtual schema`
 	if err := getAdminJSONProto(s, "databases/information_schema", nil); !testutils.IsError(err, errPattern) {
@@ -340,7 +341,7 @@ func TestAdminAPIDatabaseVirtual(t *testing.T) {
 func TestAdminAPIDatabaseSQLInjection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	const fakedb = "system;DROP DATABASE system;"
 	const path = "databases/" + fakedb
@@ -353,9 +354,9 @@ func TestAdminAPIDatabaseSQLInjection(t *testing.T) {
 func TestAdminAPITableDoesNotExist(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
-	const fakename = "I_DO_NOT_EXIST"
+	const fakename = "i_do_not_exist"
 	const badDBPath = "databases/" + fakename + "/tables/foo"
 	const dbErrPattern = `database \\"` + fakename + `\\" does not exist`
 	if err := getAdminJSONProto(s, badDBPath, nil); !testutils.IsError(err, dbErrPattern) {
@@ -372,7 +373,7 @@ func TestAdminAPITableDoesNotExist(t *testing.T) {
 func TestAdminAPITableVirtual(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	const virtual = "information_schema"
 	const badDBPath = "databases/" + virtual + "/tables/tables"
@@ -385,7 +386,7 @@ func TestAdminAPITableVirtual(t *testing.T) {
 func TestAdminAPITableSQLInjection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	const fakeTable = "users;DROP DATABASE system;"
 	const path = "databases/system/tables/" + fakeTable
@@ -397,150 +398,152 @@ func TestAdminAPITableSQLInjection(t *testing.T) {
 
 func TestAdminAPITableDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	testAdminAPITableDetailsInner(t, "test", "tbl")
-}
 
-func TestAdminAPITableDetailsEscapedNames(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	testAdminAPITableDetailsInner(t, "test test", "tbl tbl")
-}
+	for _, tc := range []struct {
+		name, dbName, tblName string
+	}{
+		{name: "lower", dbName: "test", tblName: "tbl"},
+		{name: "lower with space", dbName: "test test", tblName: "tbl tbl"},
+		{name: "upper", dbName: "TEST", tblName: "TBL"}, // Regression test for issue #14056
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+			defer s.Stopper().Stop(context.TODO())
+			ts := s.(*TestServer)
 
-func testAdminAPITableDetailsInner(t *testing.T, dbName, tblName string) {
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
-	ts := s.(*TestServer)
+			escDBName := parser.Name(tc.dbName).String()
+			escTblName := parser.Name(tc.tblName).String()
 
-	escDBName := parser.Name(dbName).String()
-	escTblName := parser.Name(tblName).String()
+			ac := log.AmbientContext{Tracer: tracing.NewTracer()}
+			ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
+			defer span.Finish()
 
-	ac := log.AmbientContext{Tracer: tracing.NewTracer()}
-	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
-	defer span.Finish()
+			session := sql.NewSession(
+				ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor, nil, &sql.MemoryMetrics{})
+			session.StartUnlimitedMonitor()
+			defer session.Finish(ts.sqlExecutor)
+			setupQueries := []string{
+				fmt.Sprintf("CREATE DATABASE %s", escDBName),
+				fmt.Sprintf(`CREATE TABLE %s.%s (
+							nulls_allowed INT,
+							nulls_not_allowed INT NOT NULL DEFAULT 1000,
+							default2 INT DEFAULT 2,
+							string_default STRING DEFAULT 'default_string'
+						)`, escDBName, escTblName),
+				fmt.Sprintf("GRANT SELECT ON %s.%s TO readonly", escDBName, escTblName),
+				fmt.Sprintf("GRANT SELECT,UPDATE,DELETE ON %s.%s TO app", escDBName, escTblName),
+				fmt.Sprintf("CREATE INDEX descidx ON %s.%s (default2 DESC)", escDBName, escTblName),
+			}
 
-	session := sql.NewSession(
-		ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor, nil, &sql.MemoryMetrics{})
-	session.StartUnlimitedMonitor()
-	defer session.Finish(ts.sqlExecutor)
-	setupQueries := []string{
-		fmt.Sprintf("CREATE DATABASE %s", escDBName),
-		fmt.Sprintf(`CREATE TABLE %s.%s (
-	nulls_allowed INT,
-	nulls_not_allowed INT NOT NULL DEFAULT 1000,
-	default2 INT DEFAULT 2,
-	string_default STRING DEFAULT 'default_string'
-)`, escDBName, escTblName),
-		fmt.Sprintf("GRANT SELECT ON %s.%s TO readonly", escDBName, escTblName),
-		fmt.Sprintf("GRANT SELECT,UPDATE,DELETE ON %s.%s TO app", escDBName, escTblName),
-		fmt.Sprintf("CREATE INDEX descIdx ON %s.%s (default2 DESC)", escDBName, escTblName),
-	}
+			for _, q := range setupQueries {
+				res := ts.sqlExecutor.ExecuteStatements(session, q, nil)
+				defer res.Close(ctx)
+				if res.ResultList[0].Err != nil {
+					t.Fatalf("error executing '%s': %s", q, res.ResultList[0].Err)
+				}
+			}
 
-	for _, q := range setupQueries {
-		res := ts.sqlExecutor.ExecuteStatements(session, q, nil)
-		defer res.Close(ctx)
-		if res.ResultList[0].Err != nil {
-			t.Fatalf("error executing '%s': %s", q, res.ResultList[0].Err)
-		}
-	}
+			// Perform API call.
+			var resp serverpb.TableDetailsResponse
+			url := fmt.Sprintf("databases/%s/tables/%s", tc.dbName, tc.tblName)
+			if err := getAdminJSONProto(s, url, &resp); err != nil {
+				t.Fatal(err)
+			}
 
-	// Perform API call.
-	var resp serverpb.TableDetailsResponse
-	url := fmt.Sprintf("databases/%s/tables/%s", dbName, tblName)
-	if err := getAdminJSONProto(s, url, &resp); err != nil {
-		t.Fatal(err)
-	}
+			// Verify columns.
+			expColumns := []serverpb.TableDetailsResponse_Column{
+				{Name: "nulls_allowed", Type: "INT", Nullable: true, DefaultValue: ""},
+				{Name: "nulls_not_allowed", Type: "INT", Nullable: false, DefaultValue: "1000:::INT"},
+				{Name: "default2", Type: "INT", Nullable: true, DefaultValue: "2:::INT"},
+				{Name: "string_default", Type: "STRING", Nullable: true, DefaultValue: "'default_string':::STRING"},
+			}
+			testutils.SortStructs(expColumns, "Name")
+			testutils.SortStructs(resp.Columns, "Name")
+			if a, e := len(resp.Columns), len(expColumns); a != e {
+				t.Fatalf("# of result columns %d != expected %d (got: %#v)", a, e, resp.Columns)
+			}
+			for i, a := range resp.Columns {
+				e := expColumns[i]
+				if a.String() != e.String() {
+					t.Fatalf("mismatch at column %d: actual %#v != %#v", i, a, e)
+				}
+			}
 
-	// Verify columns.
-	expColumns := []serverpb.TableDetailsResponse_Column{
-		{Name: "nulls_allowed", Type: "INT", Nullable: true, DefaultValue: ""},
-		{Name: "nulls_not_allowed", Type: "INT", Nullable: false, DefaultValue: "1000"},
-		{Name: "default2", Type: "INT", Nullable: true, DefaultValue: "2"},
-		{Name: "string_default", Type: "STRING", Nullable: true, DefaultValue: "'default_string'"},
-	}
-	testutils.SortStructs(expColumns, "Name")
-	testutils.SortStructs(resp.Columns, "Name")
-	if a, e := len(resp.Columns), len(expColumns); a != e {
-		t.Fatalf("# of result columns %d != expected %d (got: %#v)", a, e, resp.Columns)
-	}
-	for i, a := range resp.Columns {
-		e := expColumns[i]
-		if a.String() != e.String() {
-			t.Fatalf("mismatch at column %d: actual %#v != %#v", i, a, e)
-		}
-	}
+			// Verify grants.
+			expGrants := []serverpb.TableDetailsResponse_Grant{
+				{User: security.RootUser, Privileges: []string{"ALL"}},
+				{User: "app", Privileges: []string{"DELETE"}},
+				{User: "app", Privileges: []string{"SELECT"}},
+				{User: "app", Privileges: []string{"UPDATE"}},
+				{User: "readonly", Privileges: []string{"SELECT"}},
+			}
+			testutils.SortStructs(expGrants, "User")
+			testutils.SortStructs(resp.Grants, "User")
+			if a, e := len(resp.Grants), len(expGrants); a != e {
+				t.Fatalf("# of grant columns %d != expected %d (got: %#v)", a, e, resp.Grants)
+			}
+			for i, a := range resp.Grants {
+				e := expGrants[i]
+				sort.Strings(a.Privileges)
+				sort.Strings(e.Privileges)
+				if a.String() != e.String() {
+					t.Fatalf("mismatch at index %d: actual %#v != %#v", i, a, e)
+				}
+			}
 
-	// Verify grants.
-	expGrants := []serverpb.TableDetailsResponse_Grant{
-		{User: security.RootUser, Privileges: []string{"ALL"}},
-		{User: "app", Privileges: []string{"DELETE"}},
-		{User: "app", Privileges: []string{"SELECT"}},
-		{User: "app", Privileges: []string{"UPDATE"}},
-		{User: "readonly", Privileges: []string{"SELECT"}},
-	}
-	testutils.SortStructs(expGrants, "User")
-	testutils.SortStructs(resp.Grants, "User")
-	if a, e := len(resp.Grants), len(expGrants); a != e {
-		t.Fatalf("# of grant columns %d != expected %d (got: %#v)", a, e, resp.Grants)
-	}
-	for i, a := range resp.Grants {
-		e := expGrants[i]
-		sort.Strings(a.Privileges)
-		sort.Strings(e.Privileges)
-		if a.String() != e.String() {
-			t.Fatalf("mismatch at index %d: actual %#v != %#v", i, a, e)
-		}
-	}
+			// Verify indexes.
+			expIndexes := []serverpb.TableDetailsResponse_Index{
+				{Name: "primary", Column: "rowid", Direction: "ASC", Unique: true, Seq: 1},
+				{Name: "descidx", Column: "rowid", Direction: "ASC", Unique: false, Seq: 2, Implicit: true},
+				{Name: "descidx", Column: "default2", Direction: "DESC", Unique: false, Seq: 1},
+			}
+			testutils.SortStructs(expIndexes, "Name", "Seq")
+			testutils.SortStructs(resp.Indexes, "Name", "Seq")
+			for i, a := range resp.Indexes {
+				e := expIndexes[i]
+				if a.String() != e.String() {
+					t.Fatalf("mismatch at index %d: actual %#v != %#v", i, a, e)
+				}
+			}
 
-	// Verify indexes.
-	expIndexes := []serverpb.TableDetailsResponse_Index{
-		{Name: "primary", Column: "rowid", Direction: "ASC", Unique: true, Seq: 1},
-		{Name: "descIdx", Column: "rowid", Direction: "ASC", Unique: false, Seq: 2, Implicit: true},
-		{Name: "descIdx", Column: "default2", Direction: "DESC", Unique: false, Seq: 1},
-	}
-	testutils.SortStructs(expIndexes, "Name", "Seq")
-	testutils.SortStructs(resp.Indexes, "Name", "Seq")
-	for i, a := range resp.Indexes {
-		e := expIndexes[i]
-		if a.String() != e.String() {
-			t.Fatalf("mismatch at index %d: actual %#v != %#v", i, a, e)
-		}
-	}
+			// Verify range count.
+			if a, e := resp.RangeCount, int64(1); a != e {
+				t.Fatalf("# of ranges %d != expected %d", a, e)
+			}
 
-	// Verify range count.
-	if a, e := resp.RangeCount, int64(1); a != e {
-		t.Fatalf("# of ranges %d != expected %d", a, e)
-	}
+			// Verify Create Table Statement.
+			{
 
-	// Verify Create Table Statement.
-	{
+				const createTableCol = "CreateTable"
+				showCreateTableQuery := fmt.Sprintf("SHOW CREATE TABLE %s.%s", escDBName, escTblName)
 
-		const createTableCol = "CreateTable"
-		showCreateTableQuery := fmt.Sprintf("SHOW CREATE TABLE %s.%s", escDBName, escTblName)
+				resSet := ts.sqlExecutor.ExecuteStatements(session, showCreateTableQuery, nil)
+				defer resSet.Close(ctx)
+				res := resSet.ResultList[0]
+				if res.Err != nil {
+					t.Fatalf("error executing '%s': %s", showCreateTableQuery, res.Err)
+				}
 
-		resSet := ts.sqlExecutor.ExecuteStatements(session, showCreateTableQuery, nil)
-		defer resSet.Close(ctx)
-		res := resSet.ResultList[0]
-		if res.Err != nil {
-			t.Fatalf("error executing '%s': %s", showCreateTableQuery, res.Err)
-		}
+				scanner := makeResultScanner(res.Columns)
+				var createStmt string
+				if err := scanner.Scan(res.Rows.At(0), createTableCol, &createStmt); err != nil {
+					t.Fatal(err)
+				}
 
-		scanner := makeResultScanner(res.Columns)
-		var createStmt string
-		if err := scanner.Scan(res.Rows.At(0), createTableCol, &createStmt); err != nil {
-			t.Fatal(err)
-		}
+				if a, e := resp.CreateTableStatement, createStmt; a != e {
+					t.Fatalf("mismatched create table statement; expected %s, got %s", e, a)
+				}
+			}
 
-		if a, e := resp.CreateTableStatement, createStmt; a != e {
-			t.Fatalf("mismatched create table statement; expected %s, got %s", e, a)
-		}
-	}
-
-	// Verify Descriptor ID.
-	path, err := ts.admin.queryDescriptorIDPath(ctx, session, []string{dbName, tblName})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a, e := resp.DescriptorID, int64(path[2]); a != e {
-		t.Fatalf("table had descriptorID %d, expected %d", a, e)
+			// Verify Descriptor ID.
+			path, err := ts.admin.queryDescriptorIDPath(ctx, session, []string{tc.dbName, tc.tblName})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if a, e := resp.DescriptorID, int64(path[2]); a != e {
+				t.Fatalf("table had descriptorID %d, expected %d", a, e)
+			}
+		})
 	}
 }
 
@@ -549,7 +552,7 @@ func testAdminAPITableDetailsInner(t *testing.T, dbName, tblName string) {
 func TestAdminAPIZoneDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
 	// Create database and table.
@@ -659,7 +662,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 func TestAdminAPIUsers(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
 	// Create sample users.
@@ -705,7 +708,7 @@ VALUES ('admin', 'abc'), ('bob', 'xyz')`
 func TestAdminAPIEvents(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
 	ac := log.AmbientContext{Tracer: tracing.NewTracer()}
@@ -731,85 +734,191 @@ func TestAdminAPIEvents(t *testing.T) {
 		}
 	}
 
-	var zeroTimestamp serverpb.EventsResponse_Event_Timestamp
-
 	const allEvents = ""
 	type testcase struct {
 		eventType sql.EventLogType
+		hasLimit  bool
+		limit     int
 		expCount  int
 	}
 	testcases := []testcase{
-		{sql.EventLogNodeJoin, 1},
-		{sql.EventLogNodeRestart, 0},
-		{sql.EventLogDropDatabase, 0},
-		{sql.EventLogCreateDatabase, 1},
-		{sql.EventLogDropTable, 2},
-		{sql.EventLogCreateTable, 3},
+		{sql.EventLogNodeJoin, false, 0, 1},
+		{sql.EventLogNodeRestart, false, 0, 0},
+		{sql.EventLogDropDatabase, false, 0, 0},
+		{sql.EventLogCreateDatabase, false, 0, 1},
+		{sql.EventLogDropTable, false, 0, 2},
+		{sql.EventLogCreateTable, false, 0, 3},
+		{sql.EventLogCreateTable, true, 0, 3},
+		{sql.EventLogCreateTable, true, -1, 3},
+		{sql.EventLogCreateTable, true, 2, 2},
 	}
 	minTotalEvents := 0
 	for _, tc := range testcases {
-		minTotalEvents += tc.expCount
+		if !tc.hasLimit {
+			minTotalEvents += tc.expCount
+		}
 	}
-	testcases = append(testcases, testcase{allEvents, minTotalEvents})
+	testcases = append(testcases, testcase{allEvents, false, 0, minTotalEvents})
 
 	for i, tc := range testcases {
 		url := "events"
 		if tc.eventType != allEvents {
 			url += "?type=" + string(tc.eventType)
-		}
-		var resp serverpb.EventsResponse
-		if err := getAdminJSONProto(s, url, &resp); err != nil {
-			t.Fatal(err)
-		}
-		if tc.eventType == allEvents {
-			// When retrieving all events, we expect that there will be some system
-			// database migrations, unrelated to this test, that add to the log entry
-			// count. So, we do a looser check here.
-			if a, min := len(resp.Events), tc.expCount; a < tc.expCount {
-				t.Fatalf("%d: total # of events %d < min %d", i, a, min)
-			}
-		} else {
-			if a, e := len(resp.Events), tc.expCount; a != e {
-				t.Fatalf("%d: # of %s events %d != expected %d", i, tc.eventType, a, e)
+			if tc.hasLimit {
+				url += fmt.Sprintf("&limit=%d", tc.limit)
 			}
 		}
 
-		// Ensure we don't have blank / nonsensical fields.
-		for _, e := range resp.Events {
-			if e.Timestamp == zeroTimestamp {
-				t.Errorf("%d: missing/empty timestamp", i)
+		t.Run(url, func(t *testing.T) {
+			var resp serverpb.EventsResponse
+			if err := getAdminJSONProto(s, url, &resp); err != nil {
+				t.Fatal(err)
 			}
-
-			if len(tc.eventType) > 0 {
-				if a, e := e.EventType, string(tc.eventType); a != e {
-					t.Errorf("%d: event type %s != expected %s", i, a, e)
+			if tc.eventType == allEvents {
+				// When retrieving all events, we expect that there will be some system
+				// database migrations, unrelated to this test, that add to the log entry
+				// count. So, we do a looser check here.
+				if a, min := len(resp.Events), tc.expCount; a < tc.expCount {
+					t.Fatalf("%d: total # of events %d < min %d", i, a, min)
 				}
 			} else {
-				if len(e.EventType) == 0 {
-					t.Errorf("%d: missing event type in event", i)
+				if a, e := len(resp.Events), tc.expCount; a != e {
+					t.Fatalf("%d: # of %s events %d != expected %d", i, tc.eventType, a, e)
 				}
 			}
 
-			if e.TargetID == 0 {
-				t.Errorf("%d: missing/empty TargetID", i)
+			// Ensure we don't have blank / nonsensical fields.
+			for _, e := range resp.Events {
+				if e.Timestamp == (time.Time{}) {
+					t.Errorf("%d: missing/empty timestamp", i)
+				}
+
+				if len(tc.eventType) > 0 {
+					if a, e := e.EventType, string(tc.eventType); a != e {
+						t.Errorf("%d: event type %s != expected %s", i, a, e)
+					}
+				} else {
+					if len(e.EventType) == 0 {
+						t.Errorf("%d: missing event type in event", i)
+					}
+				}
+
+				if e.TargetID == 0 {
+					t.Errorf("%d: missing/empty TargetID", i)
+				}
+				if e.ReportingID == 0 {
+					t.Errorf("%d: missing/empty ReportingID", i)
+				}
+				if len(e.Info) == 0 {
+					t.Errorf("%d: missing/empty Info", i)
+				}
+				if len(e.UniqueID) == 0 {
+					t.Errorf("%d: missing/empty UniqueID", i)
+				}
 			}
-			if e.ReportingID == 0 {
-				t.Errorf("%d: missing/empty ReportingID", i)
-			}
-			if len(e.Info) == 0 {
-				t.Errorf("%d: missing/empty Info", i)
-			}
-			if len(e.UniqueID) == 0 {
-				t.Errorf("%d: missing/empty UniqueID", i)
-			}
+		})
+	}
+}
+
+const settingKey = "testing.b"
+
+var _ = settings.RegisterBoolSetting(settingKey, "", true)
+
+func TestAdminAPISettings(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	sc := log.Scope(t)
+	defer sc.Close(t)
+
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	allKeys := settings.Keys()
+
+	checkSetting := func(t *testing.T, k string, v serverpb.SettingsResponse_Value) {
+		ref, desc, ok := settings.Lookup(k)
+		if !ok {
+			t.Fatalf("%s: not found after initial lookup", k)
+		}
+		typ := ref.Typ()
+
+		if ref.String() != v.Value {
+			t.Errorf("%s: expected value %s, got %s", k, ref, v.Value)
+		}
+
+		if desc != v.Description {
+			t.Errorf("%s: expected description %s, got %s", k, desc, v.Description)
+		}
+		if typ != v.Type {
+			t.Errorf("%s: expected type %s, got %s", k, typ, v.Type)
 		}
 	}
+
+	t.Run("all", func(t *testing.T) {
+		var resp serverpb.SettingsResponse
+
+		if err := getAdminJSONProto(s, "settings", &resp); err != nil {
+			t.Fatal(err)
+		}
+
+		// Check that all expected keys were returned
+		if len(allKeys) != len(resp.KeyValues) {
+			t.Fatalf("expected %d keys, got %d", len(allKeys), len(resp.KeyValues))
+		}
+		for _, k := range allKeys {
+			if _, ok := resp.KeyValues[k]; !ok {
+				t.Fatalf("expected key %s not found in response", k)
+			}
+		}
+
+		// Check that the test key is listed and the values come indeed
+		// from the settings package unchanged.
+		seenRef := false
+		for k, v := range resp.KeyValues {
+			if k == settingKey {
+				seenRef = true
+				if v.Value != "true" {
+					t.Errorf("%s: expected true, got %s", k, v.Value)
+				}
+			}
+
+			checkSetting(t, k, v)
+		}
+
+		if !seenRef {
+			t.Fatalf("failed to observe test setting %s, got %q", settingKey, resp.KeyValues)
+		}
+	})
+
+	t.Run("one-by-one", func(t *testing.T) {
+		var resp serverpb.SettingsResponse
+
+		// All the settings keys must be retrievable, and their
+		// type and description must match.
+		for _, k := range allKeys {
+			q := make(url.Values)
+			q.Add("keys", k)
+			url := "settings?" + q.Encode()
+			if err := getAdminJSONProto(s, url, &resp); err != nil {
+				t.Fatalf("%s: %v", k, err)
+			}
+			if len(resp.KeyValues) != 1 {
+				t.Fatalf("%s: expected 1 response, got %d", k, len(resp.KeyValues))
+			}
+			v, ok := resp.KeyValues[k]
+			if !ok {
+				t.Fatalf("%s: response does not contain key", k)
+			}
+
+			checkSetting(t, k, v)
+		}
+	})
 }
 
 func TestAdminAPIUIData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	start := timeutil.Now()
 
@@ -847,12 +956,11 @@ func TestAdminAPIUIData(t *testing.T) {
 		// Sanity check LastUpdated.
 		for _, val := range resp.KeyValues {
 			now := timeutil.Now()
-			lastUpdated := time.Unix(val.LastUpdated.Sec, int64(val.LastUpdated.Nsec))
-			if lastUpdated.Before(start) {
-				t.Fatalf("lastUpdated %s < start %s", lastUpdated, start)
+			if val.LastUpdated.Before(start) {
+				t.Fatalf("val.LastUpdated %s < start %s", val.LastUpdated, start)
 			}
-			if lastUpdated.After(now) {
-				t.Fatalf("lastUpdated %s > now %s", lastUpdated, now)
+			if val.LastUpdated.After(now) {
+				t.Fatalf("val.LastUpdated %s > now %s", val.LastUpdated, now)
 			}
 		}
 	}
@@ -913,7 +1021,7 @@ func TestAdminAPIUIData(t *testing.T) {
 func TestClusterAPI(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// We need to retry, because the cluster ID isn't set until after
 	// bootstrapping.
@@ -932,7 +1040,7 @@ func TestClusterAPI(t *testing.T) {
 func TestHealthAPI(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// We need to retry because the node ID isn't set until after
 	// bootstrapping.
@@ -958,40 +1066,46 @@ func TestHealthAPI(t *testing.T) {
 	}
 }
 
-func TestClusterFreeze(t *testing.T) {
+func TestAdminAPIRangeLog(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.Background())
 
-	for _, freeze := range []bool{true, false} {
-		req := serverpb.ClusterFreezeRequest{
-			Freeze: freeze,
+	testCases := []struct {
+		rangeID  int
+		hasLimit bool
+		limit    int
+		expected int
+	}{
+		{1, false, 0, 1},
+		{2, false, 0, 2},
+		{2, true, 0, 2},
+		{2, true, -1, 2},
+		{2, true, 1, 1},
+	}
+
+	for _, tc := range testCases {
+		url := fmt.Sprintf("rangelog/%d", tc.rangeID)
+		if tc.hasLimit {
+			url += fmt.Sprintf("?limit=%d", tc.limit)
 		}
-
-		var resp serverpb.ClusterFreezeResponse
-		cb := func(v proto.Message) {
-			oldNum := resp.RangesAffected
-			resp = *v.(*serverpb.ClusterFreezeResponse)
-			if oldNum > resp.RangesAffected {
-				resp.RangesAffected = oldNum
+		t.Run(url, func(t *testing.T) {
+			var resp serverpb.RangeLogResponse
+			if err := getAdminJSONProto(s, url, &resp); err != nil {
+				t.Fatal(err)
 			}
-		}
 
-		cli, err := s.GetHTTPClient()
-		if err != nil {
-			t.Fatal(err)
-		}
-		path := s.AdminURL() + adminPrefix + "cluster/freeze"
+			if e, a := tc.expected, len(resp.Events); e != a {
+				t.Fatalf("expected %d events, got %d", e, a)
+			}
 
-		if err := httputil.StreamJSON(cli, path, &req, &serverpb.ClusterFreezeResponse{}, cb); err != nil {
-			t.Fatal(err)
-		}
-		if aff := resp.RangesAffected; aff == 0 {
-			t.Fatalf("expected affected ranges: %+v", resp)
-		}
-
-		if err := httputil.StreamJSON(cli, path, &req, &serverpb.ClusterFreezeResponse{}, cb); err != nil {
-			t.Fatal(err)
-		}
+			for _, event := range resp.Events {
+				if event.RangeID != roachpb.RangeID(tc.rangeID) &&
+					event.OtherRangeID != roachpb.RangeID(tc.rangeID) {
+					t.Errorf("expected rangeID or otherRangeID to be r%d, got r%d and r%d",
+						tc.rangeID, event.RangeID, event.OtherRangeID)
+				}
+			}
+		})
 	}
 }

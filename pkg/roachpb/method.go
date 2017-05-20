@@ -65,6 +65,8 @@ const (
 	AdminMerge
 	// AdminTransferLease is called to initiate a range lease transfer.
 	AdminTransferLease
+	// AdminChangeReplicas is called to add or remove replicas for a range.
+	AdminChangeReplicas
 	// HeartbeatTxn sends a periodic heartbeat to extant
 	// transaction rows to indicate the client is still alive and
 	// the transaction should not be considered abandoned.
@@ -122,13 +124,13 @@ const (
 	// an error if the key exists and the existing value is different from the
 	// supplied one.
 	InitPut
-	// ChangeFrozen freezes or unfreezes all Ranges with StartKey in a given
-	// key span.
-	ChangeFrozen
 	// WriteBatch applies the operations encoded in a BatchRepr.
 	WriteBatch
 	// Export dumps a keyrange into files.
 	Export
 	// Import bulk loads key/value entries.
 	Import
+	// AdminScatter moves replicas and leaseholders for a selection of ranges.
+	// Best-effort.
+	AdminScatter
 )

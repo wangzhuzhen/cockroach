@@ -25,10 +25,10 @@ type fmtFlags struct {
 	showTypes        bool
 	ShowTableAliases bool
 	symbolicVars     bool
-	// tableNameNormalizer will be called on all NormalizableTableNames if it is
-	// non-nil. Its results will be used if they are non-nil, or ignored if they
-	// are nil.
-	tableNameNormalizer func(*NormalizableTableName) *TableName
+	hideConstants    bool
+	// tableNameFormatter will be called on all NormalizableTableNames if it is
+	// non-nil.
+	tableNameFormatter func(*NormalizableTableName, *bytes.Buffer, FmtFlags)
 	// indexedVarFormat is an optional interceptor for
 	// IndexedVarContainer.IndexedVarFormat calls; it can be used to
 	// customize the formatting of IndexedVars.
@@ -36,12 +36,16 @@ type fmtFlags struct {
 	// starDatumFormat is an optional interceptor for StarDatum.Format calls,
 	// can be used to customize the formatting of StarDatums.
 	starDatumFormat func(buf *bytes.Buffer, f FmtFlags)
+	// If true, non-function names are replaced by underscores.
+	anonymize bool
 	// If true, strings will be rendered without wrapping quotes if possible.
 	bareStrings bool
 	// If true, datums and placeholders will have type annotations (like
 	// :::interval) as necessary to disambiguate between possible type
 	// resolutions.
 	disambiguateDatumTypes bool
+	// If false, passwords are replaced by *****.
+	showPasswords bool
 }
 
 // FmtFlags enables conditional formatting in the pretty-printer.
@@ -51,14 +55,13 @@ type FmtFlags *fmtFlags
 // a straightforward representation.
 var FmtSimple FmtFlags = &fmtFlags{}
 
+// FmtSimpleWithPasswords instructs the pretty-printer to produce a
+// straightforward representation that does not suppress passwords.
+var FmtSimpleWithPasswords FmtFlags = &fmtFlags{showPasswords: true}
+
 // FmtShowTypes instructs the pretty-printer to
 // annotate expressions with their resolved types.
 var FmtShowTypes FmtFlags = &fmtFlags{showTypes: true}
-
-// FmtSymbolicVars instructs the pretty-printer to
-// print indexedVars using symbolic notation, to
-// disambiguate columns.
-var FmtSymbolicVars FmtFlags = &fmtFlags{symbolicVars: true}
 
 // FmtBareStrings instructs the pretty-printer to print strings without
 // wrapping quotes, if possible.
@@ -69,11 +72,31 @@ var FmtBareStrings FmtFlags = &fmtFlags{bareStrings: true}
 // expressions).
 var FmtParsable FmtFlags = &fmtFlags{disambiguateDatumTypes: true}
 
-// FmtNormalizeTableNames returns FmtFlags that instructs the pretty-printer
-// to normalize all table names using the provided function.
-func FmtNormalizeTableNames(base FmtFlags, fn func(*NormalizableTableName) *TableName) FmtFlags {
+// FmtCheckEquivalence instructs the pretty-printer to produce a representation
+// that can be used to check equivalence of expressions. Specifically:
+//  - IndexedVars are formatted using symbolic notation (to disambiguate
+//    columns).
+//  - datum types are disambiguated with casts. This is necessary because datums
+//    of different types can otherwise be formatted to the same string: (for
+//    example the DDecimal 1 and the DInt 1).
+var FmtCheckEquivalence FmtFlags = &fmtFlags{symbolicVars: true, disambiguateDatumTypes: true}
+
+// FmtHideConstants instructs the pretty-printer to produce a
+// representation that does not disclose query-specific data.
+var FmtHideConstants FmtFlags = &fmtFlags{hideConstants: true}
+
+// FmtAnonymize instructs the pretty-printer to remove
+// any name but function names.
+// TODO(knz): temporary until a better solution is found for #13968
+var FmtAnonymize FmtFlags = &fmtFlags{anonymize: true}
+
+// FmtReformatTableNames returns FmtFlags that instructs the pretty-printer
+// to substitute the printing of table names using the provided function.
+func FmtReformatTableNames(
+	base FmtFlags, fn func(*NormalizableTableName, *bytes.Buffer, FmtFlags),
+) FmtFlags {
 	f := *base
-	f.tableNameNormalizer = fn
+	f.tableNameFormatter = fn
 	return &f
 }
 
@@ -107,8 +130,8 @@ func FmtStarDatumFormat(base FmtFlags, fn func(buf *bytes.Buffer, f FmtFlags)) F
 
 // NodeFormatter is implemented by nodes that can be pretty-printed.
 type NodeFormatter interface {
-	// Format performs pretty-printing towards a bytes buffer. The
-	// flags argument influences the results.
+	// Format performs pretty-printing towards a bytes buffer. The flags argument
+	// influences the results. Most callers should use FormatNode instead.
 	Format(buf *bytes.Buffer, flags FmtFlags)
 }
 
@@ -118,7 +141,7 @@ func FormatNode(buf *bytes.Buffer, f FmtFlags, n NodeFormatter) {
 	if f.showTypes {
 		if te, ok := n.(TypedExpr); ok {
 			buf.WriteByte('(')
-			n.Format(buf, f)
+			formatNodeOrHideConstants(buf, f, n)
 			buf.WriteString(")[")
 			if rt := te.ResolvedType(); rt == nil {
 				// An attempt is made to pretty-print an expression that was
@@ -133,7 +156,7 @@ func FormatNode(buf *bytes.Buffer, f FmtFlags, n NodeFormatter) {
 			return
 		}
 	}
-	n.Format(buf, f)
+	formatNodeOrHideConstants(buf, f, n)
 	if f.disambiguateDatumTypes {
 		var typ Type
 		if d, isDatum := n.(Datum); isDatum {

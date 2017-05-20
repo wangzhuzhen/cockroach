@@ -21,9 +21,9 @@ import (
 	"bytes"
 	"crypto/md5"
 	gosql "database/sql"
-	"errors"
 	"flag"
 	"fmt"
+	"go/build"
 	"io"
 	"net/url"
 	"os"
@@ -39,13 +39,13 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
-
-	"go/build"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/lib/pq"
 )
@@ -89,8 +90,8 @@ import (
 //
 // The Test-Script language is extended here for use with CockroachDB,
 // for example it introduces the "traceon" and "traceoff"
-// directives. See processTestFile() for all supported test
-// directives.
+// directives. See readTestFileConfigs() and processTestFile() for all
+// supported test directives.
 //
 // Test-Script is line-oriented. It supports both statements which
 // generate no result rows, and queries that produce result rows. The
@@ -129,6 +130,14 @@ import (
 //
 // -bigtest   cancels any -d setting and selects all relevant input
 //            files from CockroachDB's fork of Sqllogictest.
+//
+// Configuration:
+//
+// -config name   customizes the test cluster configuration for test
+//                files that lack LogicTest directives; must be one
+//                of `logicTestConfigs`.
+//                Example:
+//                  -config distsql
 //
 // Error mode:
 //
@@ -186,24 +195,85 @@ var (
 	errorRE   = regexp.MustCompile(`^(?:statement|query)\s+error\s+(?:pgcode\s+([[:alnum:]]+)\s+)?(.*)$`)
 
 	// Input selection
-	logictestdata = flag.String("d", "testdata/[^.]*", "test data glob")
-	bigtest       = flag.Bool("bigtest", false, "use the big set of logic test files (overrides testdata)")
+	logictestdata = flag.String("d", "testdata/logic_test/[^.]*", "test data glob")
+	bigtest       = flag.Bool(
+		"bigtest", false, "use the big set of logic test files (overrides testdata)",
+	)
+	defaultConfig = flag.String(
+		"config", "default",
+		"customizes the default test cluster configuration for files that lack LogicTest directives",
+	)
 
 	// Testing mode
-	maxErrs = flag.Int("max-errors", 1,
-		"stop processing input files after this number of errors (set to 0 for no limit)")
-	allowPrepareFail = flag.Bool("allow-prepare-fail", false, "tolerate unexpected errors when preparing a query")
-	flexTypes        = flag.Bool("flex-types", false,
-		"do not fail when a test expects a column of a numeric type but the query provides another type")
+	maxErrs = flag.Int(
+		"max-errors", 1,
+		"stop processing input files after this number of errors (set to 0 for no limit)",
+	)
+	allowPrepareFail = flag.Bool(
+		"allow-prepare-fail", false, "tolerate unexpected errors when preparing a query",
+	)
+	flexTypes = flag.Bool(
+		"flex-types", false,
+		"do not fail when a test expects a column of a numeric type but the query provides another type",
+	)
 
 	// Output parameters
 	showSQL = flag.Bool("show-sql", false,
-		"print the individual SQL statement/queries before processing")
+		"print the individual SQL statement/queries before processing",
+	)
 	printErrorSummary = flag.Bool("error-summary", false,
-		"print a per-error summary of failing queries at the end of testing, when -allow-prepare-fail is set")
+		"print a per-error summary of failing queries at the end of testing, "+
+			"when -allow-prepare-fail is set",
+	)
 	fullMessages = flag.Bool("full-messages", false,
-		"do not shorten the error or SQL strings when printing the summary for -allow-prepare-fail or -flex-types.")
+		"do not shorten the error or SQL strings when printing the summary for -allow-prepare-fail "+
+			"or -flex-types.",
+	)
+	rewriteResultsInTestfiles = flag.Bool(
+		"rewrite-results-in-testfiles", false,
+		"ignore the expected results and rewrite the test files with the actual results from this "+
+			"run. Used to update tests when a change affects many cases; please verify the testfile "+
+			"diffs carefully!",
+	)
 )
+
+type testClusterConfig struct {
+	// name is the name of the config (used for subtest names).
+	name                string
+	numNodes            int
+	useFakeSpanResolver bool
+	// if non-empty, overrides the default distsql mode.
+	overrideDistSQLMode string
+	// if set, any logic statement expected to succeed and parallelizable
+	// using RETURNING NOTHING syntax will be parallelized transparently.
+	// See logicStatement.parallelizeStmts.
+	parallelStmts bool
+}
+
+// logicTestConfigs contains all possible cluster configs. A test file can
+// specify a list of configs they run on in a file-level comment like:
+//   # LogicTest: default distsql
+// The test is run once on each configuration (in different subtests).
+// If no configs are indicated, the default one is used (unless overridden
+// via -config).
+var logicTestConfigs = []testClusterConfig{
+	{name: "default", numNodes: 1, overrideDistSQLMode: "Off"},
+	{name: "parallel-stmts", numNodes: 1, parallelStmts: true, overrideDistSQLMode: "Off"},
+	{name: "distsql", numNodes: 3, useFakeSpanResolver: true, overrideDistSQLMode: "On"},
+	{name: "5node", numNodes: 5, overrideDistSQLMode: "Off"},
+}
+
+// An index in the above slice.
+type logicTestConfigIdx int
+
+func findLogicTestConfig(name string) (logicTestConfigIdx, bool) {
+	for i, cfg := range logicTestConfigs {
+		if cfg.name == name {
+			return logicTestConfigIdx(i), true
+		}
+	}
+	return -1, false
+}
 
 // lineScanner handles reading from input test files.
 type lineScanner struct {
@@ -239,6 +309,30 @@ type logicStatement struct {
 	// expected pgcode for the error, if any. "" indicates the
 	// test does not check the pgwire error code.
 	expectErrCode string
+}
+
+var parallelizableRe = regexp.MustCompile(`^\s*(INSERT|UPSERT|UPDATE|DELETE).*$`)
+
+// parallelizeStmts maps all parallelizable statement types in the logic
+// statement which are not expected to throw an error to their parallelized
+// form. The transformation operates directly on the SQL syntax.
+func (ls *logicStatement) parallelizeStmts() {
+	// If the statement expects an error, we cannot parallelize it blindly
+	// because statement parallelism changes expected error semantics. For
+	// instance, errors seen when executing a parallelized statement may
+	// been reported when executing later statements.
+	if ls.expectErr != "" {
+		return
+	}
+	stmts := strings.Split(ls.sql, ";")
+	for i, stmt := range stmts {
+		// We can opt-in to statement parallelization for any parallelizable
+		// statement type that isn't already RETURNING values.
+		if parallelizableRe.MatchString(stmt) && !strings.Contains(stmt, "RETURNING") {
+			stmts[i] = stmt + " RETURNING NOTHING"
+		}
+	}
+	ls.sql = strings.Join(stmts, "; ")
 }
 
 // logicSorter sorts result rows (or not) depending on Test-Script's
@@ -366,34 +460,6 @@ func partialSort(numCols int, orderedCols []int, values []string) {
 	sortGroup(groupStart, c.numRows)
 }
 
-// Regular expression that matches decimals that have at least a trailing 0
-// after the decimal point.
-var trailingZeroDecimalRE = regexp.MustCompile(`\d*\.\d*0`)
-
-// trimDecimals removes trailing 0s after the decimal point in values that look
-// like decimals. This is a temporary workaround for #13384 (inconsistent
-// decimal precision with DistSQL).
-func trimDecimals(values []string) {
-	for vIdx, s := range values {
-		if trailingZeroDecimalRE.MatchString(s) {
-			i := len(s)
-			for i > 0 && s[i-1] == '0' {
-				i--
-			}
-			if s[i-1] == '.' {
-				// Values like "abc.00" become "abc".
-				i--
-			}
-			if i == 0 {
-				// A value like ".000" becomes "0".
-				values[vIdx] = "0"
-			} else {
-				values[vIdx] = s[:i]
-			}
-		}
-	}
-}
-
 // logicQuery represents a single query test in Test-Script.
 type logicQuery struct {
 	// pos and sql are as in logicStatement.
@@ -405,11 +471,15 @@ type logicQuery struct {
 	colNames bool
 	// some tests require the output to match modulo sorting.
 	sorter logicSorter
-	// if set, we remove trailing 0s from decimal values; see trimDecimals().
-	trimDecimals bool
 	// expectedErr and expectedErrCode are as in logicStatement.
 	expectErr     string
 	expectErrCode string
+
+	// if set, the results are cross-checked against previous queries with the
+	// same label.
+	label string
+
+	checkResults bool
 	// expectedResults indicates the expected sequence of text words
 	// when flattening a query's results.
 	expectedResults []string
@@ -421,6 +491,7 @@ type logicQuery struct {
 	// expectedHash indicates the expected hash of all result rows
 	// combined. "" indicates hash checking is disabled.
 	expectedHash string
+
 	// expectedValues indicates the number of rows expected when
 	// expectedHash is set.
 	expectedValues int
@@ -439,22 +510,19 @@ type logicQuery struct {
 type logicTest struct {
 	t *testing.T
 	// the number of nodes in the cluster.
-	numNodes int
-	// the cluster instantiated for this input file.
 	cluster serverutils.TestClusterInterface
 	// the index of the node (within the cluster) against which we run the test
 	// statements.
-	nodeIdx         int
-	useFakeResolver bool
+	nodeIdx int
 	// map of built clients. Needs to be persisted so that we can
 	// re-use them and close them all on exit.
 	clients map[string]*gosql.DB
 	// client currently in use. This can change during processing
 	// of a test input file when encountering the "user" directive.
 	// see setUser() for details.
-	user            string
-	db              *gosql.DB
-	cleanupRootUser func()
+	user         string
+	db           *gosql.DB
+	cleanupFuncs []func()
 	// progress holds the number of tests executed so far.
 	progress int
 	// failures holds the number of tests failed so far, when
@@ -478,21 +546,27 @@ type logicTest struct {
 	// explanation for labels in processInputFiles().
 	labelMap map[string]string
 
-	// logScope binds the lifetime of the log files to this test.
-	logScope log.TestLogScope
+	rewriteResTestBuf bytes.Buffer
+}
+
+// emit is used for the --generate-testfiles mode; it emits a line of testfile.
+func (t *logicTest) emit(line string) {
+	if *rewriteResultsInTestfiles {
+		t.rewriteResTestBuf.WriteString(line)
+		t.rewriteResTestBuf.WriteString("\n")
+	}
 }
 
 func (t *logicTest) close() {
-	defer t.logScope.Close(t.t)
-
 	t.traceStop()
 
-	if t.cleanupRootUser != nil {
-		t.cleanupRootUser()
-		t.cleanupRootUser = nil
+	for _, cleanup := range t.cleanupFuncs {
+		cleanup()
 	}
+	t.cleanupFuncs = nil
+
 	if t.cluster != nil {
-		t.cluster.Stopper().Stop()
+		t.cluster.Stopper().Stop(context.TODO())
 		t.cluster = nil
 	}
 	if t.clients != nil {
@@ -562,14 +636,12 @@ func (t *logicTest) setUser(user string) func() {
 	t.db = db
 	t.user = user
 
-	t.outf("--- new user: %s", user)
-
 	return cleanupFunc
 }
 
-func (t *logicTest) setup() {
-	t.logScope = log.Scope(t.t, "TestLogic")
-
+func (t *logicTest) setup(
+	numNodes int, useFakeSpanResolver bool, distSQLOverride *settings.EnumSetting,
+) {
 	// TODO(pmattis): Add a flag to make it easy to run the tests against a local
 	// MySQL or Postgres instance.
 	// TODO(andrei): if createTestServerParams() is used here, the command filter
@@ -578,10 +650,14 @@ func (t *logicTest) setup() {
 	// "testdata/rename_table". Figure out what's up with that.
 	params := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
+			// Specify a fixed memory limit (some test cases verify OOM conditions; we
+			// don't want those to take long on large machines).
+			SQLMemoryPoolSize: 128 * 1024 * 1024,
 			Knobs: base.TestingKnobs{
 				SQLExecutor: &sql.ExecutorTestingKnobs{
 					WaitForGossipUpdate:   true,
 					CheckStmtStringChange: true,
+					OverrideDistSQLMode:   distSQLOverride,
 				},
 			},
 		},
@@ -589,15 +665,15 @@ func (t *logicTest) setup() {
 		// matter where the data really is.
 		ReplicationMode: base.ReplicationManual,
 	}
-	t.cluster = serverutils.StartTestCluster(t.t, t.numNodes, params)
-	if t.useFakeResolver {
+	t.cluster = serverutils.StartTestCluster(t.t, numNodes, params)
+	if useFakeSpanResolver {
 		fakeResolver := distsqlutils.FakeResolverForTestCluster(t.cluster)
 		t.cluster.Server(t.nodeIdx).SetDistSQLSpanResolver(fakeResolver)
 	}
 
 	// db may change over the lifetime of this function, with intermediate
 	// values cached in t.clients and finally closed in t.close().
-	t.cleanupRootUser = t.setUser(security.RootUser)
+	t.cleanupFuncs = append(t.cleanupFuncs, t.setUser(security.RootUser))
 
 	if _, err := t.db.Exec(`
 CREATE DATABASE test;
@@ -617,10 +693,59 @@ SET DATABASE = test;
 	t.unsupported = 0
 }
 
-// TODO(tschottdorf): some logic tests currently take a long time to run.
-// Probably a case of heartbeats timing out or many restarts in some tests.
-// Need to investigate when all moving parts are in place.
-func (t *logicTest) processTestFile(path string) error {
+// readTestFileConfigs reads any LogicTest directive at the beginning of a
+// test file. A line that starts with "# LogicTest:" specifies a list of
+// configuration names. The test file is run against each of those
+// configurations.
+//
+// Example:
+//   # LogicTest: default distsql
+//
+// If the file doesn't contain a directive, the default config is returned.
+func readTestFileConfigs(t *testing.T, path string) []logicTestConfigIdx {
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	s := newLineScanner(file)
+	for s.Scan() {
+		fields := strings.Fields(s.Text())
+		if len(fields) == 0 {
+			continue
+		}
+		cmd := fields[0]
+		if !strings.HasPrefix(cmd, "#") {
+			// Stop at the first line that's not a comment (or empty).
+			break
+		}
+		// Directive lines are of the form:
+		// # LogicTest: opt1=val1 opt2=val3 boolopt1
+		if len(fields) > 1 && cmd == "#" && fields[1] == "LogicTest:" {
+			if len(fields) == 2 {
+				t.Fatalf("%s: empty LogicTest directive", path)
+			}
+			var configs []logicTestConfigIdx
+			for _, configName := range fields[2:] {
+				idx, ok := findLogicTestConfig(configName)
+				if !ok {
+					t.Fatalf("%s: unknown config name %s", path, configName)
+				}
+				configs = append(configs, idx)
+			}
+			return configs
+		}
+	}
+	// No directive found, return the default config.
+	idx, ok := findLogicTestConfig(*defaultConfig)
+	if !ok {
+		t.Fatalf("unknown -config %s", *defaultConfig)
+	}
+	return []logicTestConfigIdx{idx}
+}
+
+func (t *logicTest) processTestFile(path string, config testClusterConfig) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -628,10 +753,10 @@ func (t *logicTest) processTestFile(path string) error {
 	defer file.Close()
 	defer t.traceStop()
 
-	if t.verbose {
+	if *showSQL {
 		t.outf("--- queries start here")
-		defer t.printCompletion(path)
 	}
+	defer t.printCompletion(path)
 
 	t.lastProgress = timeutil.Now()
 
@@ -642,8 +767,9 @@ func (t *logicTest) processTestFile(path string) error {
 			t.Fatalf("%s:%d: too many errors encountered, skipping the rest of the input",
 				path, s.line)
 		}
-
-		fields := strings.Fields(s.Text())
+		line := s.Text()
+		t.emit(line)
+		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			continue
 		}
@@ -694,12 +820,16 @@ func (t *logicTest) processTestFile(path string) error {
 			var buf bytes.Buffer
 			for s.Scan() {
 				line := s.Text()
+				t.emit(line)
 				if line == "" {
 					break
 				}
 				fmt.Fprintln(&buf, line)
 			}
 			stmt.sql = strings.TrimSpace(buf.String())
+			if config.parallelStmts {
+				stmt.parallelizeStmts()
+			}
 			if !s.skip {
 				for i := 0; i < repeat; i++ {
 					if ok := t.execStatement(stmt); !ok {
@@ -714,7 +844,6 @@ func (t *logicTest) processTestFile(path string) error {
 
 		case "query":
 			query := logicQuery{pos: fmt.Sprintf("\n%s:%d", path, s.line)}
-			label := ""
 			// Parse "query error <regexp>"
 			if m := errorRE.FindStringSubmatch(s.Text()); m != nil {
 				query.expectErrCode = m[1]
@@ -725,10 +854,12 @@ func (t *logicTest) processTestFile(path string) error {
 				// Parse "query <type-string> <options> <label>"
 				//
 				// The type string specifies the number of columns and their types:
-				//   - T for text
+				//   - T for text; also used for various types which get converted
+				//     to string (arrays, timestamps, etc.).
 				//   - I for integer
 				//   - R for floating point or decimal
 				//   - B for boolean
+				//   - O for oid
 				//
 				// Options are a comma separated strings from the following:
 				//   - "nosort" (default)
@@ -744,15 +875,14 @@ func (t *logicTest) processTestFile(path string) error {
 				//         more information.
 				//   - "colnames": column names are verified (the expected column names
 				//         are the first line in the expected results).
-				//   - "trimdecimals": values that look like decimals have trailing 0s
-				//         removed; temporary workaround for #13384.
 				//
 				// The label is optional. If specified, the test runner stores a hash
 				// of the results of the query under the given label. If the label is
 				// reused, the test runner verifies that the results are the
 				// same. This can be used to verify that two or more queries in the
 				// same test script that are logically equivalent always generate the
-				// same output.
+				// same output. If a label is provided, expected results don't need to
+				// be provided (in which case there should be no ---- separator).
 				query.colTypes = fields[1]
 				if len(fields) >= 3 {
 					query.rawOpts = fields[2]
@@ -794,25 +924,28 @@ func (t *logicTest) processTestFile(path string) error {
 						case "colnames":
 							query.colNames = true
 
-						case "trimdecimals":
-							query.trimDecimals = true
-
 						default:
 							return fmt.Errorf("%s: unknown sort mode: %s", query.pos, opt)
 						}
 					}
 				}
 				if len(fields) >= 4 {
-					label = fields[3]
+					query.label = fields[3]
 				}
 			}
 
 			var buf bytes.Buffer
+			separator := false
 			for s.Scan() {
 				line := s.Text()
+				t.emit(line)
 				if line == "----" {
+					separator = true
 					if query.expectErr != "" {
-						return fmt.Errorf("%s: invalid ---- delimiter after a query expecting an error: %s", query.pos, query.expectErr)
+						return fmt.Errorf(
+							"%s: invalid ---- delimiter after a query expecting an error: %s",
+							query.pos, query.expectErr,
+						)
 					}
 					break
 				}
@@ -823,7 +956,8 @@ func (t *logicTest) processTestFile(path string) error {
 			}
 			query.sql = strings.TrimSpace(buf.String())
 
-			if query.expectErr == "" {
+			query.checkResults = true
+			if separator {
 				// Query results are either a space separated list of values up to a
 				// blank line or a line of the form "xx values hashing to yyy". The
 				// latter format is used by sqllogictest when a large number of results
@@ -836,6 +970,7 @@ func (t *logicTest) processTestFile(path string) error {
 							return err
 						}
 						query.expectedHash = m[2]
+						query.checkResults = false
 					} else {
 						for {
 							query.expectedResultsRaw = append(query.expectedResultsRaw, s.Text())
@@ -850,27 +985,11 @@ func (t *logicTest) processTestFile(path string) error {
 						}
 						query.expectedValues = len(query.expectedResults)
 					}
-
-					if label != "" {
-						expectedHash := query.expectedHash
-						if expectedHash == "" {
-							hash, err := t.hashResults(query.expectedResults)
-							if err != nil {
-								t.Error(err)
-								continue
-							}
-							expectedHash = hash
-						}
-						if prevHash, ok := t.labelMap[label]; ok {
-							if prevHash != expectedHash {
-								t.Errorf("%s: error in input: previous reference values for label %s (hash %s) do not match new definition (hash %s)", query.pos, label, prevHash, expectedHash)
-								continue
-							}
-						} else {
-							t.labelMap[label] = expectedHash
-						}
-					}
 				}
+			} else if query.label != "" {
+				// Label and no separator; we won't be directly checking results; we
+				// cross-check results between all queries with the same label.
+				query.checkResults = false
 			}
 
 			if !s.skip {
@@ -957,7 +1076,28 @@ func (t *logicTest) processTestFile(path string) error {
 		}
 	}
 
-	return s.Err()
+	if err := s.Err(); err != nil {
+		return err
+	}
+
+	if *rewriteResultsInTestfiles && !t.t.Failed() {
+		// Rewrite the test file.
+		file.Close()
+		file, err := os.Create(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		// Remove any trailing blank line.
+		data := t.rewriteResTestBuf.String()
+		if l := len(data); l > 2 && data[l-1] == '\n' && data[l-2] == '\n' {
+			data = data[:l-1]
+		}
+
+		fmt.Fprint(file, data)
+	}
+
+	return nil
 }
 
 // verifyError checks that either no error was found where none was
@@ -1169,9 +1309,9 @@ func (t *logicTest) execQuery(query logicQuery) error {
 		query.sorter(len(cols), query.expectedResults)
 	}
 
-	if query.trimDecimals {
-		trimDecimals(results)
-		trimDecimals(query.expectedResults)
+	hash, err := t.hashResults(results)
+	if err != nil {
+		return err
 	}
 
 	if query.expectedHash != "" {
@@ -1179,14 +1319,50 @@ func (t *logicTest) execQuery(query logicQuery) error {
 		if query.expectedValues != n {
 			return fmt.Errorf("%s: expected %d results, but found %d", query.pos, query.expectedValues, n)
 		}
-		hash, err := t.hashResults(results)
-		if err != nil {
-			return err
-		}
 		if query.expectedHash != hash {
 			return fmt.Errorf("%s: expected %s, but found %s", query.pos, query.expectedHash, hash)
 		}
-	} else if !reflect.DeepEqual(query.expectedResults, results) {
+	}
+
+	if *rewriteResultsInTestfiles {
+		if query.expectedHash != "" {
+			if query.expectedValues == 1 {
+				t.emit(fmt.Sprintf("1 value hashing to %s", query.expectedHash))
+			} else {
+				t.emit(fmt.Sprintf("%d values hashing to %s", query.expectedValues, query.expectedHash))
+			}
+		}
+
+		if query.checkResults {
+			// If the results match, emit them the way they were originally
+			// formatted/ordered in the testfile. Otherwise, emit the actual results.
+			if reflect.DeepEqual(query.expectedResults, results) {
+				for _, l := range query.expectedResultsRaw {
+					t.emit(l)
+				}
+			} else {
+				// Emit the actual results.
+				var buf bytes.Buffer
+				tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
+
+				for _, resultLine := range resultLines {
+					for _, value := range resultLine {
+						fmt.Fprintf(tw, "%s\t", value)
+					}
+					fmt.Fprint(tw, "\n")
+				}
+				_ = tw.Flush()
+				// Split into lines and trim any trailing whitespace.
+				// Note that the last line will be empty (which is what we want).
+				for _, s := range strings.Split(buf.String(), "\n") {
+					t.emit(strings.TrimRight(s, " "))
+				}
+			}
+		}
+		return nil
+	}
+
+	if query.checkResults && !reflect.DeepEqual(query.expectedResults, results) {
 		var buf bytes.Buffer
 		tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
 
@@ -1214,6 +1390,16 @@ func (t *logicTest) execQuery(query logicQuery) error {
 		return errors.New(buf.String())
 	}
 
+	if query.label != "" {
+		if prevHash, ok := t.labelMap[query.label]; ok && prevHash != hash {
+			t.Errorf(
+				"%s: error in input: previous values for label %s (hash %s) do not match (hash %s)",
+				query.pos, query.label, prevHash, hash,
+			)
+		}
+		t.labelMap[query.label] = hash
+	}
+
 	t.finishOne("OK")
 	return nil
 }
@@ -1227,21 +1413,30 @@ func (t *logicTest) success(file string) {
 	}
 }
 
-func makeLogicTest(t *testing.T, numNodes int, useFakeSpanResolver bool) *logicTest {
-	return &logicTest{
-		t:               t,
-		numNodes:        numNodes,
-		useFakeResolver: true,
-		verbose:         testing.Verbose() || log.V(1),
-		perErrorSummary: make(map[string][]string),
+func (t *logicTest) runFile(path string, config testClusterConfig) {
+	defer t.close()
+
+	defer func() {
+		if r := recover(); r != nil {
+			// Translate panics during the test to test errors.
+			t.Fatalf("panic: %v\n%s", r, string(debug.Stack()))
+		}
+	}()
+
+	if err := t.processTestFile(path, config); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// run runs the logic tests indicated by the bigtest and logictestdata flags.
-// A new cluster is set up for each separate file in the test.
-// This function must be called from within the testing.T associated with the
-// logicTest.
-func (t *logicTest) run() {
+func TestLogic(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	if testutils.Stress() {
+		t.Skip()
+	}
+
+	// run the logic tests indicated by the bigtest and logictestdata flags.
+	// A new cluster is set up for each separate file in the test.
 	var globs []string
 	if *bigtest {
 		logicTestPath := build.Default.GOPATH + "/src/github.com/cockroachdb/sqllogictest"
@@ -1295,81 +1490,97 @@ func (t *logicTest) run() {
 		t.Fatalf("No testfiles found (globs: %v)", globs)
 	}
 
-	total := 0
-	totalFail := 0
-	totalUnsupported := 0
-	lastProgress := timeutil.Now()
-	if *printErrorSummary {
-		defer t.printErrorSummary()
+	// We want to collect SQL per-statement statistics in tests,
+	// regardless of what the environment / config says.
+	defer settings.TestingSetBool(&sql.StmtStatsEnable, true)()
+
+	// mu protects the following vars, which all get updated from within the
+	// possibly parallel subtests.
+	var progress = struct {
+		syncutil.Mutex
+		total, totalFail, totalUnsupported int
+		lastProgress                       time.Time
+	}{
+		lastProgress: timeutil.Now(),
 	}
-	topLevelTest := t.t
+
+	// Read the configuration directives from all the files and accumulate a list
+	// of paths per config.
+	configPaths := make([][]string, len(logicTestConfigs))
+
 	for _, path := range paths {
-		topLevelTest.Run(path, func(tst *testing.T) {
-			// Rebind t.t for the duration of this test, since the framework will
-			// pass us a different testing.T than what we started with.
-			t.t = tst
-			defer t.close()
-			t.setup()
-
-			defer func() {
-				if r := recover(); r != nil {
-					// Translate panics during the test to test errors.
-					t.Fatalf("panic: %v\n%s", r, string(debug.Stack()))
-				}
-			}()
-
-			if err := t.processTestFile(path); err != nil {
-				t.Fatal(err)
-			}
-		})
-
-		total += t.progress
-		totalFail += t.failures
-		totalUnsupported += t.unsupported
-		now := timeutil.Now()
-		if now.Sub(lastProgress) >= 2*time.Second {
-			lastProgress = now
-			t.outf("--- total progress: %d statements/queries", total)
+		for _, idx := range readTestFileConfigs(t, path) {
+			configPaths[idx] = append(configPaths[idx], path)
 		}
 	}
 
+	// The tests below are likely to run concurrently; `log` is shared
+	// between all the goroutines and thus all tests, so it doesn't make
+	// sense to try to use separate `log.Scope` instances for each test.
+	logScope := log.Scope(t)
+	defer logScope.Close(t)
+
+	verbose := testing.Verbose() || log.V(1)
+	for idx, cfg := range logicTestConfigs {
+		paths := configPaths[idx]
+		if len(paths) == 0 {
+			continue
+		}
+		// Top-level test: one per test configuration.
+		t.Run(cfg.name, func(t *testing.T) {
+			for _, path := range paths {
+				path := path // Rebind range variable.
+				// Inner test: one per file path.
+				t.Run(filepath.Base(path), func(t *testing.T) {
+					if !*showSQL && !*rewriteResultsInTestfiles {
+						// If we're not printing out all of the SQL interactions and we're
+						// not generating testfiles, run the tests in parallel.
+						// Skip parallelizing tests that use the kv-batch-size directive since
+						// the batch size is a global variable.
+						// TODO(jordan, radu): make sqlbase.kvBatchSize non-global to fix this.
+						if filepath.Base(path) != "select_index_span_ranges" {
+							t.Parallel()
+						}
+					}
+					lt := logicTest{
+						t:               t,
+						verbose:         verbose,
+						perErrorSummary: make(map[string][]string),
+					}
+					if *printErrorSummary {
+						defer lt.printErrorSummary()
+					}
+					var distSQLOverrideEnum *settings.EnumSetting
+					if cfg.overrideDistSQLMode != "" {
+						distSQLOverrideEnum = &settings.EnumSetting{}
+						settings.TestingSetEnum(&distSQLOverrideEnum, int64(sql.DistSQLExecModeFromString(cfg.overrideDistSQLMode)))
+					}
+					lt.setup(cfg.numNodes, cfg.useFakeSpanResolver, distSQLOverrideEnum)
+					lt.runFile(path, cfg)
+
+					progress.Lock()
+					defer progress.Unlock()
+					progress.total += lt.progress
+					progress.totalFail += lt.failures
+					progress.totalUnsupported += lt.unsupported
+					now := timeutil.Now()
+					if now.Sub(progress.lastProgress) >= 2*time.Second {
+						progress.lastProgress = now
+						lt.outf("--- total progress: %d statements/queries", progress.total)
+					}
+				})
+			}
+		})
+	}
+
 	unsupportedMsg := ""
-	if totalUnsupported > 0 {
-		unsupportedMsg = fmt.Sprintf(", ignored %d unsupported queries", totalUnsupported)
+	if progress.totalUnsupported > 0 {
+		unsupportedMsg = fmt.Sprintf(", ignored %d unsupported queries", progress.totalUnsupported)
 	}
 
-	t.outf("--- total: %d tests, %d failures%s", total, totalFail, unsupportedMsg)
-}
-
-func TestLogic(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	if testutils.Stress() {
-		t.Skip()
+	if verbose {
+		fmt.Printf("--- total: %d tests, %d failures%s\n", progress.total, progress.totalFail, unsupportedMsg)
 	}
-
-	l := makeLogicTest(t, 1 /* numNodes */, false /* useFakeSpanResolver */)
-	l.run()
-}
-
-// TestLogicDistSQL is a variant of TestLogic that uses DistSQL for all
-// supported queries.
-func TestLogicDistSQL(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	if testing.Short() {
-		t.Skip("short flag")
-	}
-
-	if testutils.Stress() {
-		t.Skip()
-	}
-
-	defer sql.SetDefaultDistSQLMode("ON")()
-
-	// TODO(radu): make this run on 3 nodes (#13377)
-	l := makeLogicTest(t, 3 /* numNodes */, true /* useFakeSpanResolver */)
-	l.run()
 }
 
 type errorSummaryEntry struct {

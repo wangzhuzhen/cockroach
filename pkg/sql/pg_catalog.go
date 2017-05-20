@@ -38,7 +38,7 @@ import (
 
 var (
 	oidZero   = parser.NewDOid(0)
-	zeroVal   = parser.NewDInt(0)
+	zeroVal   = parser.DZero
 	negOneVal = parser.NewDInt(-1)
 )
 
@@ -504,7 +504,7 @@ CREATE TABLE pg_catalog.pg_constraint (
 				case sqlbase.ConstraintTypeCheck:
 					oid = h.CheckConstraintOid(db, table, c.CheckConstraint)
 					contype = conTypeCheck
-					// TODO(nvanbenschoten) We currently do not store the referenced columns for a check
+					// TODO(nvanbenschoten): We currently do not store the referenced columns for a check
 					// constraint. We should add an array of column indexes to
 					// sqlbase.TableDescriptor_CheckConstraint and use that here.
 					consrc = parser.NewDString(c.Details)
@@ -661,12 +661,14 @@ CREATE TABLE pg_catalog.pg_depend (
 `,
 	populate: func(ctx context.Context, p *planner, addRow func(...parser.Datum) error) error {
 		h := makeOidHasher()
-		db, err := p.getDatabaseDesc(ctx, pgCatalogName)
+		db, err := getDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), pgCatalogName)
 		if err != nil {
 			return errors.New("could not find pg_catalog")
 		}
-		pgConstraintDesc, err := p.getTableDesc(
+		pgConstraintDesc, err := getTableDesc(
 			ctx,
+			p.txn,
+			p.getVirtualTabler(),
 			&parser.TableName{
 				DatabaseName: pgCatalogName,
 				TableName:    "pg_constraint"},
@@ -676,8 +678,10 @@ CREATE TABLE pg_catalog.pg_depend (
 		}
 		pgConstraintTableOid := h.TableOid(db, pgConstraintDesc)
 
-		pgClassDesc, err := p.getTableDesc(
+		pgClassDesc, err := getTableDesc(
 			ctx,
+			p.txn,
+			p.getVirtualTabler(),
 			&parser.TableName{
 				DatabaseName: pgCatalogName,
 				TableName:    "pg_class"},
@@ -1072,7 +1076,7 @@ CREATE TABLE pg_catalog.pg_proc (
 `,
 	populate: func(ctx context.Context, p *planner, addRow func(...parser.Datum) error) error {
 		h := makeOidHasher()
-		dbDesc, err := p.getDatabaseDesc(ctx, pgCatalogName)
+		dbDesc, err := getDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), pgCatalogName)
 		if err != nil {
 			return err
 		}
@@ -1278,7 +1282,7 @@ CREATE TABLE pg_catalog.pg_settings (
 	populate: func(_ context.Context, p *planner, addRow func(...parser.Datum) error) error {
 		for _, vName := range varNames {
 			gen := varGen[vName]
-			value := gen(p)
+			value := gen.Get(p)
 			valueDatum := parser.NewDString(value)
 			if err := addRow(
 				parser.NewDString(strings.ToLower(vName)), // name
@@ -1383,10 +1387,6 @@ var (
 	_ = typCategoryUnknown
 
 	typDelim = parser.NewDString(",")
-
-	arrayInProcName = "array_in"
-	arrayInProcOid  = makeOidHasher().BuiltinOid(
-		arrayInProcName, &parser.Builtins[arrayInProcName][0]).(*parser.DOid).AsRegProc(arrayInProcName)
 )
 
 // See: https://www.postgresql.org/docs/9.6/static/catalog-pg-type.html.
@@ -1428,27 +1428,35 @@ CREATE TABLE pg_catalog.pg_type (
 `,
 	populate: func(_ context.Context, p *planner, addRow func(...parser.Datum) error) error {
 		h := makeOidHasher()
-		for oid, typ := range parser.OidToType {
+		for o, typ := range parser.OidToType {
 			cat := typCategory(typ)
-			typInput := oidZero
 			typElem := oidZero
+			builtinPrefix := parser.PGIOBuiltinPrefix(typ)
 			if cat == typCategoryArray {
-				typInput = arrayInProcOid
-				typElem = parser.NewDOid(parser.DInt(parser.UnwrapType(typ).(parser.TArray).Typ.Oid()))
+				if typ == parser.TypeIntVector {
+					// IntVector needs a special case because its a special snowflake
+					// type. It's just like an Int2Array, but it has its own OID. We
+					// can't just wrap our Int2Array type in an OID wrapper, though,
+					// because Int2Array is not an exported, first-class type - it's an
+					// input-only type that translates immediately to int8array. This
+					// would go away if we decided to export Int2Array as a real type.
+					typElem = parser.NewDOid(parser.DInt(oid.T_int2))
+				} else {
+					builtinPrefix = "array_"
+					typElem = parser.NewDOid(parser.DInt(parser.UnwrapType(typ).(parser.TArray).Typ.Oid()))
+				}
 			}
-			typname := typ.String()
-			if n, ok := aliasedOidToName[oid]; ok {
-				typname = n
-			}
+			typname := parser.PGDisplayName(typ)
+
 			if err := addRow(
-				parser.NewDOid(parser.DInt(oid)), // oid
-				parser.NewDName(typname),         // typname
-				pgNamespacePGCatalog.Oid,         // typnamespace
-				parser.DNull,                     // typowner
-				typLen(typ),                      // typlen
-				typByVal(typ),                    // typbyval
-				typTypeBase,                      // typtype
-				cat,                              // typcategory
+				parser.NewDOid(parser.DInt(o)), // oid
+				parser.NewDName(typname),       // typname
+				pgNamespacePGCatalog.Oid,       // typnamespace
+				parser.DNull,                   // typowner
+				typLen(typ),                    // typlen
+				typByVal(typ),                  // typbyval
+				typTypeBase,                    // typtype
+				cat,                            // typcategory
 				parser.MakeDBool(false), // typispreferred
 				parser.MakeDBool(true),  // typisdefined
 				typDelim,                // typdelim
@@ -1457,13 +1465,13 @@ CREATE TABLE pg_catalog.pg_type (
 				oidZero,                 // typarray
 
 				// regproc references
-				typInput, // typinput
-				oidZero,  // typoutput
-				oidZero,  // typreceive
-				oidZero,  // typsend
-				oidZero,  // typmodin
-				oidZero,  // typmodout
-				oidZero,  // typanalyze
+				h.RegProc(builtinPrefix+"in"),   // typinput
+				h.RegProc(builtinPrefix+"out"),  // typoutput
+				h.RegProc(builtinPrefix+"recv"), // typreceive
+				h.RegProc(builtinPrefix+"send"), // typsend
+				oidZero, // typmodin
+				oidZero, // typmodout
+				oidZero, // typanalyze
 
 				parser.DNull,            // typalign
 				parser.DNull,            // typstorage
@@ -1481,26 +1489,6 @@ CREATE TABLE pg_catalog.pg_type (
 		}
 		return nil
 	},
-}
-
-// aliasedOidToName maps Postgres object IDs to type names for those OIDs that map to
-// Cockroach types that have more than one associated OID, like Int. The name
-// for these OIDs will override the type name of the corresponding type when
-// looking up the display name for an OID.
-var aliasedOidToName = map[oid.Oid]string{
-	oid.T_float4:     "float4",
-	oid.T_float8:     "float8",
-	oid.T_int2:       "int2",
-	oid.T_int4:       "int4",
-	oid.T_int8:       "int8",
-	oid.T_int2vector: "int2vector",
-	oid.T_text:       "text",
-	oid.T_varchar:    "varchar",
-	oid.T_numeric:    "numeric",
-	oid.T__int2:      "int2[]",
-	oid.T__int4:      "int4[]",
-	oid.T__int8:      "int8[]",
-	oid.T__text:      "text[]",
 }
 
 // typOid is the only OID generation approach that does not use oidHasher, because
@@ -1662,7 +1650,7 @@ func (h oidHasher) writeTypeTag(tag oidTypeTag) {
 	h.writeUInt8(uint8(tag))
 }
 
-func (h oidHasher) getOid() parser.Datum {
+func (h oidHasher) getOid() *parser.DOid {
 	i := h.h.Sum32()
 	h.h.Reset()
 	return parser.NewDOid(parser.DInt(i))
@@ -1698,13 +1686,13 @@ func (h oidHasher) writeForeignKeyReference(fk *sqlbase.ForeignKeyReference) {
 	h.writeStr(fk.Name)
 }
 
-func (h oidHasher) NamespaceOid(namespace string) parser.Datum {
+func (h oidHasher) NamespaceOid(namespace string) *parser.DOid {
 	h.writeTypeTag(namespaceTypeTag)
 	h.writeStr(namespace)
 	return h.getOid()
 }
 
-func (h oidHasher) DBOid(db *sqlbase.DatabaseDescriptor) parser.Datum {
+func (h oidHasher) DBOid(db *sqlbase.DatabaseDescriptor) *parser.DOid {
 	h.writeTypeTag(databaseTypeTag)
 	h.writeDB(db)
 	return h.getOid()
@@ -1712,7 +1700,7 @@ func (h oidHasher) DBOid(db *sqlbase.DatabaseDescriptor) parser.Datum {
 
 func (h oidHasher) TableOid(
 	db *sqlbase.DatabaseDescriptor, table *sqlbase.TableDescriptor,
-) parser.Datum {
+) *parser.DOid {
 	h.writeTypeTag(tableTypeTag)
 	h.writeDB(db)
 	h.writeTable(table)
@@ -1721,7 +1709,7 @@ func (h oidHasher) TableOid(
 
 func (h oidHasher) IndexOid(
 	db *sqlbase.DatabaseDescriptor, table *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor,
-) parser.Datum {
+) *parser.DOid {
 	h.writeTypeTag(indexTypeTag)
 	h.writeDB(db)
 	h.writeTable(table)
@@ -1731,7 +1719,7 @@ func (h oidHasher) IndexOid(
 
 func (h oidHasher) ColumnOid(
 	db *sqlbase.DatabaseDescriptor, table *sqlbase.TableDescriptor, column *sqlbase.ColumnDescriptor,
-) parser.Datum {
+) *parser.DOid {
 	h.writeTypeTag(columnTypeTag)
 	h.writeDB(db)
 	h.writeTable(table)
@@ -1743,7 +1731,7 @@ func (h oidHasher) CheckConstraintOid(
 	db *sqlbase.DatabaseDescriptor,
 	table *sqlbase.TableDescriptor,
 	check *sqlbase.TableDescriptor_CheckConstraint,
-) parser.Datum {
+) *parser.DOid {
 	h.writeTypeTag(checkConstraintTypeTag)
 	h.writeDB(db)
 	h.writeTable(table)
@@ -1753,7 +1741,7 @@ func (h oidHasher) CheckConstraintOid(
 
 func (h oidHasher) PrimaryKeyConstraintOid(
 	db *sqlbase.DatabaseDescriptor, table *sqlbase.TableDescriptor, pkey *sqlbase.IndexDescriptor,
-) parser.Datum {
+) *parser.DOid {
 	h.writeTypeTag(pKeyConstraintTypeTag)
 	h.writeDB(db)
 	h.writeTable(table)
@@ -1763,7 +1751,7 @@ func (h oidHasher) PrimaryKeyConstraintOid(
 
 func (h oidHasher) ForeignKeyConstraintOid(
 	db *sqlbase.DatabaseDescriptor, table *sqlbase.TableDescriptor, fk *sqlbase.ForeignKeyReference,
-) parser.Datum {
+) *parser.DOid {
 	h.writeTypeTag(fkConstraintTypeTag)
 	h.writeDB(db)
 	h.writeTable(table)
@@ -1773,7 +1761,7 @@ func (h oidHasher) ForeignKeyConstraintOid(
 
 func (h oidHasher) UniqueConstraintOid(
 	db *sqlbase.DatabaseDescriptor, table *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor,
-) parser.Datum {
+) *parser.DOid {
 	h.writeTypeTag(uniqueConstraintTypeTag)
 	h.writeDB(db)
 	h.writeTable(table)
@@ -1781,20 +1769,28 @@ func (h oidHasher) UniqueConstraintOid(
 	return h.getOid()
 }
 
-func (h oidHasher) BuiltinOid(name string, builtin *parser.Builtin) parser.Datum {
+func (h oidHasher) BuiltinOid(name string, builtin *parser.Builtin) *parser.DOid {
 	h.writeTypeTag(functionTypeTag)
 	h.writeStr(name)
 	h.writeStr(builtin.Types.String())
 	return h.getOid()
 }
 
-func (h oidHasher) UserOid(username string) parser.Datum {
+func (h oidHasher) RegProc(name string) parser.Datum {
+	builtin, ok := parser.Builtins[name]
+	if !ok {
+		return parser.DNull
+	}
+	return h.BuiltinOid(name, &builtin[0]).AsRegProc(name)
+}
+
+func (h oidHasher) UserOid(username string) *parser.DOid {
 	h.writeTypeTag(userTypeTag)
 	h.writeStr(username)
 	return h.getOid()
 }
 
-func (h oidHasher) CollationOid(collation string) parser.Datum {
+func (h oidHasher) CollationOid(collation string) *parser.DOid {
 	h.writeTypeTag(collationTypeTag)
 	h.writeStr(collation)
 	return h.getOid()

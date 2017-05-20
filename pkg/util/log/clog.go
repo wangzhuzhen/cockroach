@@ -34,7 +34,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
@@ -87,7 +86,7 @@ func (s *Severity) Set(value string) error {
 		}
 		threshold = Severity(v)
 	}
-	logging.stderrThreshold.set(threshold)
+	s.set(threshold)
 	return nil
 }
 
@@ -138,24 +137,6 @@ var colorProfile256 = &colorProfile{
 	warnPrefix:  []byte("\033[38;5;214m"),
 	errorPrefix: []byte("\033[38;5;160m"),
 	timePrefix:  []byte("\033[38;5;246m"),
-}
-
-// OutputStats tracks the number of output lines and bytes written.
-type outputStats struct {
-	lines int64
-	bytes int64
-}
-
-// Stats tracks the number of lines of output and number of bytes
-// per severity level. Values must be read with atomic.LoadInt64.
-var Stats struct {
-	Info, Warning, Error outputStats
-}
-
-var severityStats = [Severity_NONE]*outputStats{
-	Severity_INFO:    &Stats.Info,
-	Severity_WARNING: &Stats.Warning,
-	Severity_ERROR:   &Stats.Error,
 }
 
 // Level is exported because it appears in the arguments to V and is
@@ -343,14 +324,18 @@ func (t *traceLocation) Set(value string) error {
 	return nil
 }
 
+// We don't include a capture group for the log message here, just for the
+// preamble, because a capture group that handles multiline messages is very
+// slow when running on the large buffers passed to EntryDecoder.split.
 var entryRE = regexp.MustCompile(
-	`(?m)^([IWEF])(\d{6} \d{2}:\d{2}:\d{2}.\d{6}) (?:(\d+) )?([^:]+):(\d+)  (.*)`)
+	`(?m)^([IWEF])(\d{6} \d{2}:\d{2}:\d{2}.\d{6}) (?:(\d+) )?([^:]+):(\d+)`)
 
 // EntryDecoder reads successive encoded log entries from the input
 // buffer. Each entry is preceded by a single big-ending uint32
 // describing the next entry's length.
 type EntryDecoder struct {
-	scanner *bufio.Scanner
+	scanner            *bufio.Scanner
+	truncatedLastEntry bool
 }
 
 // NewEntryDecoder creates a new instance of EntryDecoder.
@@ -393,7 +378,7 @@ func (d *EntryDecoder) Decode(entry *Entry) error {
 			return err
 		}
 		entry.Line = int64(line)
-		entry.Message = string(m[6])
+		entry.Message = strings.TrimSpace(string(b[len(m[0]):]))
 		return nil
 	}
 }
@@ -402,14 +387,38 @@ func (d *EntryDecoder) split(data []byte, atEOF bool) (advance int, token []byte
 	if atEOF && len(data) == 0 {
 		return 0, nil, nil
 	}
-	// We assume we're currently positioned at a log entry. We want to find the
-	// next one so we start our search at data[1].
+	if d.truncatedLastEntry {
+		i := entryRE.FindIndex(data)
+		if i == nil {
+			// If there's no entry that starts in this chunk, advance past it, since
+			// we've truncated the entry it was originally part of.
+			return len(data), nil, nil
+		}
+		d.truncatedLastEntry = false
+		if i[0] > 0 {
+			// If an entry starts anywhere other than the first index, advance to it
+			// to maintain the invariant that entries start at the beginning of data.
+			// This isn't necessary, but simplifies the code below.
+			return i[0], nil, nil
+		}
+		// If i[0] == 0, then a new entry starts at the beginning of data, so fall
+		// through to the normal logic.
+	}
+	// From this point on, we assume we're currently positioned at a log entry.
+	// We want to find the next one so we start our search at data[1].
 	i := entryRE.FindIndex(data[1:])
 	if i == nil {
 		if atEOF {
 			return len(data), data, nil
 		}
-		// Request more data.
+		if len(data) >= bufio.MaxScanTokenSize {
+			// If there's no room left in the buffer, return the current truncated
+			// entry.
+			d.truncatedLastEntry = true
+			return len(data), data, nil
+		}
+		// If there is still room to read more, ask for more before deciding whether
+		// to truncate the entry.
 		return 0, nil, nil
 	}
 	// i[0] is the start of the next log entry, but we need to adjust the value
@@ -572,22 +581,44 @@ func formatLogEntry(entry Entry, stacks []byte, colors *colorProfile) *buffer {
 }
 
 func init() {
-	// Default stderrThreshold to log everything.
+	// Default stderrThreshold and fileThreshold to log everything.
 	// This will be the default in tests unless overridden; the CLI
 	// commands set their default separately in cli/flags.go
 	logging.stderrThreshold = Severity_INFO
+	logging.fileThreshold = Severity_INFO
 
 	logging.setVState(0, nil, false)
 	logging.exitFunc = os.Exit
 	logging.gcNotify = make(chan struct{}, 1)
 
 	go logging.flushDaemon()
+}
+
+// LoggingToStderr returns true if log messages of the given severity
+// are visible on stderr.
+func LoggingToStderr(s Severity) bool {
+	return s >= logging.stderrThreshold.get()
+}
+
+// StartGCDaemon starts the log file GC -- this must be called after
+// command-line parsing has completed so that no data is lost when the
+// user configures larger max sizes than the defaults.
+func StartGCDaemon() {
 	go logging.gcDaemon()
 }
 
 // Flush flushes all pending log I/O.
 func Flush() {
 	logging.lockAndFlushAll()
+}
+
+// SetSync configures whether logging synchronizes all writes.
+func SetSync(sync bool) {
+	logging.lockAndSetSync(sync)
+	if sync {
+		// There may be something in the buffers already; flush it.
+		Flush()
+	}
 }
 
 // loggingT collects all the global state of the logging setup.
@@ -598,8 +629,10 @@ type loggingT struct {
 
 	noStderrRedirect bool
 
-	// Level flag. Handled atomically.
-	stderrThreshold Severity // The -alsologtostderr flag.
+	// Level flag for output to stderr. Handled atomically.
+	stderrThreshold Severity
+	// Level flag for output to files.
+	fileThreshold Severity
 
 	// freeList is a list of byte buffers, maintained under freeListMu.
 	freeList *buffer
@@ -610,13 +643,11 @@ type loggingT struct {
 
 	// mu protects the remaining elements of this structure and is
 	// used to synchronize logging.
-
-	// Boolean flags. Also protected by mu (see flags.go).
-	toStderr bool // The -logtostderr flag.
-
 	mu syncutil.Mutex
-	// file holds writer for each of the log types.
-	file [Severity_NONE]flushSyncWriter
+	// file holds the log file writer.
+	file flushSyncWriter
+	// syncWrites if true calls file.Flush on every log write.
+	syncWrites bool
 	// pcs is used in V to avoid an allocation when computing the caller's PC.
 	pcs [1]uintptr
 	// vmap is a cache of the V Level for each V() call site, identified by PC.
@@ -628,6 +659,8 @@ type loggingT struct {
 	filterLength int32
 	// traceLocation is the state of the -log_backtrace_at flag.
 	traceLocation traceLocation
+	// disableDaemons can be used to turn off both the GC and flush deamons.
+	disableDaemons bool
 	// These flags are modified only under lock, although verbosity may be fetched
 	// safely using atomic.LoadInt32.
 	vmodule   moduleSpec    // The state of the --vmodule flag.
@@ -730,9 +763,9 @@ func (l *loggingT) outputLogEntry(s Severity, file string, line int, msg string)
 	if s >= l.stderrThreshold.get() {
 		l.outputToStderr(entry, stacks)
 	}
-	if logDir.isSet() {
-		if l.file[s] == nil {
-			if err := l.createFiles(s); err != nil {
+	if logDir.isSet() && s >= l.fileThreshold.get() {
+		if l.file == nil {
+			if err := l.createFile(); err != nil {
 				// Make sure the message appears somewhere.
 				l.outputToStderr(entry, stacks)
 				l.mu.Unlock()
@@ -744,34 +777,15 @@ func (l *loggingT) outputLogEntry(s Severity, file string, line int, msg string)
 		buf := l.processForFile(entry, stacks)
 		data := buf.Bytes()
 
-		switch s {
-		case Severity_FATAL:
-			if _, err := l.file[Severity_FATAL].Write(data); err != nil {
-				panic(err)
-			}
-			fallthrough
-		case Severity_ERROR:
-			if _, err := l.file[Severity_ERROR].Write(data); err != nil {
-				panic(err)
-			}
-			fallthrough
-		case Severity_WARNING:
-			if _, err := l.file[Severity_WARNING].Write(data); err != nil {
-				panic(err)
-			}
-			fallthrough
-		case Severity_INFO:
-			if _, err := l.file[Severity_INFO].Write(data); err != nil {
-				panic(err)
-			}
+		if _, err := l.file.Write(data); err != nil {
+			panic(err)
+		}
+		if l.syncWrites {
+			_ = l.file.Flush()
+			_ = l.file.Sync()
 		}
 
 		l.putBuffer(buf)
-
-		if stats := severityStats[s]; stats != nil {
-			atomic.AddInt64(&stats.lines, 1)
-			atomic.AddInt64(&stats.bytes, int64(len(data)))
-		}
 	}
 	exitFunc := l.exitFunc
 	l.mu.Unlock()
@@ -789,7 +803,7 @@ func (l *loggingT) outputLogEntry(s Severity, file string, line int, msg string)
 
 func (l *loggingT) outputToStderr(entry Entry, stacks []byte) {
 	buf := l.processForStderr(entry, stacks)
-	if _, err := os.Stderr.Write(buf.Bytes()); err != nil {
+	if _, err := OrigStderr.Write(buf.Bytes()); err != nil {
 		panic(err)
 	}
 	l.putBuffer(buf)
@@ -811,7 +825,23 @@ func (l *loggingT) getTermColorProfile() *colorProfile {
 	if !l.hasColorProfile {
 		l.hasColorProfile = true
 		if !l.nocolor {
-			fi, _ := os.Stderr.Stat() // get the FileInfo struct describing the standard input.
+			fi, err := OrigStderr.Stat() // get the FileInfo struct describing the standard input.
+			if err != nil {
+				// Stat() will return an error on Windows in both Powershell and
+				// console until go1.9. See https://github.com/golang/go/issues/14853.
+				//
+				// Note that this bug does not affect MSYS/Cygwin terminals.
+				//
+				// TODO(bram): remove this hack once we move to go 1.9.
+				//
+				// Console does not support our color profiles but
+				// Powershell supports colorProfile256. Sadly, detecting the
+				// shell is not well supported, so default to no-color.
+				if runtime.GOOS != "windows" {
+					panic(err)
+				}
+				return l.colorProfile
+			}
 			if (fi.Mode() & os.ModeCharDevice) != 0 {
 				term := os.Getenv("TERM")
 				switch term {
@@ -839,7 +869,7 @@ func timeoutFlush(timeout time.Duration) {
 	select {
 	case <-done:
 	case <-time.After(timeout):
-		fmt.Fprintln(os.Stderr, "clog: Flush took longer than", timeout)
+		fmt.Fprintln(OrigStderr, "clog: Flush took longer than", timeout)
 	}
 }
 
@@ -872,7 +902,7 @@ var logExitFunc func(error)
 // It flushes the logs and exits the program; there's no point in hanging around.
 // l.mu is held.
 func (l *loggingT) exit(err error) {
-	fmt.Fprintf(os.Stderr, "log: exiting because of error: %s\n", err)
+	fmt.Fprintf(OrigStderr, "log: exiting because of error: %s\n", err)
 	// If logExitFunc is set, we do that instead of exiting.
 	if logExitFunc != nil {
 		logExitFunc(err)
@@ -893,9 +923,8 @@ type syncBuffer struct {
 	logger *loggingT
 	*bufio.Writer
 	file         *os.File
-	sev          Severity
 	lastRotation int64
-	nbytes       uint64 // The number of bytes written to this file
+	nbytes       int64 // The number of bytes written to this file
 }
 
 func (sb *syncBuffer) Sync() error {
@@ -903,13 +932,13 @@ func (sb *syncBuffer) Sync() error {
 }
 
 func (sb *syncBuffer) Write(p []byte) (n int, err error) {
-	if sb.nbytes+uint64(len(p)) >= MaxSize {
+	if sb.nbytes+int64(len(p)) >= atomic.LoadInt64(&LogFileMaxSize) {
 		if err := sb.rotateFile(time.Now()); err != nil {
 			sb.logger.exit(err)
 		}
 	}
 	n, err = sb.Writer.Write(p)
-	sb.nbytes += uint64(n)
+	sb.nbytes += int64(n)
 	if err != nil {
 		sb.logger.exit(err)
 	}
@@ -927,7 +956,7 @@ func (sb *syncBuffer) rotateFile(now time.Time) error {
 		}
 	}
 	var err error
-	sb.file, sb.lastRotation, _, err = create(sb.sev, now, sb.lastRotation)
+	sb.file, sb.lastRotation, _, err = create(now, sb.lastRotation)
 	sb.nbytes = 0
 	if err != nil {
 		return err
@@ -937,13 +966,11 @@ func (sb *syncBuffer) rotateFile(now time.Time) error {
 	// stack traces that are written by the Go runtime to stderr. Note that if
 	// --logtostderr is true we'll never enter this code path and panic stack
 	// traces will go to the original stderr as you would expect.
-	if sb.sev == Severity_INFO &&
-		logging.stderrThreshold > Severity_INFO &&
-		!logging.noStderrRedirect {
+	if logging.stderrThreshold > Severity_INFO && !logging.noStderrRedirect {
 		// NB: any concurrent output to stderr may straddle the old and new
 		// files. This doesn't apply to log messages as we won't reach this code
 		// unless we're not logging to stderr.
-		if err := syscall.Dup2(int(sb.file.Fd()), syscall.Stderr); err != nil {
+		if err := hijackStderr(sb.file); err != nil {
 			return err
 		}
 	}
@@ -961,7 +988,7 @@ func (sb *syncBuffer) rotateFile(now time.Time) error {
 		fmt.Sprintf("line format: [IWEF]yymmdd hh:mm:ss.uuuuuu goid file:line msg utf8=\u2713\n"),
 	} {
 		buf := formatLogEntry(Entry{
-			Severity:  sb.sev,
+			Severity:  Severity_INFO,
 			Time:      now.UnixNano(),
 			Goroutine: goid.Get(),
 			File:      f,
@@ -970,7 +997,7 @@ func (sb *syncBuffer) rotateFile(now time.Time) error {
 		}, nil, nil)
 		var n int
 		n, err = sb.file.Write(buf.Bytes())
-		sb.nbytes += uint64(n)
+		sb.nbytes += int64(n)
 		if err != nil {
 			return err
 		}
@@ -989,35 +1016,30 @@ func (sb *syncBuffer) rotateFile(now time.Time) error {
 // on disk I/O. The flushDaemon will block instead.
 const bufferSize = 256 * 1024
 
-func (l *loggingT) closeFilesLocked() error {
-	for s := Severity_FATAL; s >= Severity_INFO; s-- {
-		if l.file[s] != nil {
-			if sb, ok := l.file[s].(*syncBuffer); ok {
-				if err := sb.file.Close(); err != nil {
-					return err
-				}
+func (l *loggingT) closeFileLocked() error {
+	if l.file != nil {
+		if sb, ok := l.file.(*syncBuffer); ok {
+			if err := sb.file.Close(); err != nil {
+				return err
 			}
-			l.file[s] = nil
 		}
+		l.file = nil
 	}
-	return nil
+	return restoreStderr()
 }
 
-// createFiles creates all the log files for severity from sev down to Severity_INFO.
+// createFile creates the log file.
 // l.mu is held.
-func (l *loggingT) createFiles(sev Severity) error {
+func (l *loggingT) createFile() error {
 	now := time.Now()
-	// Files are created in decreasing severity order, so as soon as we find one
-	// has already been created, we can stop.
-	for s := sev; s >= Severity_INFO && l.file[s] == nil; s-- {
+	if l.file == nil {
 		sb := &syncBuffer{
 			logger: l,
-			sev:    s,
 		}
 		if err := sb.rotateFile(now); err != nil {
 			return err
 		}
-		l.file[s] = sb
+		l.file = sb
 	}
 	return nil
 }
@@ -1028,7 +1050,11 @@ const flushInterval = 30 * time.Second
 func (l *loggingT) flushDaemon() {
 	// doesn't need to be Stop()'d as the loop never escapes
 	for range time.Tick(flushInterval) {
-		l.lockAndFlushAll()
+		l.mu.Lock()
+		if !l.disableDaemons {
+			l.flushAll()
+		}
+		l.mu.Unlock()
 	}
 }
 
@@ -1039,23 +1065,30 @@ func (l *loggingT) lockAndFlushAll() {
 	l.mu.Unlock()
 }
 
+// lockAndSetSync configures syncWrites
+func (l *loggingT) lockAndSetSync(sync bool) {
+	l.mu.Lock()
+	l.syncWrites = sync
+	l.mu.Unlock()
+}
+
 // flushAll flushes all the logs and attempts to "sync" their data to disk.
 // l.mu is held.
 func (l *loggingT) flushAll() {
-	// Flush from fatal down, in case there's trouble flushing.
-	for s := Severity_FATAL; s >= Severity_INFO; s-- {
-		file := l.file[s]
-		if file != nil {
-			_ = file.Flush() // ignore error
-			_ = file.Sync()  // ignore error
-		}
+	if l.file != nil {
+		_ = l.file.Flush() // ignore error
+		_ = l.file.Sync()  // ignore error
 	}
 }
 
 func (l *loggingT) gcDaemon() {
 	l.gcOldFiles()
 	for range l.gcNotify {
-		l.gcOldFiles()
+		l.mu.Lock()
+		if !l.disableDaemons {
+			l.gcOldFiles()
+		}
+		l.mu.Unlock()
 	}
 }
 
@@ -1068,44 +1101,41 @@ func (l *loggingT) gcOldFiles() {
 
 	allFiles, err := ListLogFiles()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "unable to GC log files: %s\n", err)
+		fmt.Fprintf(OrigStderr, "unable to GC log files: %s\n", err)
 		return
 	}
 
-	maxSizePerSeverity := atomic.LoadUint64(&MaxSizePerSeverity)
-	for s := Severity_INFO; s <= Severity_FATAL; s++ {
-		severityFiles := selectFiles(allFiles, s, math.MaxInt64)
-		if len(severityFiles) == 0 {
+	logFilesCombinedMaxSize := atomic.LoadInt64(&LogFilesCombinedMaxSize)
+	files := selectFiles(allFiles, math.MaxInt64)
+	if len(files) == 0 {
+		return
+	}
+	// files is sorted with the newest log files first (which we want
+	// to keep). Note that we always keep the most recent log file.
+	sum := files[0].SizeBytes
+	for _, f := range files[1:] {
+		sum += f.SizeBytes
+		if sum < logFilesCombinedMaxSize {
 			continue
 		}
-		// severityFiles is sorted with the newest log files first (which we want
-		// to keep). Note that we always keep the most recent log file per
-		// severity.
-		sum := severityFiles[0].SizeBytes
-		for _, f := range severityFiles[1:] {
-			sum += f.SizeBytes
-			if uint64(sum) < maxSizePerSeverity {
-				continue
-			}
-			path := filepath.Join(dir, f.Name)
-			if err := os.Remove(path); err != nil {
-				fmt.Fprintf(os.Stderr, "%s\n", err)
-			}
+		path := filepath.Join(dir, f.Name)
+		if err := os.Remove(path); err != nil {
+			fmt.Fprintln(OrigStderr, err)
 		}
 	}
 }
 
-// copyStandardLogTo arranges for messages written to the Go "log" package's
-// default logs to also appear in the Google logs for the named and lower
-// severities.  Subsequent changes to the standard log's default output location
-// or format may break this behavior.
+// copyStandardLogTo arranges for messages written to the Go "log"
+// package's default logs to also appear in the CockroachDB logs with
+// the specified severity.  Subsequent changes to the standard log's
+// default output location or format may break this behavior.
 //
 // Valid names are "INFO", "WARNING", "ERROR", and "FATAL".  If the name is not
 // recognized, copyStandardLogTo panics.
-func copyStandardLogTo(name string) {
-	sev, ok := SeverityByName(name)
+func copyStandardLogTo(severityName string) {
+	sev, ok := SeverityByName(severityName)
 	if !ok {
-		panic(fmt.Sprintf("copyStandardLogTo(%q): unrecognized Severity name", name))
+		panic(fmt.Sprintf("copyStandardLogTo(%q): unrecognized Severity name", severityName))
 	}
 	// Set a log format that captures the user's file and line:
 	//   d.go:23: message
@@ -1141,8 +1171,8 @@ func (lb logBridge) Write(b []byte) (n int, err error) {
 	return len(b), nil
 }
 
-// NewStdLogger creates a *stdLog.Logger that forwards messages to the Google
-// logs for the specified severity.
+// NewStdLogger creates a *stdLog.Logger that forwards messages to the
+// CockroachDB logs with the specified severity.
 func NewStdLogger(severity Severity) *stdLog.Logger {
 	return stdLog.New(logBridge(severity), "", stdLog.Lshortfile)
 }

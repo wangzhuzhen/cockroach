@@ -78,14 +78,11 @@ const (
 	isRange                // range commands may span multiple keys
 	isReverse              // reverse commands traverse ranges in descending direction
 	isAlone                // requests which must be alone in a batch
-	// Some commands can skip interacting with the command queue and the timestamp
-	// cache. For example, RequestLeaseRequest is sequenced exclusively by Raft.
-	// These requests still have keys in their header, but those keys are used
-	// exclusively for routing the request to the right range.
-	isNonKV
 	// Requests for acquiring a lease skip the (proposal-time) check that the
 	// proposing replica has a valid lease.
 	skipLeaseCheck
+	consultsTSCache // mutating commands which write data at a timestamp
+	updatesTSCache  // commands which read data at a timestamp
 )
 
 // GetTxnID returns the transaction ID if the header has a transaction
@@ -109,10 +106,26 @@ func IsTransactionWrite(args Request) bool {
 	return (args.flags() & isTxnWrite) != 0
 }
 
-// IsRange returns true if the operation is range-based and must include
+// IsRange returns true if the command is range-based and must include
 // a start and an end key.
 func IsRange(args Request) bool {
 	return (args.flags() & isRange) != 0
+}
+
+// ConsultsTimestampCache returns whether the command must consult
+// the timestamp cache to determine whether a mutation is safe at
+// a proposed timestamp or needs to move to a higher timestamp to
+// avoid re-writing history.
+func ConsultsTimestampCache(args Request) bool {
+	return (args.flags() & consultsTSCache) != 0
+}
+
+// UpdatesTimestampCache returns whether the command must update
+// the timestamp cache in order to set a low water mark for the
+// timestamp at which mutations to overlapping key(s) can write
+// such that they don't re-write history.
+func UpdatesTimestampCache(args Request) bool {
+	return (args.flags() & updatesTSCache) != 0
 }
 
 // Request is an interface for RPC requests.
@@ -133,18 +146,18 @@ type Request interface {
 // Implementors return the previous lease at the time the request
 // was proposed.
 type leaseRequestor interface {
-	prevLease() *Lease
+	prevLease() Lease
 }
 
 var _ leaseRequestor = &RequestLeaseRequest{}
 
-func (rlr *RequestLeaseRequest) prevLease() *Lease {
+func (rlr *RequestLeaseRequest) prevLease() Lease {
 	return rlr.PrevLease
 }
 
 var _ leaseRequestor = &TransferLeaseRequest{}
 
-func (tlr *TransferLeaseRequest) prevLease() *Lease {
+func (tlr *TransferLeaseRequest) prevLease() Lease {
 	return tlr.PrevLease
 }
 
@@ -250,29 +263,6 @@ func (cc *CheckConsistencyResponse) combine(c combinable) error {
 var _ combinable = &CheckConsistencyResponse{}
 
 // Combine implements the combinable interface.
-func (af *ChangeFrozenResponse) combine(c combinable) error {
-	if af != nil {
-		otherAF := c.(*ChangeFrozenResponse)
-		if err := af.ResponseHeader.combine(otherAF.Header()); err != nil {
-			return err
-		}
-		af.RangesAffected += otherAF.RangesAffected
-		if otherAF.MinStartKey.Less(af.MinStartKey) {
-			af.MinStartKey = otherAF.MinStartKey
-		}
-		for storeID, nodeID := range otherAF.Stores {
-			if af.Stores == nil {
-				af.Stores = make(map[StoreID]NodeID, len(otherAF.Stores))
-			}
-			af.Stores[storeID] = nodeID
-		}
-	}
-	return nil
-}
-
-var _ combinable = &ChangeFrozenResponse{}
-
-// Combine implements the combinable interface.
 func (er *ExportResponse) combine(c combinable) error {
 	if er != nil {
 		otherER := c.(*ExportResponse)
@@ -285,6 +275,20 @@ func (er *ExportResponse) combine(c combinable) error {
 }
 
 var _ combinable = &ExportResponse{}
+
+// Combine implements the combinable interface.
+func (r *AdminScatterResponse) combine(c combinable) error {
+	if r != nil {
+		otherR := c.(*AdminScatterResponse)
+		if err := r.ResponseHeader.combine(otherR.Header()); err != nil {
+			return err
+		}
+		r.Ranges = append(r.Ranges, otherR.Ranges...)
+	}
+	return nil
+}
+
+var _ combinable = &AdminScatterResponse{}
 
 // Header implements the Request interface.
 func (rh Span) Header() Span {
@@ -419,9 +423,6 @@ func (*ReverseScanRequest) Method() Method { return ReverseScan }
 func (*CheckConsistencyRequest) Method() Method { return CheckConsistency }
 
 // Method implements the Request interface.
-func (*ChangeFrozenRequest) Method() Method { return ChangeFrozen }
-
-// Method implements the Request interface.
 func (*BeginTransactionRequest) Method() Method { return BeginTransaction }
 
 // Method implements the Request interface.
@@ -435,6 +436,9 @@ func (*AdminMergeRequest) Method() Method { return AdminMerge }
 
 // Method implements the Request interface.
 func (*AdminTransferLeaseRequest) Method() Method { return AdminTransferLease }
+
+// Method implements the Request interface.
+func (*AdminChangeReplicasRequest) Method() Method { return AdminChangeReplicas }
 
 // Method implements the Request interface.
 func (*HeartbeatTxnRequest) Method() Method { return HeartbeatTxn }
@@ -489,6 +493,9 @@ func (*ExportRequest) Method() Method { return Export }
 
 // Method implements the Request interface.
 func (*ImportRequest) Method() Method { return Import }
+
+// Method implements the Request interface.
+func (*AdminScatterRequest) Method() Method { return AdminScatter }
 
 // ShallowCopy implements the Request interface.
 func (gr *GetRequest) ShallowCopy() Request {
@@ -551,12 +558,6 @@ func (ccr *CheckConsistencyRequest) ShallowCopy() Request {
 }
 
 // ShallowCopy implements the Request interface.
-func (afr *ChangeFrozenRequest) ShallowCopy() Request {
-	shallowCopy := *afr
-	return &shallowCopy
-}
-
-// ShallowCopy implements the Request interface.
 func (btr *BeginTransactionRequest) ShallowCopy() Request {
 	shallowCopy := *btr
 	return &shallowCopy
@@ -583,6 +584,12 @@ func (amr *AdminMergeRequest) ShallowCopy() Request {
 // ShallowCopy implements the Request interface.
 func (atlr *AdminTransferLeaseRequest) ShallowCopy() Request {
 	shallowCopy := *atlr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
+func (acrr *AdminChangeReplicasRequest) ShallowCopy() Request {
+	shallowCopy := *acrr
 	return &shallowCopy
 }
 
@@ -690,6 +697,12 @@ func (ekr *ExportRequest) ShallowCopy() Request {
 
 // ShallowCopy implements the Request interface.
 func (r *ImportRequest) ShallowCopy() Request {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
+func (r *AdminScatterRequest) ShallowCopy() Request {
 	shallowCopy := *r
 	return &shallowCopy
 }
@@ -803,18 +816,6 @@ func NewScan(key, endKey Key) Request {
 	}
 }
 
-// NewChangeFrozen returns a Request initialized to scan from start to end keys.
-func NewChangeFrozen(key, endKey Key, frozen bool, mustVersion string) Request {
-	return &ChangeFrozenRequest{
-		Span: Span{
-			Key:    key,
-			EndKey: endKey,
-		},
-		Frozen:      frozen,
-		MustVersion: mustVersion,
-	}
-}
-
 // NewCheckConsistency returns a Request initialized to scan from start to end keys.
 func NewCheckConsistency(key, endKey Key, withDiff bool) Request {
 	return &CheckConsistencyRequest{
@@ -837,12 +838,19 @@ func NewReverseScan(key, endKey Key) Request {
 	}
 }
 
-func (*GetRequest) flags() int            { return isRead | isTxn }
-func (*PutRequest) flags() int            { return isWrite | isTxn | isTxnWrite }
-func (*ConditionalPutRequest) flags() int { return isRead | isWrite | isTxn | isTxnWrite }
-func (*InitPutRequest) flags() int        { return isRead | isWrite | isTxn | isTxnWrite }
-func (*IncrementRequest) flags() int      { return isRead | isWrite | isTxn | isTxnWrite }
-func (*DeleteRequest) flags() int         { return isWrite | isTxn | isTxnWrite }
+func (*GetRequest) flags() int { return isRead | isTxn | updatesTSCache }
+func (*PutRequest) flags() int { return isWrite | isTxn | isTxnWrite | consultsTSCache }
+
+// ConditionalPut and InitPut effectively read and may not write,
+// so must update the timestamp cache.
+func (*ConditionalPutRequest) flags() int {
+	return isRead | isWrite | isTxn | isTxnWrite | updatesTSCache | consultsTSCache
+}
+func (*InitPutRequest) flags() int {
+	return isRead | isWrite | isTxn | isTxnWrite | updatesTSCache | consultsTSCache
+}
+func (*IncrementRequest) flags() int { return isRead | isWrite | isTxn | isTxnWrite | consultsTSCache }
+func (*DeleteRequest) flags() int    { return isWrite | isTxn | isTxnWrite | consultsTSCache }
 func (drr *DeleteRangeRequest) flags() int {
 	// DeleteRangeRequest has different properties if the "inline" flag is set.
 	// This flag indicates that the request is deleting inline MVCC values,
@@ -861,56 +869,64 @@ func (drr *DeleteRangeRequest) flags() int {
 	if drr.Inline {
 		return isWrite | isRange | isAlone
 	}
-	return isWrite | isTxn | isTxnWrite | isRange
+	// DeleteRange updates the timestamp cache as it doesn't leave
+	// intents or tombstones for keys which don't yet exist. By updating
+	// the write timestamp cache, it forces subsequent writes to get a
+	// write-too-old error and avoids the phantom delete anomaly.
+	return isWrite | isTxn | isTxnWrite | isRange | updatesTSCache | consultsTSCache
 }
-func (*ScanRequest) flags() int               { return isRead | isRange | isTxn }
-func (*ReverseScanRequest) flags() int        { return isRead | isRange | isReverse | isTxn }
-func (*BeginTransactionRequest) flags() int   { return isWrite | isTxn }
-func (*EndTransactionRequest) flags() int     { return isWrite | isTxn | isAlone }
-func (*AdminSplitRequest) flags() int         { return isAdmin | isAlone }
-func (*AdminMergeRequest) flags() int         { return isAdmin | isAlone }
-func (*AdminTransferLeaseRequest) flags() int { return isAdmin | isAlone }
-func (*HeartbeatTxnRequest) flags() int       { return isWrite | isTxn }
-func (*GCRequest) flags() int                 { return isWrite | isRange }
-func (*PushTxnRequest) flags() int            { return isWrite | isAlone }
-func (*QueryTxnRequest) flags() int           { return isRead | isAlone }
-func (*RangeLookupRequest) flags() int        { return isRead }
-func (*ResolveIntentRequest) flags() int      { return isWrite }
-func (*ResolveIntentRangeRequest) flags() int { return isWrite | isRange }
-func (*NoopRequest) flags() int               { return isRead } // slightly special
-func (*TruncateLogRequest) flags() int        { return isWrite | isNonKV }
+func (*ScanRequest) flags() int             { return isRead | isRange | isTxn | updatesTSCache }
+func (*ReverseScanRequest) flags() int      { return isRead | isRange | isReverse | isTxn | updatesTSCache }
+func (*BeginTransactionRequest) flags() int { return isWrite | isTxn | consultsTSCache }
 
-// MergeRequests are considered "non KV" because they do not need to be gated
-// by the command queue (reordering is ok) and they operate on non-MVCC data so
-// the timestamp cache is also unnecessary.
-func (*MergeRequest) flags() int { return isWrite | isNonKV }
+// EndTransaction updates the write timestamp cache to prevent
+// replays. Replays for the same transaction key and timestamp will
+// have Txn.WriteTooOld=true and must retry on EndTransaction.
+func (*EndTransactionRequest) flags() int      { return isWrite | isTxn | isAlone | updatesTSCache }
+func (*AdminSplitRequest) flags() int          { return isAdmin | isAlone }
+func (*AdminMergeRequest) flags() int          { return isAdmin | isAlone }
+func (*AdminTransferLeaseRequest) flags() int  { return isAdmin | isAlone }
+func (*AdminChangeReplicasRequest) flags() int { return isAdmin | isAlone }
+func (*HeartbeatTxnRequest) flags() int        { return isWrite | isTxn }
+func (*GCRequest) flags() int                  { return isWrite | isRange }
+func (*PushTxnRequest) flags() int             { return isWrite | isAlone }
+func (*QueryTxnRequest) flags() int            { return isRead | isAlone }
+func (*RangeLookupRequest) flags() int         { return isRead }
+func (*ResolveIntentRequest) flags() int       { return isWrite }
+func (*ResolveIntentRangeRequest) flags() int  { return isWrite | isRange }
+func (*NoopRequest) flags() int                { return isRead } // slightly special
+func (*TruncateLogRequest) flags() int         { return isWrite }
+func (*MergeRequest) flags() int               { return isWrite }
 
 func (*RequestLeaseRequest) flags() int {
-	return isWrite | isAlone | isNonKV | skipLeaseCheck
+	return isWrite | isAlone | skipLeaseCheck
 }
 
 // LeaseInfoRequest is usually executed in an INCONSISTENT batch, which has the
 // effect of the `skipLeaseCheck` flag that lease write operations have.
-func (*LeaseInfoRequest) flags() int { return isRead | isNonKV | isAlone }
+func (*LeaseInfoRequest) flags() int { return isRead | isAlone }
 func (*TransferLeaseRequest) flags() int {
-	// TODO(andrei): update this comment.
 	// TransferLeaseRequest requires the lease, which is checked in
-	// `AdminTransferLease()` at proposal time and in the usual way for write
-	// commands at apply time.
-	// But it can't be checked at propose time through the
-	// `redirectOnOrAcquireLease` call because, by the time that call is made, the
-	// replica has registered that a transfer is in progress and
-	// `redirectOnOrAcquireLease` already tentatively redirects to the
-	// future lease holder.
-	return isWrite | isAlone | isNonKV | skipLeaseCheck
+	// `AdminTransferLease()` before the TransferLeaseRequest is created and sent
+	// for evaluation and in the usual way at application time (i.e.
+	// replica.processRaftCommand() checks that the lease hasn't changed since the
+	// command resulting from the evaluation of TransferLeaseRequest was
+	// proposed).
+	//
+	// But we're marking it with skipLeaseCheck because `redirectOnOrAcquireLease`
+	// can't be used before evaluation as, by the time that call would be made,
+	// the store has registered that a transfer is in progress and
+	// `redirectOnOrAcquireLease` would already tentatively redirect to the future
+	// lease holder.
+	return isWrite | isAlone | skipLeaseCheck
 }
-func (*ComputeChecksumRequest) flags() int          { return isWrite | isNonKV | isRange }
+func (*ComputeChecksumRequest) flags() int          { return isWrite | isRange }
 func (*DeprecatedVerifyChecksumRequest) flags() int { return isWrite }
 func (*CheckConsistencyRequest) flags() int         { return isAdmin | isRange }
-func (*ChangeFrozenRequest) flags() int             { return isWrite | isRange | isNonKV }
 func (*WriteBatchRequest) flags() int               { return isWrite | isRange }
-func (*ExportRequest) flags() int                   { return isRead | isRange }
+func (*ExportRequest) flags() int                   { return isRead | isRange | updatesTSCache }
 func (*ImportRequest) flags() int                   { return isAdmin | isAlone }
+func (*AdminScatterRequest) flags() int             { return isAdmin | isAlone | isRange }
 
 // Keys returns credentials in an s3gof3r.Keys
 func (b *ExportStorage_S3) Keys() s3gof3r.Keys {

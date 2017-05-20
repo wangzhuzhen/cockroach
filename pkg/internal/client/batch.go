@@ -245,8 +245,10 @@ func (b *Batch) fillResults() error {
 			case *roachpb.AdminMergeRequest:
 			case *roachpb.AdminSplitRequest:
 			case *roachpb.AdminTransferLeaseRequest:
+			case *roachpb.AdminChangeReplicasRequest:
 			case *roachpb.HeartbeatTxnRequest:
 			case *roachpb.GCRequest:
+			case *roachpb.LeaseInfoRequest:
 			case *roachpb.PushTxnRequest:
 			case *roachpb.QueryTxnRequest:
 			case *roachpb.RangeLookupRequest:
@@ -256,9 +258,9 @@ func (b *Batch) fillResults() error {
 			case *roachpb.TruncateLogRequest:
 			case *roachpb.RequestLeaseRequest:
 			case *roachpb.CheckConsistencyRequest:
-			case *roachpb.ChangeFrozenRequest:
 			case *roachpb.WriteBatchRequest:
 			case *roachpb.ImportRequest:
+			case *roachpb.AdminScatterRequest:
 			}
 			// Fill up the resume span.
 			if result.Err == nil && reply != nil && reply.Header().ResumeSpan != nil {
@@ -603,6 +605,27 @@ func (b *Batch) adminTransferLease(key interface{}, target roachpb.StoreID) {
 			Key: k,
 		},
 		Target: target,
+	}
+	b.appendReqs(req)
+	b.initResult(1, 0, notRaw, nil)
+}
+
+// adminChangeReplicas is only exported on DB. It is here for symmetry with the
+// other operations.
+func (b *Batch) adminChangeReplicas(
+	key interface{}, changeType roachpb.ReplicaChangeType, targets []roachpb.ReplicationTarget,
+) {
+	k, err := marshalKey(key)
+	if err != nil {
+		b.initResult(0, 0, notRaw, err)
+		return
+	}
+	req := &roachpb.AdminChangeReplicasRequest{
+		Span: roachpb.Span{
+			Key: k,
+		},
+		ChangeType: changeType,
+		Targets:    targets,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)

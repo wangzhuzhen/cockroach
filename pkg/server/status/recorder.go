@@ -46,6 +46,9 @@ const (
 	// nodeTimeSeriesPrefix is the common prefix for time series keys which
 	// record node-specific data.
 	nodeTimeSeriesPrefix = "cr.node.%s"
+
+	advertiseAddrLabelKey = "advertise-addr"
+	httpAddrLabelKey      = "http-addr"
 )
 
 type quantile struct {
@@ -82,11 +85,11 @@ type storeMetrics interface {
 // store hosted by the node. There are slight differences in the way these are
 // recorded, and they are thus kept separate.
 type MetricsRecorder struct {
-	// prometheusExporter merges metrics into families and generates the
-	// prometheus text format.
-	prometheusExporter metric.PrometheusExporter
-	mu                 struct {
+	mu struct {
 		syncutil.Mutex
+		// prometheusExporter merges metrics into families and generates the
+		// prometheus text format.
+		prometheusExporter metric.PrometheusExporter
 		// nodeRegistry contains, as subregistries, the multiple component-specific
 		// registries which are recorded as "node level" metrics.
 		nodeRegistry *metric.Registry
@@ -118,7 +121,7 @@ func NewMetricsRecorder(clock *hlc.Clock) *MetricsRecorder {
 	mr := &MetricsRecorder{}
 	mr.mu.storeRegistries = make(map[roachpb.StoreID]*metric.Registry)
 	mr.mu.stores = make(map[roachpb.StoreID]storeMetrics)
-	mr.prometheusExporter = metric.MakePrometheusExporter()
+	mr.mu.prometheusExporter = metric.MakePrometheusExporter()
 	mr.mu.clock = clock
 	return mr
 }
@@ -126,13 +129,27 @@ func NewMetricsRecorder(clock *hlc.Clock) *MetricsRecorder {
 // AddNode adds the Registry from an initialized node, along with its descriptor
 // and start time.
 func (mr *MetricsRecorder) AddNode(
-	reg *metric.Registry, desc roachpb.NodeDescriptor, startedAt int64,
+	reg *metric.Registry,
+	desc roachpb.NodeDescriptor,
+	startedAt int64,
+	advertiseAddr, httpAddr string,
 ) {
 	mr.mu.Lock()
 	defer mr.mu.Unlock()
 	mr.mu.nodeRegistry = reg
 	mr.mu.desc = desc
 	mr.mu.startedAt = startedAt
+
+	// Create node ID gauge metric with host as a label.
+	metadata := metric.Metadata{
+		Name: "node-id",
+		Help: "node ID with labels for advertised RPC and HTTP addresses",
+	}
+	metadata.AddLabel(advertiseAddrLabelKey, advertiseAddr)
+	metadata.AddLabel(httpAddrLabelKey, httpAddr)
+	nodeIDGauge := metric.NewGauge(metadata)
+	nodeIDGauge.Update(int64(desc.NodeID))
+	reg.AddMetric(nodeIDGauge)
 }
 
 // AddStore adds the Registry from the provided store as a store-level registry
@@ -175,10 +192,8 @@ func (mr *MetricsRecorder) MarshalJSON() ([]byte, error) {
 	return json.Marshal(topLevel)
 }
 
-// scrapePrometheus updates the prometheusExporter's metrics snapshot.
-func (mr *MetricsRecorder) scrapePrometheus() {
-	mr.mu.Lock()
-	defer mr.mu.Unlock()
+// scrapePrometheusLocked updates the prometheusExporter's metrics snapshot.
+func (mr *MetricsRecorder) scrapePrometheusLocked() {
 	if mr.mu.nodeRegistry == nil {
 		// We haven't yet processed initialization information; output nothing.
 		if log.V(1) {
@@ -186,16 +201,18 @@ func (mr *MetricsRecorder) scrapePrometheus() {
 		}
 	}
 
-	mr.prometheusExporter.ScrapeRegistry(mr.mu.nodeRegistry)
+	mr.mu.prometheusExporter.ScrapeRegistry(mr.mu.nodeRegistry)
 	for _, reg := range mr.mu.storeRegistries {
-		mr.prometheusExporter.ScrapeRegistry(reg)
+		mr.mu.prometheusExporter.ScrapeRegistry(reg)
 	}
 }
 
 // PrintAsText writes the current metrics values as plain-text to the writer.
 func (mr *MetricsRecorder) PrintAsText(w io.Writer) error {
-	mr.scrapePrometheus()
-	return mr.prometheusExporter.PrintAsText(w)
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
+	mr.scrapePrometheusLocked()
+	return mr.mu.prometheusExporter.PrintAsText(w)
 }
 
 // GetTimeSeriesData serializes registered metrics for consumption by
@@ -255,7 +272,7 @@ func (mr *MetricsRecorder) GetStatusSummary() *NodeStatus {
 
 	now := mr.mu.clock.PhysicalNow()
 
-	// Generate an node status with no store data.
+	// Generate a node status with no store data.
 	nodeStat := &NodeStatus{
 		Desc:          mr.mu.desc,
 		BuildInfo:     build.GetInfo(),

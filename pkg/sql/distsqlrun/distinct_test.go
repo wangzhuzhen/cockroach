@@ -17,8 +17,10 @@
 package distsqlrun
 
 import (
+	"math"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -41,7 +43,9 @@ func TestDistinct(t *testing.T) {
 		expected sqlbase.EncDatumRows
 	}{
 		{
-			spec: DistinctSpec{},
+			spec: DistinctSpec{
+				DistinctColumns: []uint32{0, 1},
+			},
 			input: sqlbase.EncDatumRows{
 				{v[2], v[3]},
 				{v[5], v[6]},
@@ -58,9 +62,11 @@ func TestDistinct(t *testing.T) {
 				{v[3], v[5]},
 				{v[2], v[9]},
 			},
-		}, {
+		},
+		{
 			spec: DistinctSpec{
-				OrderedColumns: []uint32{1},
+				OrderedColumns:  []uint32{1},
+				DistinctColumns: []uint32{0, 1},
 			},
 			input: sqlbase.EncDatumRows{
 				{v[2], v[3]},
@@ -79,15 +85,64 @@ func TestDistinct(t *testing.T) {
 				{v[5], v[6]},
 			},
 		},
+		{
+			spec: DistinctSpec{
+				OrderedColumns:  []uint32{1},
+				DistinctColumns: []uint32{1},
+			},
+			input: sqlbase.EncDatumRows{
+				{v[2], v[3]},
+				{v[2], v[3]},
+				{v[2], v[6]},
+				{v[2], v[9]},
+				{v[3], v[5]},
+				{v[5], v[6]},
+				{v[6], v[6]},
+				{v[7], v[6]},
+			},
+			expected: sqlbase.EncDatumRows{
+				{v[2], v[3]},
+				{v[2], v[6]},
+				{v[2], v[9]},
+				{v[3], v[5]},
+				{v[5], v[6]},
+			},
+		},
+		{
+			spec: DistinctSpec{
+				OrderedColumns:  []uint32{1},
+				DistinctColumns: []uint32{},
+			},
+			input: sqlbase.EncDatumRows{
+				{v[2], v[3]},
+				{v[2], v[3]},
+				{v[2], v[6]},
+				{v[2], v[9]},
+				{v[3], v[5]},
+				{v[5], v[6]},
+				{v[6], v[6]},
+			},
+			expected: sqlbase.EncDatumRows{
+				{v[2], v[3]},
+				{v[2], v[3]},
+				{v[2], v[6]},
+				{v[2], v[9]},
+				{v[3], v[5]},
+				{v[5], v[6]},
+				{v[6], v[6]},
+			},
+		},
 	}
 
+	monitor := mon.MakeUnlimitedMonitor(context.Background(), "test", nil, nil, math.MaxInt64)
+	defer monitor.Stop(context.Background())
 	for _, c := range testCases {
 		ds := c.spec
 
 		in := NewRowBuffer(nil /* types */, c.input, RowBufferArgs{})
 		out := &RowBuffer{}
 
-		flowCtx := FlowCtx{}
+		flowCtx := FlowCtx{evalCtx: parser.EvalContext{Mon: &monitor}}
 
 		d, err := newDistinct(&flowCtx, &ds, in, &PostProcessSpec{}, out)
 		if err != nil {

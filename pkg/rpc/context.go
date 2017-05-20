@@ -28,8 +28,8 @@ import (
 	"github.com/rubyist/circuitbreaker"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -58,6 +58,12 @@ const (
 	maximumPingDurationMult = 2
 )
 
+const (
+	defaultWindowSize     = 65535
+	initialWindowSize     = defaultWindowSize * 32 // for an RPC
+	initialConnWindowSize = initialWindowSize * 16 // for a connection
+)
+
 // SourceAddr provides a way to specify a source/local address for outgoing
 // connections. It should only ever be set by testing code, and is not thread
 // safe (so it must be initialized before the server starts).
@@ -75,6 +81,8 @@ var SourceAddr = func() net.Addr {
 	return nil
 }()
 
+var enableRPCCompression = envutil.EnvOrDefaultBool("COCKROACH_ENABLE_RPC_COMPRESSION", false)
+
 // NewServer is a thin wrapper around grpc.NewServer that registers a heartbeat
 // service.
 func NewServer(ctx *Context) *grpc.Server {
@@ -84,6 +92,22 @@ func NewServer(ctx *Context) *grpc.Server {
 		// Our maximum kv size is unlimited, so we need this to be very large.
 		// TODO(peter,tamird): need tests before lowering
 		grpc.MaxMsgSize(math.MaxInt32),
+		// Adjust the stream and connection window sizes. The gRPC defaults are too
+		// low for high latency connections.
+		grpc.InitialWindowSize(initialWindowSize),
+		grpc.InitialConnWindowSize(initialConnWindowSize),
+		// The default number of concurrent streams/requests on a client connection
+		// is 100, while the server is unlimited. The client setting can only be
+		// controlled by adjusting the server value. Set a very large value for the
+		// server value so that we have no fixed limit on the number of concurrent
+		// streams/requests on either the client or server.
+		grpc.MaxConcurrentStreams(math.MaxInt32),
+		grpc.RPCDecompressor(snappyDecompressor{}),
+	}
+	// Compression is enabled separately from decompression to allow staged
+	// rollout.
+	if ctx.rpcCompression {
+		opts = append(opts, grpc.RPCCompressor(snappyCompressor{}))
 	}
 	if !ctx.Insecure {
 		tlsConfig, err := ctx.GetServerTLSConfig()
@@ -117,9 +141,11 @@ type Context struct {
 	RemoteClocks *RemoteClockMonitor
 	masterCtx    context.Context
 
-	HeartbeatInterval time.Duration
-	HeartbeatTimeout  time.Duration
+	heartbeatInterval time.Duration
+	heartbeatTimeout  time.Duration
 	HeartbeatCB       func()
+
+	rpcCompression bool
 
 	localInternalServer roachpb.InternalServer
 
@@ -145,17 +171,18 @@ func NewContext(
 		breakerClock: breakerClock{
 			clock: hlcClock,
 		},
+		rpcCompression: enableRPCCompression,
 	}
 	var cancel context.CancelFunc
 	ctx.masterCtx, cancel = context.WithCancel(ambient.AnnotateCtx(context.Background()))
 	ctx.Stopper = stopper
 	ctx.RemoteClocks = newRemoteClockMonitor(
 		ctx.LocalClock, 10*defaultHeartbeatInterval, baseCtx.HistogramWindowInterval)
-	ctx.HeartbeatInterval = defaultHeartbeatInterval
-	ctx.HeartbeatTimeout = 2 * defaultHeartbeatInterval
+	ctx.heartbeatInterval = defaultHeartbeatInterval
+	ctx.heartbeatTimeout = 2 * defaultHeartbeatInterval
 	ctx.conns.cache = make(map[string]*connMeta)
 
-	stopper.RunWorker(func() {
+	stopper.RunWorker(ctx.masterCtx, func(context.Context) {
 		<-stopper.ShouldQuiesce()
 
 		cancel()
@@ -217,7 +244,7 @@ func (ctx *Context) GRPCDial(target string, opts ...grpc.DialOption) (*grpc.Clie
 	meta, ok := ctx.conns.cache[target]
 	if !ok {
 		meta = &connMeta{
-			heartbeatErr: errNotHeartbeated,
+			heartbeatErr: ErrNotHeartbeated,
 		}
 		ctx.conns.cache[target] = meta
 	}
@@ -236,9 +263,26 @@ func (ctx *Context) GRPCDial(target string, opts ...grpc.DialOption) (*grpc.Clie
 			dialOpt = grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig))
 		}
 
-		dialOpts := make([]grpc.DialOption, 0, 2+len(opts))
+		var dialOpts []grpc.DialOption
 		dialOpts = append(dialOpts, dialOpt)
 		dialOpts = append(dialOpts, grpc.WithBackoffMaxDelay(maxBackoff))
+		dialOpts = append(dialOpts, grpc.WithDecompressor(snappyDecompressor{}))
+		// Compression is enabled separately from decompression to allow staged
+		// rollout.
+		if ctx.rpcCompression {
+			dialOpts = append(dialOpts, grpc.WithCompressor(snappyCompressor{}))
+		}
+		dialOpts = append(dialOpts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			// Send periodic pings on the connection.
+			Time: base.NetworkTimeout,
+			// If the pings don't get a response within the timeout, we might be
+			// experiencing a network partition. gRPC will close the transport-level
+			// connection and all the pending RPCs (which may not have timeouts) will
+			// fail eagerly. gRPC will then reconnect the transport transparently.
+			Timeout: base.NetworkTimeout,
+			// Do the pings even when there are no ongoing RPCs.
+			PermitWithoutStream: true,
+		}))
 		dialOpts = append(dialOpts, opts...)
 
 		if SourceAddr != nil {
@@ -258,11 +302,11 @@ func (ctx *Context) GRPCDial(target string, opts ...grpc.DialOption) (*grpc.Clie
 		}
 		meta.conn, meta.dialErr = grpc.DialContext(ctx.masterCtx, target, dialOpts...)
 		if meta.dialErr == nil {
-			if err := ctx.Stopper.RunTask(func() {
-				ctx.Stopper.RunWorker(func() {
+			if err := ctx.Stopper.RunTask(ctx.masterCtx, func(masterCtx context.Context) {
+				ctx.Stopper.RunWorker(masterCtx, func(masterCtx context.Context) {
 					err := ctx.runHeartbeat(meta, target)
 					if err != nil && !grpcutil.IsClosedConnection(err) {
-						log.Errorf(ctx.masterCtx, "removing connection to %s due to error: %s", target, err)
+						log.Errorf(masterCtx, "removing connection to %s due to error: %s", target, err)
 					}
 					ctx.removeConn(target, meta)
 				})
@@ -289,8 +333,13 @@ func (ctx *Context) NewBreaker() *circuit.Breaker {
 	return newBreaker(&ctx.breakerClock)
 }
 
-var errNotConnected = errors.New("not connected")
-var errNotHeartbeated = errors.New("not yet heartbeated")
+// ErrNotConnected is returned by ConnHealth when there is no connection to the
+// host (e.g. GRPCDial was never called for that address).
+var ErrNotConnected = errors.New("not connected")
+
+// ErrNotHeartbeated is returned by ConnHealth when we have not yet performed
+// the first heartbeat.
+var ErrNotHeartbeated = errors.New("not yet heartbeated")
 
 // ConnHealth returns whether the most recent heartbeat succeeded or not.
 // This should not be used as a definite status of a node's health and just used
@@ -301,7 +350,7 @@ func (ctx *Context) ConnHealth(remoteAddr string) error {
 	if meta, ok := ctx.conns.cache[remoteAddr]; ok {
 		return meta.heartbeatErr
 	}
-	return errNotConnected
+	return ErrNotConnected
 }
 
 func (ctx *Context) runHeartbeat(meta *connMeta, remoteAddr string) error {
@@ -326,33 +375,21 @@ func (ctx *Context) runHeartbeat(meta *connMeta, remoteAddr string) error {
 			heartbeatTimer.Read = true
 		}
 
-		goCtx, cancel := context.WithTimeout(ctx.masterCtx, ctx.HeartbeatTimeout)
+		goCtx := ctx.masterCtx
+		var cancel context.CancelFunc
+		if hbTimeout := ctx.heartbeatTimeout; hbTimeout > 0 {
+			goCtx, cancel = context.WithTimeout(goCtx, hbTimeout)
+		}
 		sendTime := ctx.LocalClock.PhysicalTime()
 		// NB: We want the request to fail-fast (the default), otherwise we won't
 		// be notified of transport failures.
 		response, err := heartbeatClient.Ping(goCtx, &request)
-		cancel()
+		if cancel != nil {
+			cancel()
+		}
 		ctx.conns.Lock()
 		meta.heartbeatErr = err
 		ctx.conns.Unlock()
-
-		// If we got a timeout, we might be experiencing a network partition. We
-		// close the connection so that all other pending RPCs (which may not have
-		// timeouts) fail eagerly. Any other error is likely to be noticed by
-		// other RPCs, so it's OK to leave the connection open while grpc
-		// internally reconnects if necessary.
-		//
-		// NB: This check is skipped when the connection is initiated from a CLI
-		// client since those clients aren't sensitive to partitions, are likely
-		// to be invoked while the server is starting (particularly in tests), and
-		// are not equipped with the retry logic necessary to deal with this
-		// connection termination.
-		//
-		// TODO(tamird): That we rely on the zero maxOffset to indicate a CLI
-		// client is a hack; we should do something more explicit.
-		if maxOffset != 0 && grpc.Code(err) == codes.DeadlineExceeded {
-			return err
-		}
 
 		// HACK: work around https://github.com/grpc/grpc-go/issues/1026
 		// Getting a "connection refused" error from the "write" system call
@@ -389,6 +426,6 @@ func (ctx *Context) runHeartbeat(meta *connMeta, remoteAddr string) error {
 			}
 		}
 
-		heartbeatTimer.Reset(ctx.HeartbeatInterval)
+		heartbeatTimer.Reset(ctx.heartbeatInterval)
 	}
 }

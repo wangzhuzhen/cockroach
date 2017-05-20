@@ -17,6 +17,7 @@
 package grpcutil
 
 import (
+	"io"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
@@ -29,6 +30,18 @@ import (
 	"google.golang.org/grpc/transport"
 )
 
+type localRequestKey struct{}
+
+// NewLocalRequestContext returns a Context that can be used for local (in-process) requests.
+func NewLocalRequestContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, localRequestKey{}, struct{}{})
+}
+
+// IsLocalRequestContext returns true if this context is marked for local (in-process) use.
+func IsLocalRequestContext(ctx context.Context) bool {
+	return ctx.Value(localRequestKey{}) != nil
+}
+
 // IsClosedConnection returns true if err's Cause is an error produced by gRPC
 // on closed connections.
 func IsClosedConnection(err error) bool {
@@ -38,6 +51,10 @@ func IsClosedConnection(err error) bool {
 		grpc.Code(err) == codes.Unavailable ||
 		grpc.ErrorDesc(err) == grpc.ErrClientConnClosing.Error() ||
 		strings.Contains(err.Error(), "is closing") ||
+		strings.Contains(err.Error(), "tls: use of closed connection") ||
+		strings.Contains(err.Error(), "use of closed network connection") ||
+		strings.Contains(err.Error(), io.ErrClosedPipe.Error()) ||
+		strings.Contains(err.Error(), io.EOF.Error()) ||
 		strings.Contains(err.Error(), "node unavailable") {
 		return true
 	}

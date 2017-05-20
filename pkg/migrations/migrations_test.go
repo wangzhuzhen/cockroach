@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/pkg/errors"
@@ -45,11 +46,19 @@ var (
 		name:           "add one descriptor",
 		workFn:         func(_ context.Context, _ runner) error { return nil },
 		newDescriptors: 1,
+		newRanges:      1,
 	}
 	addTwoDescriptorsMigration = migrationDescriptor{
 		name:           "add two descriptors",
 		workFn:         func(_ context.Context, _ runner) error { return nil },
 		newDescriptors: 2,
+		newRanges:      2,
+	}
+	addRangelessDescMigration = migrationDescriptor{
+		name:           "add rangeless descriptor",
+		workFn:         func(_ context.Context, _ runner) error { return nil },
+		newDescriptors: 2,
+		newRanges:      1,
 	}
 	errorMigration = migrationDescriptor{
 		name:   "error",
@@ -130,13 +139,14 @@ func (f *fakeDB) Txn(context.Context, func(context.Context, *client.Txn) error) 
 }
 
 func TestEnsureMigrations(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	db := &fakeDB{}
 	mgr := Manager{
 		stopper:      stop.NewStopper(),
 		leaseManager: &fakeLeaseManager{},
 		db:           db,
 	}
-	defer mgr.stopper.Stop()
+	defer mgr.stopper.Stop(context.TODO())
 
 	fnGotCalled := false
 	fnGotCalledDescriptor := migrationDescriptor{
@@ -147,77 +157,83 @@ func TestEnsureMigrations(t *testing.T) {
 		},
 	}
 	testCases := []struct {
-		preCompleted            []migrationDescriptor
-		migrations              []migrationDescriptor
-		expectedErr             string
-		expectedPreDescriptors  int
-		expectedPostDescriptors int
+		preCompleted                                    []migrationDescriptor
+		migrations                                      []migrationDescriptor
+		expectedErr                                     string
+		expectedPreDescriptors, expectedPostDescriptors int
+		expectedPreRanges, expectedPostRanges           int
 	}{
 		{
 			nil,
 			nil,
 			"",
-			0, 0,
+			0, 0, 0, 0,
 		},
 		{
 			nil,
 			[]migrationDescriptor{noopMigration1},
 			"",
-			0, 0,
+			0, 0, 0, 0,
 		},
 		{
 			[]migrationDescriptor{noopMigration1},
 			[]migrationDescriptor{noopMigration1},
 			"",
-			0, 0,
+			0, 0, 0, 0,
 		},
 		{
 			[]migrationDescriptor{},
 			[]migrationDescriptor{noopMigration1, noopMigration2},
 			"",
-			0, 0,
+			0, 0, 0, 0,
 		},
 		{
 			[]migrationDescriptor{noopMigration1},
 			[]migrationDescriptor{noopMigration1, noopMigration2},
 			"",
-			0, 0,
+			0, 0, 0, 0,
 		},
 		{
 			[]migrationDescriptor{noopMigration1, noopMigration2, panicMigration},
 			[]migrationDescriptor{noopMigration1, noopMigration2, panicMigration},
 			"",
-			0, 0,
+			0, 0, 0, 0,
 		},
 		{
 			[]migrationDescriptor{noopMigration1, noopMigration2},
 			[]migrationDescriptor{noopMigration1, noopMigration2, fnGotCalledDescriptor},
 			"",
-			0, 0,
+			0, 0, 0, 0,
 		},
 		{
 			[]migrationDescriptor{noopMigration1, noopMigration2},
 			[]migrationDescriptor{noopMigration1, noopMigration2, errorMigration},
 			fmt.Sprintf("failed to run migration %q", errorMigration.name),
-			0, 0,
+			0, 0, 0, 0,
 		},
 		{
 			[]migrationDescriptor{noopMigration1},
 			[]migrationDescriptor{noopMigration1, addOneDescriptorMigration},
 			"",
-			0, 1,
+			0, 1, 0, 1,
 		},
 		{
 			[]migrationDescriptor{addOneDescriptorMigration},
 			[]migrationDescriptor{addOneDescriptorMigration, addTwoDescriptorsMigration},
 			"",
-			1, 3,
+			1, 3, 1, 3,
+		},
+		{
+			[]migrationDescriptor{addOneDescriptorMigration},
+			[]migrationDescriptor{addOneDescriptorMigration, addRangelessDescMigration},
+			"",
+			1, 3, 1, 2,
 		},
 		{
 			[]migrationDescriptor{},
 			[]migrationDescriptor{noopMigration1, addOneDescriptorMigration, noopMigration2, addTwoDescriptorsMigration},
 			"",
-			0, 3,
+			0, 3, 0, 3,
 		},
 	}
 	for _, tc := range testCases {
@@ -228,13 +244,17 @@ func TestEnsureMigrations(t *testing.T) {
 			}
 			backwardCompatibleMigrations = tc.migrations
 
-			preDescriptors, err := AdditionalInitialDescriptors(context.Background(), mgr.db)
+			preDescriptors, preRanges, err := AdditionalInitialDescriptors(context.Background(), mgr.db)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if preDescriptors != tc.expectedPreDescriptors {
-				t.Errorf("expected %d additional initial ranges before migration, got %d",
+				t.Errorf("expected %d additional initial descriptors before migration, got %d",
 					tc.expectedPreDescriptors, preDescriptors)
+			}
+			if preRanges != tc.expectedPreRanges {
+				t.Errorf("expected %d additional initial ranges before migration, got %d",
+					tc.expectedPreRanges, preRanges)
 			}
 
 			err = mgr.EnsureMigrations(context.Background())
@@ -245,13 +265,17 @@ func TestEnsureMigrations(t *testing.T) {
 				return
 			}
 
-			postDescriptors, err := AdditionalInitialDescriptors(context.Background(), mgr.db)
+			postDescriptors, postRanges, err := AdditionalInitialDescriptors(context.Background(), mgr.db)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if postDescriptors != tc.expectedPostDescriptors {
-				t.Errorf("expected %d additional initial ranges after migration, got %d",
+				t.Errorf("expected %d additional initial descriptors after migration, got %d",
 					tc.expectedPostDescriptors, postDescriptors)
+			}
+			if postRanges != tc.expectedPostRanges {
+				t.Errorf("expected %d additional initial ranges after migration, got %d",
+					tc.expectedPostRanges, postRanges)
 			}
 
 			for _, migration := range tc.migrations {
@@ -271,13 +295,14 @@ func TestEnsureMigrations(t *testing.T) {
 }
 
 func TestDBErrors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	db := &fakeDB{}
 	mgr := Manager{
 		stopper:      stop.NewStopper(),
 		leaseManager: &fakeLeaseManager{},
 		db:           db,
 	}
-	defer mgr.stopper.Stop()
+	defer mgr.stopper.Stop(context.TODO())
 
 	migration := noopMigration1
 	backwardCompatibleMigrations = []migrationDescriptor{migration}
@@ -330,6 +355,7 @@ func TestDBErrors(t *testing.T) {
 // we don't test that here due to the added code that would be needed to change
 // its retry settings to allow for testing it in a reasonable amount of time.
 func TestLeaseErrors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	db := &fakeDB{kvs: make(map[string][]byte)}
 	mgr := Manager{
 		stopper: stop.NewStopper(),
@@ -339,7 +365,7 @@ func TestLeaseErrors(t *testing.T) {
 		},
 		db: db,
 	}
-	defer mgr.stopper.Stop()
+	defer mgr.stopper.Stop(context.TODO())
 
 	migration := noopMigration1
 	backwardCompatibleMigrations = []migrationDescriptor{migration}
@@ -358,13 +384,14 @@ func TestLeaseErrors(t *testing.T) {
 // The lease not having enough time left on it to finish migrations should
 // cause the process to exit via a call to log.Fatal.
 func TestLeaseExpiration(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	db := &fakeDB{kvs: make(map[string][]byte)}
 	mgr := Manager{
 		stopper:      stop.NewStopper(),
 		leaseManager: &fakeLeaseManager{leaseTimeRemaining: time.Nanosecond},
 		db:           db,
 	}
-	defer mgr.stopper.Stop()
+	defer mgr.stopper.Stop(context.TODO())
 
 	oldLeaseRefreshInterval := leaseRefreshInterval
 	leaseRefreshInterval = time.Microsecond

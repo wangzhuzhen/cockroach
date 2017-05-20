@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -58,7 +59,7 @@ func TestSelfBootstrap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 }
 
 // TestServerStartClock tests that a server's clock is not pushed out of thin
@@ -79,7 +80,7 @@ func TestServerStartClock(t *testing.T) {
 		},
 	}
 	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// Run a command so that we are sure to touch the timestamp cache. This is
 	// actually not needed because other commands run during server
@@ -111,7 +112,7 @@ func TestPlainHTTPServer(t *testing.T) {
 		// The default context uses embedded certs.
 		Insecure: true,
 	})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	var data serverpb.JSONResponse
 	testutils.SucceedsSoon(t, func() error {
@@ -128,7 +129,7 @@ func TestPlainHTTPServer(t *testing.T) {
 func TestSecureHTTPRedirect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
 	httpClient, err := s.GetHTTPClient()
@@ -178,7 +179,7 @@ func TestSecureHTTPRedirect(t *testing.T) {
 func TestAcceptEncoding(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	client, err := s.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +233,7 @@ func TestAcceptEncoding(t *testing.T) {
 func TestMultiRangeScanDeleteRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 	tds := db.GetSender()
 
@@ -320,7 +321,7 @@ func TestMultiRangeScanWithMaxResults(t *testing.T) {
 
 	for i, tc := range testCases {
 		s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
-		defer s.Stopper().Stop()
+		defer s.Stopper().Stop(context.TODO())
 		ts := s.(*TestServer)
 		tds := db.GetSender()
 
@@ -364,7 +365,7 @@ func TestSystemConfigGossip(t *testing.T) {
 	t.Skip("#12351")
 
 	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 	ctx := context.TODO()
 
@@ -386,7 +387,9 @@ func TestSystemConfigGossip(t *testing.T) {
 
 	// Write a system key with the transaction marked as having a Gossip trigger.
 	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		txn.SetSystemConfigTrigger()
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
 		return txn.Put(ctx, key, valAt(2))
 	}); err != nil {
 		t.Fatal(err)
@@ -453,5 +456,65 @@ func TestOfficializeAddr(t *testing.T) {
 		checkOfficialize(t, network, "hellow.world:1234", "127.0.0.1:2345", "hellow.world:1234")
 		checkOfficialize(t, network, ":1234", "127.0.0.1:2345", net.JoinHostPort(hostname, "1234"))
 		checkOfficialize(t, network, ":0", "127.0.0.1:2345", net.JoinHostPort(hostname, "2345"))
+	}
+}
+
+func TestClusterStores(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	tc := serverutils.StartTestCluster(t, 2, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(context.TODO())
+
+	testutils.SucceedsSoon(t, func() error {
+		stores := tc.Server(0).(*TestServer).ClusterStores()
+		if len(stores) != 2 {
+			return errors.Errorf("expected 2 stores, got %v", stores)
+		}
+		n1 := tc.Server(0).NodeID()
+		n2 := tc.Server(1).NodeID()
+		s1 := stores[0].NodeID
+		s2 := stores[1].NodeID
+		if !(n1 == s1 && n2 == s2) && !(n1 == s2 && n2 == s1) {
+			return errors.Errorf("expected stores for nodes %d, %d, got %v", n1, n2, stores)
+		}
+		return nil
+	})
+}
+
+func TestListenURLFileCreation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	file, err := ioutil.TempFile(os.TempDir(), t.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+		ListeningURLFile: file.Name(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stopper().Stop(context.TODO())
+	defer func() {
+		if err := os.Remove(file.Name()); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	data, err := ioutil.ReadFile(file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u, err := url.Parse(string(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if s.ServingAddr() != u.Host {
+		t.Fatalf("expected URL %s to match host %s", u, s.ServingAddr())
 	}
 }

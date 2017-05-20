@@ -20,6 +20,7 @@ option go_package = "serverpb";
 
 import "cockroach/pkg/build/info.proto";
 import "cockroach/pkg/gossip/gossip.proto";
+import "cockroach/pkg/roachpb/data.proto";
 import "cockroach/pkg/server/status/status.proto";
 import "cockroach/pkg/storage/engine/enginepb/mvcc.proto";
 import "cockroach/pkg/storage/storagebase/state.proto";
@@ -76,8 +77,6 @@ message RaftState {
   }
 
   uint64 replica_id = 1 [(gogoproto.customname) = "ReplicaID"];
-  // TODO(tamird): use raftpb's HardState. This leads to complications for
-  // the ui protos which are currently unsolved.
   raftpb.HardState hard_state  = 2 [(gogoproto.nullable) = false];
   // Lead is part of Raft's SoftState.
   uint64 lead = 3;
@@ -87,6 +86,14 @@ message RaftState {
   string state = 4;
   uint64 applied = 5;
   map<uint64, Progress> progress = 6 [(gogoproto.nullable) = false];
+}
+
+message RangeProblems {
+    bool unavailable = 1;
+    bool leader_not_lease_holder = 2;
+    bool no_raft_leader = 3;
+    bool underreplicated = 4;
+    bool no_lease = 5;
 }
 
 message RangeInfo {
@@ -102,6 +109,8 @@ message RangeInfo {
      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.StoreID"
   ];
   string error_message = 7;
+  repeated roachpb.Lease lease_history = 8 [(gogoproto.nullable) = false];
+  RangeProblems problems = 9 [(gogoproto.nullable) = false];
 }
 
 message RangesRequest {

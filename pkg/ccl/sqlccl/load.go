@@ -4,7 +4,7 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/pkg/ccl/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
 
 package sqlccl
 
@@ -14,8 +14,8 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
+	"time"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -46,25 +46,27 @@ func Load(
 	database, uri string,
 	ts hlc.Timestamp,
 	loadChunkBytes int64,
+	tempPrefix string,
 ) (BackupDescriptor, error) {
 	if loadChunkBytes == 0 {
 		loadChunkBytes = config.DefaultZoneConfig().RangeMaxBytes / 2
 	}
 
-	// TODO(dan): Handle traditional vs modern.
-	syntax := parser.Traditional
 	parse := parser.Parser{}
+	curTime := time.Unix(0, ts.WallTime).UTC()
 	evalCtx := parser.EvalContext{}
+	evalCtx.SetTxnTimestamp(curTime)
+	evalCtx.SetStmtTimestamp(curTime)
 
-	dir, err := storageccl.ExportStorageFromURI(ctx, uri)
+	conf, err := storageccl.ExportStorageConfFromURI(uri)
+	if err != nil {
+		return BackupDescriptor{}, err
+	}
+	dir, err := storageccl.MakeExportStorage(ctx, conf)
 	if err != nil {
 		return BackupDescriptor{}, errors.Wrap(err, "export storage from URI")
 	}
-	defer func() {
-		if err := dir.Close(); err != nil {
-			log.Errorf(ctx, "close storage: %s", err)
-		}
-	}()
+	defer dir.Close()
 
 	var dbDescBytes []byte
 	if err := db.QueryRow(`
@@ -90,7 +92,7 @@ func Load(
 
 	var currentCmd bytes.Buffer
 	scanner := bufio.NewReader(r)
-	var ri sql.RowInserter
+	var ri sqlbase.RowInserter
 	var defaultExprs []parser.TypedExpr
 	var cols []sqlbase.ColumnDescriptor
 	var tableDesc *sqlbase.TableDescriptor
@@ -112,20 +114,20 @@ func Load(
 			return BackupDescriptor{}, errors.Wrap(err, "read line")
 		}
 		currentCmd.WriteString(line)
-		if !isEndOfStatement(syntax, currentCmd.String()) {
+		if !isEndOfStatement(currentCmd.String()) {
 			currentCmd.WriteByte('\n')
 			continue
 		}
 		cmd := currentCmd.String()
 		currentCmd.Reset()
-		stmt, err := parser.ParseOne(cmd, syntax)
+		stmt, err := parser.ParseOne(cmd)
 		if err != nil {
 			return BackupDescriptor{}, errors.Wrapf(err, "parsing: %q", cmd)
 		}
 		switch s := stmt.(type) {
 		case *parser.CreateTable:
 			if tableDesc != nil {
-				if err := writeSST(ctx, &backup, dir, kvs, ts); err != nil {
+				if err := writeSST(ctx, &backup, dir, tempPrefix, kvs, ts); err != nil {
 					return BackupDescriptor{}, errors.Wrap(err, "writeSST")
 				}
 				kvs = kvs[:0]
@@ -146,7 +148,7 @@ func Load(
 			// only uses txn for resolving FKs and interleaved tables, neither of which
 			// are present here.
 			var txn *client.Txn
-			desc, err := sql.MakeTableDesc(ctx, txn, sql.NilVirtualTabler, nil, s, dbDesc.ID, 0 /* table ID */, privs, affected, dbDesc.Name)
+			desc, err := sql.MakeTableDesc(ctx, txn, sql.NilVirtualTabler, nil, s, dbDesc.ID, 0 /* table ID */, privs, affected, dbDesc.Name, &evalCtx)
 			if err != nil {
 				return BackupDescriptor{}, errors.Wrap(err, "make table desc")
 			}
@@ -157,7 +159,7 @@ func Load(
 				Union: &sqlbase.Descriptor_Table{Table: tableDesc},
 			})
 
-			ri, err = sql.MakeRowInserter(nil, tableDesc, nil, tableDesc.Columns, true)
+			ri, err = sqlbase.MakeRowInserter(nil, tableDesc, nil, tableDesc.Columns, true)
 			if err != nil {
 				return BackupDescriptor{}, errors.Wrap(err, "make row inserter")
 			}
@@ -195,7 +197,7 @@ func Load(
 			}
 
 			if kvBytes > loadChunkBytes {
-				if err := writeSST(ctx, &backup, dir, kvs, ts); err != nil {
+				if err := writeSST(ctx, &backup, dir, tempPrefix, kvs, ts); err != nil {
 					return BackupDescriptor{}, errors.Wrap(err, "writeSST")
 				}
 				kvs = kvs[:0]
@@ -208,7 +210,7 @@ func Load(
 	}
 
 	if tableDesc != nil {
-		if err := writeSST(ctx, &backup, dir, kvs, ts); err != nil {
+		if err := writeSST(ctx, &backup, dir, tempPrefix, kvs, ts); err != nil {
 			return BackupDescriptor{}, errors.Wrap(err, "writeSST")
 		}
 	}
@@ -217,15 +219,7 @@ func Load(
 	if err != nil {
 		return BackupDescriptor{}, errors.Wrap(err, "marshal backup descriptor")
 	}
-	descFile, err := dir.PutFile(ctx, BackupDescriptorName)
-	if err != nil {
-		return BackupDescriptor{}, errors.Wrap(err, "creating backup descriptor file")
-	}
-	defer descFile.Cleanup()
-	if err = ioutil.WriteFile(descFile.LocalFile(), descBuf, 0600); err != nil {
-		return BackupDescriptor{}, errors.Wrap(err, "write backup descriptor")
-	}
-	if err := descFile.Finish(); err != nil {
+	if err := dir.WriteFile(ctx, BackupDescriptorName, bytes.NewReader(descBuf)); err != nil {
 		return BackupDescriptor{}, errors.Wrap(err, "uploading backup descriptor")
 	}
 
@@ -238,7 +232,7 @@ func insertStmtToKVs(
 	defaultExprs []parser.TypedExpr,
 	cols []sqlbase.ColumnDescriptor,
 	evalCtx parser.EvalContext,
-	ri sql.RowInserter,
+	ri sqlbase.RowInserter,
 	stmt *parser.Insert,
 	f func(roachpb.KeyValue),
 ) error {
@@ -312,8 +306,8 @@ func (i inserter) Put(key, value interface{}) {
 }
 
 // isEndOfStatement returns true if stmt ends with a semicolon.
-func isEndOfStatement(syntax parser.Syntax, stmt string) bool {
-	sc := parser.MakeScanner(stmt, syntax)
+func isEndOfStatement(stmt string) bool {
+	sc := parser.MakeScanner(stmt)
 	var last int
 	sc.Tokens(func(t int) {
 		last = t
@@ -325,16 +319,17 @@ func writeSST(
 	ctx context.Context,
 	backup *BackupDescriptor,
 	base storageccl.ExportStorage,
+	tempPrefix string,
 	kvs []engine.MVCCKeyValue,
 	ts hlc.Timestamp,
 ) error {
 	filename := fmt.Sprintf("load-%d.sst", rand.Int63())
 	log.Info(ctx, "writesst ", filename)
-	sstFile, err := base.PutFile(ctx, filename)
+	sstFile, err := storageccl.MakeExportFileTmpWriter(ctx, tempPrefix, base, filename)
 	if err != nil {
 		return err
 	}
-	defer sstFile.Cleanup()
+	defer sstFile.Close(ctx)
 
 	sst := engine.MakeRocksDBSstFileWriter()
 	if err := sst.Open(sstFile.LocalFile()); err != nil {
@@ -350,7 +345,7 @@ func writeSST(
 		return err
 	}
 
-	if err := sstFile.Finish(); err != nil {
+	if err := sstFile.Finish(ctx); err != nil {
 		return err
 	}
 

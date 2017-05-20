@@ -21,11 +21,25 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
+
+// MakeDBClient creates a kv client for use in cli tools.
+func MakeDBClient() (*client.DB, *stop.Stopper, error) {
+	// The KV endpoints require the node user.
+	baseCfg.User = security.NodeUser
+	conn, clock, stopper, err := getClientGRPCConn()
+	if err != nil {
+		return nil, nil, err
+	}
+	return client.NewDB(client.NewSender(conn), clock), stopper, nil
+}
 
 // A lsRangesCmd command lists the ranges in a cluster.
 var lsRangesCmd = &cobra.Command{
@@ -60,7 +74,7 @@ func runLsRanges(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	rows, err := kvDB.Scan(context.Background(), startKey, endKey, maxResults)
 	if err != nil {
@@ -103,7 +117,7 @@ func runSplitRange(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 	return errors.Wrap(kvDB.AdminSplit(context.Background(), key), "split failed")
 }
 

@@ -57,7 +57,7 @@ func runLsNodes(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	nodeStatuses, err := c.Nodes(stopperContext(stopper), &serverpb.NodesRequest{})
 	if err != nil {
@@ -71,8 +71,7 @@ func runLsNodes(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	printQueryOutput(os.Stdout, lsNodesColumnHeaders, rows, "", cliCtx.tableDisplayFormat)
-	return nil
+	return printQueryOutput(os.Stdout, lsNodesColumnHeaders, newRowSliceIter(rows), "", cliCtx.tableDisplayFormat)
 }
 
 var nodesColumnHeaders = []string{
@@ -110,12 +109,13 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer stopper.Stop()
+	ctx := stopperContext(stopper)
+	defer stopper.Stop(ctx)
 
 	switch len(args) {
 	case 0:
 		// Show status for all nodes.
-		nodes, err := c.Nodes(stopperContext(stopper), &serverpb.NodesRequest{})
+		nodes, err := c.Nodes(ctx, &serverpb.NodesRequest{})
 		if err != nil {
 			return err
 		}
@@ -123,7 +123,7 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 
 	case 1:
 		nodeID := args[0]
-		nodeStatus, err := c.Node(stopperContext(stopper), &serverpb.NodeRequest{NodeId: nodeID})
+		nodeStatus, err := c.Node(ctx, &serverpb.NodeRequest{NodeId: nodeID})
 		if err != nil {
 			return err
 		}
@@ -140,9 +140,8 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 		return errors.Errorf("expected no arguments or a single node ID")
 	}
 
-	printQueryOutput(os.Stdout, nodesColumnHeaders, nodeStatusesToRows(nodeStatuses), "",
+	return printQueryOutput(os.Stdout, nodesColumnHeaders, newRowSliceIter(nodeStatusesToRows(nodeStatuses)), "",
 		cliCtx.tableDisplayFormat)
-	return nil
 }
 
 // nodeStatusesToRows converts NodeStatuses to SQL-like result rows, so that we can pretty-print
@@ -206,7 +205,7 @@ func init() {
 }
 
 func getStatusClient() (serverpb.StatusClient, *stop.Stopper, error) {
-	conn, _, stopper, err := getGRPCConn()
+	conn, _, stopper, err := getClientGRPCConn()
 	if err != nil {
 		return nil, nil, err
 	}

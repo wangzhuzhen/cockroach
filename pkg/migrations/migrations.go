@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -52,6 +53,17 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 		name:           "create system.jobs table",
 		workFn:         createJobsTable,
 		newDescriptors: 1,
+		newRanges:      1,
+	},
+	{
+		name:           "create system.settings table",
+		workFn:         createSettingsTable,
+		newDescriptors: 1,
+		newRanges:      0, // it lives in gossip range.
+	},
+	{
+		name:   "enable diagnostics reporting",
+		workFn: optIntToDiagnosticsStatReporting,
 	},
 }
 
@@ -64,10 +76,11 @@ type migrationDescriptor struct {
 	// workFn must be idempotent so that we can safely re-run it if a node failed
 	// while running it.
 	workFn func(context.Context, runner) error
-	// newDescriptors is the number of additional descriptors that would be added
-	// by this migration in a fresh cluster. This is needed to automate certain
-	// tests, which check the number of ranges present on server bootup.
-	newDescriptors int
+	// newRanges and descriptors are the number of additional ranges/descriptors
+	// that would be added by this migration in a fresh cluster. This is needed to
+	// automate certain tests, which check the number of ranges/descriptors
+	// present on server bootup.
+	newRanges, newDescriptors int
 }
 
 type runner struct {
@@ -132,26 +145,28 @@ func NewManager(
 	}
 }
 
-// AdditionalInitialDescriptors returns the number of system descriptors that
-// have been added by migrations. This is needed for certain tests, which check
-// the number of ranges at node startup.
+// AdditionalInitialDescriptors returns the number of system descriptors and
+// ranges that have been added by migrations. This is needed for certain tests,
+// which check the number of ranges at node startup.
 //
 // NOTE: This value may be out-of-date if another node is actively running
 // migrations, and so should only be used in test code where the migration
 // lifecycle is tightly controlled.
-func AdditionalInitialDescriptors(ctx context.Context, db db) (int, error) {
+func AdditionalInitialDescriptors(
+	ctx context.Context, db db,
+) (descriptors int, ranges int, _ error) {
 	completedMigrations, err := getCompletedMigrations(ctx, db)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	n := 0
 	for _, migration := range backwardCompatibleMigrations {
 		key := migrationKey(migration)
 		if _, ok := completedMigrations[string(key)]; ok {
-			n += migration.newDescriptors
+			descriptors += migration.newDescriptors
+			ranges += migration.newRanges
 		}
 	}
-	return n, nil
+	return descriptors, ranges, nil
 }
 
 // EnsureMigrations should be run during node startup to ensure that all
@@ -215,10 +230,19 @@ func (m *Manager) EnsureMigrations(ctx context.Context) error {
 				log.Warningf(ctx, "unable to extend ownership of expiration lease: %s", err)
 			}
 			if m.leaseManager.TimeRemaining(lease) < leaseRefreshInterval {
-				// Note that we may be able to do better than this by influencing the
-				// deadline of migrations' transactions based on the least expiration
-				// time, but simply kill the process for now for the sake of simplicity.
-				log.Fatal(ctx, "not enough time left on migration lease, terminating for safety")
+				// Do one last final check of whether we're done - it's possible that
+				// ReleaseLease can sneak in and execute ahead of ExtendLease even if
+				// the ExtendLease started first (making for an unexpected value error),
+				// and doing this final check can avoid unintended shutdowns.
+				select {
+				case <-done:
+					return
+				default:
+					// Note that we may be able to do better than this by influencing the
+					// deadline of migrations' transactions based on the lease expiration
+					// time, but simply kill the process for now for the sake of simplicity.
+					log.Fatal(ctx, "not enough time left on migration lease, terminating for safety")
+				}
 			}
 		}
 	}); err != nil {
@@ -316,6 +340,7 @@ func eventlogUniqueIDDefault(ctx context.Context, r runner) error {
 	return err
 }
 
+// TODO(a-robinson): Write unit test for this.
 func createJobsTable(ctx context.Context, r runner) error {
 	// We install the table at the KV layer so that we can choose a known ID in
 	// the reserved ID space. (The SQL layer doesn't allow this.)
@@ -324,7 +349,53 @@ func createJobsTable(ctx context.Context, r runner) error {
 		desc := sqlbase.JobsTable
 		b.CPut(sqlbase.MakeNameMetadataKey(desc.GetParentID(), desc.GetName()), desc.GetID(), nil)
 		b.CPut(sqlbase.MakeDescMetadataKey(desc.GetID()), sqlbase.WrapDescriptor(&desc), nil)
-		txn.SetSystemConfigTrigger()
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
 		return txn.Run(ctx, b)
 	})
+}
+
+// TODO(a-robinson): Write unit test for this.
+func createSettingsTable(ctx context.Context, r runner) error {
+	// We install the table at the KV layer so that we can choose a known ID in
+	// the reserved ID space. (The SQL layer doesn't allow this.)
+	return r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		b := txn.NewBatch()
+		desc := sqlbase.SettingsTable
+		b.CPut(sqlbase.MakeNameMetadataKey(desc.GetParentID(), desc.GetName()), desc.GetID(), nil)
+		b.CPut(sqlbase.MakeDescMetadataKey(desc.GetID()), sqlbase.WrapDescriptor(&desc), nil)
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
+		return txn.Run(ctx, b)
+	})
+}
+
+var reportingOptOut = envutil.EnvOrDefaultBool("COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING", false)
+
+func optIntToDiagnosticsStatReporting(ctx context.Context, r runner) error {
+	const setStmt = "SET CLUSTER SETTING diagnostics.reporting.enabled = true"
+
+	// We're opting-out of the automatic opt-in. See discussion in updates.go.
+	if reportingOptOut {
+		return nil
+	}
+
+	// System tables can only be modified by a privileged internal user.
+	session := r.newRootSession(ctx)
+	defer session.Finish(r.sqlExecutor)
+	// Retry a limited number of times because returning an error and letting
+	// the node kill itself is better than holding the migration lease for an
+	// arbitrarily long time.
+	var err error
+	for retry := retry.Start(retry.Options{MaxRetries: 5}); retry.Next(); {
+		res := r.sqlExecutor.ExecuteStatements(session, setStmt, nil)
+		err = checkQueryResults(res.ResultList, 1)
+		if err == nil {
+			break
+		}
+		log.Warningf(ctx, "failed attempt to update setting: %s", err)
+	}
+	return err
 }

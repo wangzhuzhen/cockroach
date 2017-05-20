@@ -17,8 +17,12 @@
 package storage
 
 import (
+	"reflect"
 	"time"
 
+	"github.com/coreos/etcd/raft"
+	"github.com/kr/pretty"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -28,9 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/coreos/etcd/raft"
-	"github.com/kr/pretty"
-	"github.com/pkg/errors"
 )
 
 // leaseMetricsType is used to distinguish between various lease
@@ -74,10 +75,9 @@ type ProposalData struct {
 	// proposalResult come from LocalEvalResult)
 	doneCh chan proposalResult
 
-	// Local contains the results of evaluating the request in
-	// propEvalKV, tying the upstream evaluation of the request to the
-	// downstream application of the command. If propEvalKV is false,
-	// Local is nil.
+	// Local contains the results of evaluating the request
+	// tying the upstream evaluation of the request to the
+	// downstream application of the command.
 	Local *LocalEvalResult
 
 	// Request is the client's original BatchRequest.
@@ -229,13 +229,6 @@ func (p *EvalResult) MergeAndDestroy(q EvalResult) error {
 		return errors.New("must not specify Stats")
 	}
 
-	if p.Replicated.State.Frozen == storagebase.ReplicaState_FROZEN_UNSPECIFIED {
-		p.Replicated.State.Frozen = q.Replicated.State.Frozen
-	} else if q.Replicated.State.Frozen != storagebase.ReplicaState_FROZEN_UNSPECIFIED {
-		return errors.New("conflicting FrozenStatus")
-	}
-	q.Replicated.State.Frozen = storagebase.ReplicaState_FROZEN_UNSPECIFIED
-
 	p.Replicated.BlockReads = p.Replicated.BlockReads || q.Replicated.BlockReads
 	q.Replicated.BlockReads = false
 
@@ -308,7 +301,7 @@ func (p *EvalResult) MergeAndDestroy(q EvalResult) error {
 	}
 	q.Local.updatedTxn = nil
 
-	if (q != EvalResult{}) {
+	if !reflect.DeepEqual(q, EvalResult{}) {
 		log.Fatalf(context.TODO(), "unhandled EvalResult: %s", pretty.Diff(q, EvalResult{}))
 	}
 
@@ -377,14 +370,21 @@ func (r *Replica) computeChecksumPostApply(
 	}
 }
 
+// leasePostApply is called when a RequestLease or TransferLease
+// request is executed for a range.
 func (r *Replica) leasePostApply(
-	ctx context.Context,
-	newLease *roachpb.Lease,
-	replicaID roachpb.ReplicaID,
-	prevLease *roachpb.Lease,
+	ctx context.Context, newLease roachpb.Lease, replicaID roachpb.ReplicaID, prevLease roachpb.Lease,
 ) {
 	iAmTheLeaseHolder := newLease.Replica.ReplicaID == replicaID
 	leaseChangingHands := prevLease.Replica.StoreID != newLease.Replica.StoreID
+
+	if iAmTheLeaseHolder {
+		// Always log lease acquisition for epoch-based leases which are
+		// infrequent.
+		if newLease.Type() == roachpb.LeaseEpoch || (log.V(1) && leaseChangingHands) {
+			log.Infof(ctx, "new range lease %s following %s", newLease, prevLease)
+		}
+	}
 
 	if leaseChangingHands && iAmTheLeaseHolder {
 		// If this replica is a new holder of the lease, update the low water
@@ -398,13 +398,16 @@ func (r *Replica) leasePostApply(
 		// requests, this is kosher). This means that we don't use the old
 		// lease's expiration but instead use the new lease's start to initialize
 		// the timestamp cache low water.
-		if log.V(1) {
-			log.Infof(ctx, "new range lease %s following %s [physicalTime=%s]",
-				newLease, prevLease, r.store.Clock().PhysicalTime())
+		desc := r.Desc()
+		r.store.tsCacheMu.Lock()
+		for _, keyRange := range makeReplicatedKeyRanges(desc) {
+			for _, readOnly := range []bool{true, false} {
+				r.store.tsCacheMu.cache.add(
+					keyRange.start.Key, keyRange.end.Key,
+					newLease.Start, lowWaterTxnIDMarker, readOnly)
+			}
 		}
-		r.tsCacheMu.Lock()
-		r.tsCacheMu.cache.SetLowWater(newLease.Start)
-		r.tsCacheMu.Unlock()
+		r.store.tsCacheMu.Unlock()
 
 		// Reset the request counts used to make lease placement decisions whenever
 		// starting a new lease.
@@ -420,16 +423,9 @@ func (r *Replica) leasePostApply(
 		}
 	}
 	if leaseChangingHands && !iAmTheLeaseHolder {
-		// We're not the lease holder, reset our timestamp cache, releasing
-		// anything currently cached. The timestamp cache is only used by the
-		// lease holder. Note that we'll call SetLowWater when we next acquire
-		// the lease.
-		r.tsCacheMu.Lock()
-		r.tsCacheMu.cache.Clear(r.store.Clock().Now())
-		r.tsCacheMu.Unlock()
 		// Also clear and disable the push transaction queue. Any waiters
 		// must be redirected to the new lease holder.
-		r.pushTxnQueue.ClearAndDisable()
+		r.pushTxnQueue.Clear(true /* disable */)
 	}
 
 	if !iAmTheLeaseHolder && r.IsLeaseValid(newLease, r.store.Clock().Now()) {
@@ -466,6 +462,11 @@ func (r *Replica) leasePostApply(
 		}
 		// Make sure the push transaction queue is enabled.
 		r.pushTxnQueue.Enable()
+	}
+
+	// Mark the new lease in the replica's lease history.
+	if r.leaseHistory != nil {
+		r.leaseHistory.add(newLease)
 	}
 }
 
@@ -506,9 +507,9 @@ func (r *Replica) handleReplicatedEvalResult(
 	// that all fields were handled).
 	{
 		rResult.IsLeaseRequest = false
-		rResult.IsConsistencyRelated = false
-		rResult.IsFreeze = false
 		rResult.Timestamp = hlc.Timestamp{}
+		rResult.StartKey = nil
+		rResult.EndKey = nil
 	}
 
 	if rResult.BlockReads {
@@ -532,10 +533,6 @@ func (r *Replica) handleReplicatedEvalResult(
 	r.store.metrics.addMVCCStats(rResult.Delta)
 	rResult.Delta = enginepb.MVCCStats{}
 
-	const raftLogCheckFrequency = 1 + RaftLogQueueStaleThreshold/4
-	if rResult.State.RaftAppliedIndex%raftLogCheckFrequency == 1 {
-		r.store.raftLogQueue.MaybeAdd(r, r.store.Clock().Now())
-	}
 	if needsSplitBySize {
 		r.store.splitQueue.MaybeAdd(r, r.store.Clock().Now())
 	}
@@ -546,7 +543,7 @@ func (r *Replica) handleReplicatedEvalResult(
 
 	// The above are always present, so we assert only if there are
 	// "nontrivial" actions below.
-	shouldAssert = (rResult != storagebase.ReplicatedEvalResult{})
+	shouldAssert = !reflect.DeepEqual(rResult, storagebase.ReplicatedEvalResult{})
 
 	// Process Split or Merge. This needs to happen after stats update because
 	// of the ContainsEstimates hack.
@@ -564,7 +561,7 @@ func (r *Replica) handleReplicatedEvalResult(
 			r.mu.state.Stats.ContainsEstimates = false
 			stats := r.mu.state.Stats
 			r.mu.Unlock()
-			if err := r.stateLoader.setMVCCStats(ctx, r.store.Engine(), &stats); err != nil {
+			if err := r.raftMu.stateLoader.setMVCCStats(ctx, r.store.Engine(), &stats); err != nil {
 				log.Fatal(ctx, errors.Wrap(err, "unable to write MVCC stats"))
 			}
 		}
@@ -589,13 +586,6 @@ func (r *Replica) handleReplicatedEvalResult(
 	}
 
 	// Update the remaining ReplicaState.
-
-	if rResult.State.Frozen != storagebase.ReplicaState_FROZEN_UNSPECIFIED {
-		r.mu.Lock()
-		r.mu.state.Frozen = rResult.State.Frozen
-		r.mu.Unlock()
-	}
-	rResult.State.Frozen = storagebase.ReplicaState_FROZEN_UNSPECIFIED
 
 	if newDesc := rResult.State.Desc; newDesc != nil {
 		if err := r.setDesc(newDesc); err != nil {
@@ -630,11 +620,11 @@ func (r *Replica) handleReplicatedEvalResult(
 
 		r.mu.Lock()
 		replicaID := r.mu.replicaID
-		prevLease := r.mu.state.Lease
+		prevLease := *r.mu.state.Lease
 		r.mu.state.Lease = newLease
 		r.mu.Unlock()
 
-		r.leasePostApply(ctx, newLease, replicaID, prevLease)
+		r.leasePostApply(ctx, *newLease, replicaID, prevLease)
 	}
 
 	if newTruncState := rResult.State.TruncatedState; newTruncState != nil {
@@ -669,16 +659,37 @@ func (r *Replica) handleReplicatedEvalResult(
 	if rResult.RaftLogDelta != nil {
 		r.mu.Lock()
 		r.mu.raftLogSize += *rResult.RaftLogDelta
+		r.mu.raftLogLastCheckSize += *rResult.RaftLogDelta
+		// Ensure raftLog{,LastCheck}Size is not negative since it isn't persisted
+		// between server restarts.
 		if r.mu.raftLogSize < 0 {
-			// Ensure raftLogSize is not negative since it isn't persisted between
-			// server restarts.
 			r.mu.raftLogSize = 0
+		}
+		if r.mu.raftLogLastCheckSize < 0 {
+			r.mu.raftLogLastCheckSize = 0
 		}
 		r.mu.Unlock()
 		rResult.RaftLogDelta = nil
+	} else {
+		// Check for whether to queue the range for Raft log truncation if this is
+		// not a Raft log truncation command itself. We don't want to check the
+		// Raft log for truncation on every write operation or even every operation
+		// which occurs after the Raft log exceeds RaftLogQueueStaleSize. The logic
+		// below queues the replica for possible Raft log truncation whenever an
+		// additional RaftLogQueueStaleSize bytes have been written to the Raft
+		// log.
+		r.mu.Lock()
+		checkRaftLog := r.mu.raftLogSize-r.mu.raftLogLastCheckSize >= RaftLogQueueStaleSize
+		if checkRaftLog {
+			r.mu.raftLogLastCheckSize = r.mu.raftLogSize
+		}
+		r.mu.Unlock()
+		if checkRaftLog {
+			r.store.raftLogQueue.MaybeAdd(r, r.store.Clock().Now())
+		}
 	}
 
-	if (rResult != storagebase.ReplicatedEvalResult{}) {
+	if !reflect.DeepEqual(rResult, storagebase.ReplicatedEvalResult{}) {
 		log.Fatalf(ctx, "unhandled field in ReplicatedEvalResult: %s", pretty.Diff(rResult, storagebase.ReplicatedEvalResult{}))
 	}
 	return shouldAssert
@@ -777,20 +788,19 @@ func (r *Replica) handleLocalEvalResult(
 	return shouldAssert
 }
 
-func (r *Replica) handleEvalResult(
-	ctx context.Context, lResult *LocalEvalResult, rResult *storagebase.ReplicatedEvalResult,
+func (r *Replica) handleEvalResultRaftMuLocked(
+	ctx context.Context, lResult *LocalEvalResult, rResult storagebase.ReplicatedEvalResult,
 ) {
-	// Careful: `shouldAssert = f() || g()` will not run both if `f()` is true.
-	shouldAssert := false
-	if rResult != nil {
-		shouldAssert = r.handleReplicatedEvalResult(ctx, *rResult) || shouldAssert
-	}
+	shouldAssert := r.handleReplicatedEvalResult(ctx, rResult)
 	if lResult != nil {
+		// Careful: `shouldAssert = f() || g()` will not run both if `f()` is true.
 		shouldAssert = r.handleLocalEvalResult(ctx, *lResult) || shouldAssert
 	}
 	if shouldAssert {
 		// Assert that the on-disk state doesn't diverge from the in-memory
 		// state as a result of the side effects.
-		r.assertState(r.store.Engine())
+		r.mu.Lock()
+		r.assertStateLocked(ctx, r.store.Engine())
+		r.mu.Unlock()
 	}
 }

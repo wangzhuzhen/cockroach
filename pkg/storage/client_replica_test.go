@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -180,14 +181,21 @@ func TestRejectFutureCommand(t *testing.T) {
 func TestTxnPutOutOfOrder(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	// key is selected to fall within the meta range in order for the later
+	// routing of requests to range 1 to work properly. Removing the routing
+	// of all requests to range 1 would allow us to make the key more normal.
 	const key = "key"
 	// Set up a filter to so that the get operation at Step 3 will return an error.
 	var numGets int32
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	manual := hlc.NewManualClock(123)
 	cfg := storage.TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
+	// Splits can cause our chosen key to end up on a range other than range 1,
+	// and trying to handle that complicates the test without providing any
+	// added benefit.
+	cfg.TestingKnobs.DisableSplitQueue = true
 	cfg.TestingKnobs.TestingEvalFilter =
 		func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 			if _, ok := filterArgs.Req.(*roachpb.GetRequest); ok &&
@@ -251,7 +259,7 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 				return err
 			}
 			if !bytes.Equal(actual.ValueBytes(), updatedVal) {
-				t.Fatalf("unexpected get result: %s", actual)
+				return errors.Errorf("unexpected get result: %s", actual)
 			}
 
 			if epoch == 0 {
@@ -265,7 +273,9 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 		})
 
 		if epoch != 2 {
-			errChan <- errors.Errorf("unexpected number of txn retries: %d", epoch)
+			file, line, _ := caller.Lookup(0)
+			errChan <- errors.Errorf("%s:%d unexpected number of txn retries. "+
+				"Expected epoch 2, got: %d.", file, line, epoch)
 		} else {
 			errChan <- nil
 		}
@@ -322,7 +332,7 @@ func TestRangeLookupUseReverse(t *testing.T) {
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
 	// Init test ranges:
@@ -565,7 +575,7 @@ func TestRangeTransferLease(t *testing.T) {
 		}
 	}
 
-	forceLeaseExtension := func(sender *storage.Stores, lease *roachpb.Lease) error {
+	forceLeaseExtension := func(sender *storage.Stores, lease roachpb.Lease) error {
 		shouldRenewTS := lease.Expiration.Add(-1, 0)
 		mtc.manualClock.Set(shouldRenewTS.WallTime + 1)
 		return sendRead(sender).GoError()
@@ -578,8 +588,8 @@ func TestRangeTransferLease(t *testing.T) {
 				t.Fatal(err)
 			}
 			newLease, _ := replica0.GetLease()
-			if err := origLease.Equivalent(*newLease); err != nil {
-				t.Fatal(err)
+			if !origLease.Equivalent(newLease) {
+				t.Fatalf("original lease %v and new lease %v not equivalent", origLease, newLease)
 			}
 		}
 
@@ -915,10 +925,11 @@ func TestLeaseNotUsedAfterRestart(t *testing.T) {
 // Test that a lease extension (a RequestLeaseRequest that doesn't change the
 // lease holder) is not blocked by ongoing reads.
 // The test relies on two things:
-// 1) Lease extensions, unlike lease transfers, are not blocked by reads through their
-// PostCommitTrigger.noConcurrentReads.
-// 2) Requests with the non-KV flag, such as RequestLeaseRequest, do not
-// go through the command queue.
+// 1) Lease extensions, unlike lease transfers, are not blocked by reads through
+// their ReplicatedEvalResult.BlockReads.
+// 2) Requests such as RequestLeaseRequest don't declare to touch the whole key
+// span of the range, and thus don't conflict through the command queue with
+// other reads.
 func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	readBlocked := make(chan struct{})
@@ -940,7 +951,7 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 			},
 		})
 	s := srv.(*server.TestServer)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// Start a read and wait for it to block.
 	key := roachpb.Key("a")
@@ -971,6 +982,12 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		curLease, _, err := s.GetRangeLease(context.TODO(), key)
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		leaseReq := roachpb.RequestLeaseRequest{
 			Span: roachpb.Span{
 				Key: key,
@@ -980,6 +997,7 @@ func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 				Expiration: s.Clock().Now().Add(time.Second.Nanoseconds(), 0),
 				Replica:    repDesc,
 			},
+			PrevLease: curLease,
 		}
 		if _, pErr := client.SendWrapped(context.Background(), s.DistSender(), &leaseReq); pErr != nil {
 			t.Fatal(pErr)
@@ -1017,7 +1035,7 @@ func TestLeaseInfoRequest(t *testing.T) {
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 		})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	kvDB0 := tc.Servers[0].DB()
 	kvDB1 := tc.Servers[1].DB()
@@ -1121,7 +1139,7 @@ func TestErrorHandlingForNonKVCommand(t *testing.T) {
 			},
 		})
 	s := srv.(*server.TestServer)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// Send the lease request.
 	key := roachpb.Key("a")
@@ -1197,7 +1215,7 @@ func TestRangeInfo(t *testing.T) {
 	expRangeInfos := []roachpb.RangeInfo{
 		{
 			Desc:  *rhsReplica0.Desc(),
-			Lease: *rhsLease,
+			Lease: rhsLease,
 		},
 	}
 	if !reflect.DeepEqual(reply.Header().RangeInfos, expRangeInfos) {
@@ -1229,11 +1247,11 @@ func TestRangeInfo(t *testing.T) {
 	expRangeInfos = []roachpb.RangeInfo{
 		{
 			Desc:  *lhsReplica0.Desc(),
-			Lease: *lhsLease,
+			Lease: lhsLease,
 		},
 		{
 			Desc:  *rhsReplica0.Desc(),
-			Lease: *rhsLease,
+			Lease: rhsLease,
 		},
 	}
 	if !reflect.DeepEqual(reply.Header().RangeInfos, expRangeInfos) {
@@ -1254,11 +1272,11 @@ func TestRangeInfo(t *testing.T) {
 	expRangeInfos = []roachpb.RangeInfo{
 		{
 			Desc:  *rhsReplica0.Desc(),
-			Lease: *rhsLease,
+			Lease: rhsLease,
 		},
 		{
 			Desc:  *lhsReplica0.Desc(),
-			Lease: *lhsLease,
+			Lease: lhsLease,
 		},
 	}
 	if !reflect.DeepEqual(reply.Header().RangeInfos, expRangeInfos) {
@@ -1285,11 +1303,11 @@ func TestRangeInfo(t *testing.T) {
 	expRangeInfos = []roachpb.RangeInfo{
 		{
 			Desc:  *lhsReplica1.Desc(),
-			Lease: *lhsLease,
+			Lease: lhsLease,
 		},
 		{
 			Desc:  *rhsReplica1.Desc(),
-			Lease: *rhsLease,
+			Lease: rhsLease,
 		},
 	}
 	if !reflect.DeepEqual(reply.Header().RangeInfos, expRangeInfos) {
@@ -1471,7 +1489,7 @@ func TestDrainRangeRejection(t *testing.T) {
 	if err := repl.ChangeReplicas(
 		context.Background(),
 		roachpb.ADD_REPLICA,
-		roachpb.ReplicaDescriptor{
+		roachpb.ReplicationTarget{
 			NodeID:  mtc.idents[drainingIdx].NodeID,
 			StoreID: mtc.idents[drainingIdx].StoreID,
 		},

@@ -21,7 +21,6 @@ import (
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -32,7 +31,7 @@ func TestStartSubqueriesReturnsError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	sql := "SELECT 1 WHERE (SELECT CRDB_INTERNAL.FORCE_RETRY('1s':::INTERVAL) > 0)"
 	p := makeTestPlanner()
-	stmts, err := p.parser.Parse(sql, parser.Traditional)
+	stmts, err := p.parser.Parse(sql)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +39,7 @@ func TestStartSubqueriesReturnsError(t *testing.T) {
 		t.Fatalf("expected to parse 1 statement, got: %d", len(stmts))
 	}
 	stmt := stmts[0]
-	plan, err := p.makePlan(context.TODO(), stmt, false /* autoCommit */)
+	plan, err := p.makePlan(context.TODO(), stmt)
 	if err != nil {
 		t.Fatal(err)
 	}

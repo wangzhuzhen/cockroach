@@ -22,6 +22,7 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip/simulation"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -58,15 +59,18 @@ func connectionsRefused(network *simulation.Network) int64 {
 // As of Jan 2017, this normally takes ~12 cycles and 8-12 refused connections.
 func TestConvergence(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	if testutils.Stress() {
+		t.Skip()
+	}
+
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	network := simulation.NewNetwork(stopper, testConvergenceSize, true)
 
 	const maxCycles = 100
 	if connectedCycle := network.RunUntilFullyConnected(); connectedCycle > maxCycles {
-		log.Warningf(context.Background(),
-			"expected a fully-connected network within %d cycles; took %d",
+		log.Warningf(context.Background(), "expected a fully-connected network within %d cycles; took %d",
 			maxCycles, connectedCycle)
 	}
 
@@ -88,8 +92,12 @@ func TestConvergence(t *testing.T) {
 // As of Jan 2017, this normally takes 8-9 cycles and 50-60 refused connections.
 func TestNetworkReachesEquilibrium(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	if testutils.Stress() {
+		t.Skip()
+	}
+
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	network := simulation.NewNetwork(stopper, testReachesEquilibriumSize, true)
 
@@ -114,8 +122,7 @@ func TestNetworkReachesEquilibrium(t *testing.T) {
 
 	const maxCycles = 200
 	if numCycles > maxCycles {
-		log.Warningf(context.Background(),
-			"expected a non-thrashing network within %d cycles; took %d",
+		log.Warningf(context.Background(), "expected a non-thrashing network within %d cycles; took %d",
 			maxCycles, numCycles)
 	}
 

@@ -57,10 +57,8 @@ import (
 )
 
 const (
-	builderImage     = "docker.io/cockroachdb/builder"
-	builderTag       = "20170228-215146"
-	builderImageFull = builderImage + ":" + builderTag
-	networkPrefix    = "cockroachdb_acceptance"
+	defaultImage  = "docker.io/library/ubuntu:xenial-20170214"
+	networkPrefix = "cockroachdb_acceptance"
 )
 
 // DefaultTCP is the default SQL/RPC port specification.
@@ -71,22 +69,27 @@ const defaultHTTP nat.Port = base.DefaultHTTPPort + "/tcp"
 // binary.
 const CockroachBinaryInContainer = "/cockroach/cockroach"
 
-var cockroachImage = flag.String("i", builderImageFull, "the docker image to run")
-var cockroachBinary = flag.String("b", defaultBinary(), "the host-side binary to run (if image == "+builderImage+")")
+var cockroachImage = flag.String("i", defaultImage, "the docker image to run")
+var cockroachBinary = flag.String("b", defaultBinary(), "the host-side binary to run (if image == "+defaultImage+")")
 var cockroachEntry = flag.String("e", "", "the entry point for the image")
 var waitOnStop = flag.Bool("w", false, "wait for the user to interrupt before tearing down the cluster")
-var pwd = filepath.Clean(os.ExpandEnv("${PWD}"))
 var maxRangeBytes = config.DefaultZoneConfig().RangeMaxBytes
 
 // keyLen is the length (in bits) of the generated CA and node certs.
 const keyLen = 1024
 
 func defaultBinary() string {
-	gopath := filepath.SplitList(os.Getenv("GOPATH"))
-	if len(gopath) == 0 {
+	dir, err := os.Getwd()
+	if err != nil {
 		return ""
 	}
-	return gopath[0] + "/bin/docker_amd64/cockroach"
+	// The repository root, as seen by the caller.
+	for i := 0; i < 2; i++ {
+		dir = filepath.Dir(dir)
+	}
+	// NB: This is the binary produced by our linux-gnu build target. Changes
+	// to the Makefile must be reflected here.
+	return filepath.Join(dir, "cockroach-linux-2.6.32-gnu-amd64")
 }
 
 func exists(path string) bool {
@@ -146,11 +149,12 @@ type LocalCluster struct {
 	stopper              *stop.Stopper
 	monitorCtx           context.Context
 	monitorCtxCancelFunc func()
-	logDir               string // no logging if empty
 	clusterID            string
 	networkID            string
 	networkName          string
-	privileged           bool // whether to run containers in privileged mode
+	privileged           bool   // whether to run containers in privileged mode
+	logDir               string // no logging if empty
+	logDirRemovable      bool   // if true, the log directory can be removed after use
 }
 
 // CreateLocal creates a new local cockroach cluster. The stopper is used to
@@ -167,7 +171,7 @@ func CreateLocal(
 	default:
 	}
 
-	if *cockroachImage == builderImageFull && !exists(*cockroachBinary) {
+	if *cockroachImage == defaultImage && !exists(*cockroachBinary) {
 		log.Fatalf(ctx, "\"%s\": does not exist", *cockroachBinary)
 	}
 
@@ -185,8 +189,18 @@ func CreateLocal(
 	// Only pass a nonzero logDir down to LocalCluster when instructed to keep
 	// logs.
 	var uniqueLogDir string
+	logDirRemovable := false
 	if logDir != "" {
+		pwd, err := os.Getwd()
+		maybePanic(err)
+
 		uniqueLogDir = fmt.Sprintf("%s-%s", logDir, clusterIDS)
+		if !filepath.IsAbs(uniqueLogDir) {
+			uniqueLogDir = filepath.Join(pwd, uniqueLogDir)
+		}
+		ensureLogDirExists(uniqueLogDir)
+		logDirRemovable = true
+		log.Infof(ctx, "local cluster log directory: %s", uniqueLogDir)
 	}
 	return &LocalCluster{
 		clusterID: clusterIDS,
@@ -194,10 +208,11 @@ func CreateLocal(
 		config:    cfg,
 		stopper:   stopper,
 		// TODO(tschottdorf): deadlocks will occur if these channels fill up.
-		events:         make(chan Event, 1000),
-		expectedEvents: make(chan Event, 1000),
-		logDir:         uniqueLogDir,
-		privileged:     privileged,
+		events:          make(chan Event, 1000),
+		expectedEvents:  make(chan Event, 1000),
+		logDir:          uniqueLogDir,
+		logDirRemovable: logDirRemovable,
+		privileged:      privileged,
 	}
 }
 
@@ -324,6 +339,9 @@ func (l *LocalCluster) initCluster(ctx context.Context) {
 	log.Infof(ctx, "Initializing Cluster %s:\n%s", l.config.Name, configJSON)
 	l.panicOnStop()
 
+	pwd, err := os.Getwd()
+	maybePanic(err)
+
 	// Create the temporary certs directory in the current working
 	// directory. Boot2docker's handling of binding local directories
 	// into the container is very confusing. If the directory being
@@ -339,16 +357,9 @@ func (l *LocalCluster) initCluster(ctx context.Context) {
 	}
 
 	if l.logDir != "" {
-		if !filepath.IsAbs(l.logDir) {
-			l.logDir = filepath.Join(pwd, l.logDir)
-		}
 		binds = append(binds, l.logDir+":/logs")
-		// If we don't make sure the directory exists, Docker will and then we
-		// may run into ownership issues (think Docker running as root, but us
-		// running as a regular Joe as it happens on CircleCI).
-		maybePanic(os.MkdirAll(l.logDir, 0777))
 	}
-	if *cockroachImage == builderImageFull {
+	if *cockroachImage == defaultImage {
 		path, err := filepath.Abs(*cockroachBinary)
 		maybePanic(err)
 		binds = append(binds, path+":"+CockroachBinaryInContainer)
@@ -383,8 +394,8 @@ func (l *LocalCluster) initCluster(ctx context.Context) {
 		}
 	}
 
-	if *cockroachImage == builderImageFull {
-		maybePanic(pullImage(ctx, l, builderImage+":"+builderTag, types.ImagePullOptions{}))
+	if *cockroachImage == defaultImage {
+		maybePanic(pullImage(ctx, l, defaultImage, types.ImagePullOptions{}))
 	}
 	c, err := createContainer(
 		ctx,
@@ -431,7 +442,7 @@ func (l *LocalCluster) createRoach(
 	}
 	log.Infof(ctx, "creating docker container with name: %s", hostname)
 	var entrypoint []string
-	if *cockroachImage == builderImageFull {
+	if *cockroachImage == defaultImage {
 		entrypoint = append(entrypoint, CockroachBinaryInContainer)
 	} else if *cockroachEntry != "" {
 		entrypoint = append(entrypoint, *cockroachEntry)
@@ -464,10 +475,9 @@ func (l *LocalCluster) createRoach(
 }
 
 func (l *LocalCluster) createCACert() {
-	maybePanic(security.RunCreateCACert(
-		filepath.Join(l.CertsDir, security.EmbeddedCACert),
-		filepath.Join(l.CertsDir, security.EmbeddedCAKey),
-		keyLen))
+	maybePanic(security.CreateCAPair(
+		l.CertsDir, filepath.Join(l.CertsDir, security.EmbeddedCAKey),
+		keyLen, 48*time.Hour, false, false))
 }
 
 func (l *LocalCluster) createNodeCerts() {
@@ -475,12 +485,10 @@ func (l *LocalCluster) createNodeCerts() {
 	for _, node := range l.Nodes {
 		nodes = append(nodes, node.nodeStr)
 	}
-	maybePanic(security.RunCreateNodeCert(
-		filepath.Join(l.CertsDir, security.EmbeddedCACert),
+	maybePanic(security.CreateNodePair(
+		l.CertsDir,
 		filepath.Join(l.CertsDir, security.EmbeddedCAKey),
-		filepath.Join(l.CertsDir, security.EmbeddedNodeCert),
-		filepath.Join(l.CertsDir, security.EmbeddedNodeKey),
-		keyLen, nodes))
+		keyLen, 48*time.Hour, false, nodes))
 }
 
 // startNode starts a Docker container to run testNode. It may be called in
@@ -488,9 +496,7 @@ func (l *LocalCluster) createNodeCerts() {
 func (l *LocalCluster) startNode(ctx context.Context, node *testNode) {
 	cmd := []string{
 		"start",
-		"--ca-cert=/certs/ca.crt",
-		"--cert=/certs/node.crt",
-		"--key=/certs/node.key",
+		"--certs-dir=/certs/",
 		"--host=" + node.nodeStr,
 		"--verbosity=1",
 	}
@@ -513,17 +519,17 @@ func (l *LocalCluster) startNode(ctx context.Context, node *testNode) {
 		cmd = append(cmd, "--join="+net.JoinHostPort(l.Nodes[0].nodeStr, base.DefaultPort))
 	}
 
-	var locallogDir string
+	var localLogDir string
 	if len(l.logDir) > 0 {
-		dockerlogDir := "/logs/" + node.nodeStr
-		locallogDir = filepath.Join(l.logDir, node.nodeStr)
-		maybePanic(os.MkdirAll(locallogDir, 0777))
+		dockerLogDir := "/logs/" + node.nodeStr
+		localLogDir = filepath.Join(l.logDir, node.nodeStr)
+		ensureLogDirExists(localLogDir)
 		cmd = append(
 			cmd,
-			"--alsologtostderr=ERROR",
-			"--log-dir="+dockerlogDir)
+			"--logtostderr=ERROR",
+			"--log-dir="+dockerLogDir)
 	} else {
-		cmd = append(cmd, "--alsologtostderr=INFO")
+		cmd = append(cmd, "--logtostderr=INFO")
 	}
 	env := []string{
 		"COCKROACH_SCAN_MAX_IDLE_TIME=200ms",
@@ -541,8 +547,8 @@ func (l *LocalCluster) startNode(ctx context.Context, node *testNode) {
   pprof:     docker exec -it %[4]s pprof https+insecure://$(hostname):%[5]s/debug/pprof/heap
   cockroach: %[6]s
 
-  cli-env:   COCKROACH_INSECURE=false COCKROACH_CA_CERT=%[7]s/ca.crt COCKROACH_CERT=%[7]s/node.crt COCKROACH_KEY=%[7]s/node.key COCKROACH_HOST=%s COCKROACH_PORT=%d`,
-		node.Name(), "https://"+httpAddr.String(), locallogDir, node.Container.id[:5],
+  cli-env:   COCKROACH_INSECURE=false COCKROACH_CERTS_DIR=%[7]s COCKROACH_HOST=%s COCKROACH_PORT=%d`,
+		node.Name(), "https://"+httpAddr.String(), localLogDir, node.Container.id[:5],
 		base.DefaultHTTPPort, cmd, l.CertsDir, httpAddr.IP, httpAddr.Port)
 }
 
@@ -650,12 +656,9 @@ func (l *LocalCluster) Start(ctx context.Context) {
 	log.Infof(ctx, "creating certs (%dbit) in: %s", keyLen, l.CertsDir)
 	l.createCACert()
 	l.createNodeCerts()
-	maybePanic(security.RunCreateClientCert(
-		filepath.Join(l.CertsDir, security.EmbeddedCACert),
-		filepath.Join(l.CertsDir, security.EmbeddedCAKey),
-		filepath.Join(l.CertsDir, security.EmbeddedRootCert),
-		filepath.Join(l.CertsDir, security.EmbeddedRootKey),
-		512, security.RootUser))
+	maybePanic(security.CreateClientPair(
+		l.CertsDir, filepath.Join(l.CertsDir, security.EmbeddedCAKey),
+		512, 48*time.Hour, false, security.RootUser))
 
 	l.monitorCtx, l.monitorCtxCancelFunc = context.WithCancel(context.Background())
 	go l.monitor(ctx)
@@ -785,10 +788,8 @@ func (l *LocalCluster) stop(ctx context.Context) {
 func (l *LocalCluster) NewClient(ctx context.Context, i int) (*roachClient.DB, error) {
 	clock := hlc.NewClock(hlc.UnixNano, 0)
 	rpcContext := rpc.NewContext(log.AmbientContext{}, &base.Config{
-		User:       security.NodeUser,
-		SSLCA:      filepath.Join(l.CertsDir, security.EmbeddedCACert),
-		SSLCert:    filepath.Join(l.CertsDir, security.EmbeddedNodeCert),
-		SSLCertKey: filepath.Join(l.CertsDir, security.EmbeddedNodeKey),
+		User:        security.NodeUser,
+		SSLCertsDir: l.CertsDir,
 	}, clock, l.stopper)
 	conn, err := rpcContext.GRPCDial(l.Nodes[i].Addr(ctx, DefaultTCP).String())
 	if err != nil {
@@ -910,4 +911,26 @@ func (l *LocalCluster) ExecRoot(ctx context.Context, i int, cmd []string) error 
 
 	return retry(ctx, 3, 10*time.Second, "ExecRoot",
 		matchNone, execRoot)
+}
+
+func ensureLogDirExists(logDir string) {
+	// Ensure that the path exists, with all its parents.
+	// If we don't make sure the directory exists, Docker will and then we
+	// may run into ownership issues (think Docker running as root, but us
+	// running as a regular Joe as it happens on CircleCI).
+	maybePanic(os.MkdirAll(logDir, 0755))
+	// Now make the last component, and just the last one, writable by
+	// anyone, and set the gid and uid bit so that the owner is
+	// propagated to sub-directories.
+	maybePanic(os.Chmod(logDir, 0777|os.ModeSetuid|os.ModeSetgid))
+}
+
+// Cleanup removes the log directory if it was initially created
+// by this LocalCluster.
+func (l *LocalCluster) Cleanup(ctx context.Context) {
+	if l.logDir != "" && l.logDirRemovable {
+		if err := os.RemoveAll(l.logDir); err != nil {
+			log.Warning(ctx, err)
+		}
+	}
 }

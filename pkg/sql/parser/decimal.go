@@ -22,7 +22,7 @@ var (
 	// postegrs binary decimal format in the wire protocol, which uses an
 	// int16. See pgwire/types.go.
 	DecimalCtx = &apd.Context{
-		Precision:   16,
+		Precision:   20,
 		Rounding:    apd.RoundHalfUp,
 		MaxExponent: 2000,
 		MinExponent: -2000,
@@ -32,4 +32,11 @@ var (
 	ExactCtx = DecimalCtx.WithPrecision(0)
 	// HighPrecisionCtx is a decimal context with high precision.
 	HighPrecisionCtx = DecimalCtx.WithPrecision(2000)
+	// RoundCtx is a decimal context with high precision and RoundHalfEven
+	// rounding.
+	RoundCtx = func() *apd.Context {
+		ctx := *HighPrecisionCtx
+		ctx.Rounding = apd.RoundHalfEven
+		return &ctx
+	}()
 )

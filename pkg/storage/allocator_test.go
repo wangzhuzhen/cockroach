@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/gossiputil"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -237,7 +238,7 @@ func TestAllocatorSimpleRetrieval(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper, g, _, a, _ := createTestAllocator( /* deterministic */ false)
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 	gossiputil.NewStoreGossiper(g).GossipStores(singleStore, t)
 	result, err := a.AllocateTarget(
 		context.Background(),
@@ -260,7 +261,7 @@ func TestAllocatorCorruptReplica(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper, g, sp, a, _ := createTestAllocator( /* deterministic */ false)
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 	gossiputil.NewStoreGossiper(g).GossipStores(sameDCStores, t)
 	const store1ID = roachpb.StoreID(1)
 
@@ -292,7 +293,7 @@ func TestAllocatorNoAvailableDisks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper, _, _, a, _ := createTestAllocator( /* deterministic */ false)
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 	result, err := a.AllocateTarget(
 		context.Background(),
 		simpleZoneConfig.Constraints,
@@ -312,7 +313,7 @@ func TestAllocatorTwoDatacenters(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper, g, _, a, _ := createTestAllocator( /* deterministic */ false)
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 	gossiputil.NewStoreGossiper(g).GossipStores(multiDCStores, t)
 	ctx := context.Background()
 	result1, err := a.AllocateTarget(
@@ -369,7 +370,7 @@ func TestAllocatorExistingReplica(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper, g, _, a, _ := createTestAllocator( /* deterministic */ false)
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 	gossiputil.NewStoreGossiper(g).GossipStores(sameDCStores, t)
 	result, err := a.AllocateTarget(
 		context.Background(),
@@ -403,7 +404,7 @@ func TestAllocatorRelaxConstraints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper, g, _, a, _ := createTestAllocator( /* deterministic */ false)
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 	gossiputil.NewStoreGossiper(g).GossipStores(multiDCStores, t)
 
 	testCases := []struct {
@@ -620,7 +621,7 @@ func TestAllocatorRebalance(t *testing.T) {
 	}
 
 	stopper, g, _, a, _ := createTestAllocator( /* deterministic */ false)
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 
 	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
 	ctx := context.Background()
@@ -658,6 +659,88 @@ func TestAllocatorRebalance(t *testing.T) {
 		if expResult := (i >= 2); expResult != result {
 			t.Errorf("%d: expected rebalance %t; got %t", i, expResult, result)
 		}
+	}
+}
+
+func TestAllocatorRebalanceDeadNodes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper, _, sp, a, _ := createTestAllocator( /* deterministic */ false)
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
+
+	mockStorePool(sp,
+		[]roachpb.StoreID{1, 2, 3, 4, 5, 6},
+		[]roachpb.StoreID{7, 8},
+		nil)
+
+	ranges := func(rangeCount int32) roachpb.StoreCapacity {
+		return roachpb.StoreCapacity{
+			Capacity:   1000,
+			Available:  1000,
+			RangeCount: rangeCount,
+		}
+	}
+
+	// Initialize 8 stores: where store 6 is the target for rebalancing.
+	sp.detailsMu.Lock()
+	sp.getStoreDetailLocked(1).desc.Capacity = ranges(100)
+	sp.getStoreDetailLocked(2).desc.Capacity = ranges(100)
+	sp.getStoreDetailLocked(3).desc.Capacity = ranges(100)
+	sp.getStoreDetailLocked(4).desc.Capacity = ranges(100)
+	sp.getStoreDetailLocked(5).desc.Capacity = ranges(100)
+	sp.getStoreDetailLocked(6).desc.Capacity = ranges(0)
+	sp.getStoreDetailLocked(7).desc.Capacity = ranges(100)
+	sp.getStoreDetailLocked(8).desc.Capacity = ranges(100)
+	sp.detailsMu.Unlock()
+
+	replicas := func(storeIDs ...roachpb.StoreID) []roachpb.ReplicaDescriptor {
+		res := make([]roachpb.ReplicaDescriptor, len(storeIDs))
+		for i, storeID := range storeIDs {
+			res[i].StoreID = storeID
+		}
+		return res
+	}
+
+	// Each test case should describe a repair situation which has a lower
+	// priority than the previous test case.
+	testCases := []struct {
+		existing []roachpb.ReplicaDescriptor
+		expected roachpb.StoreID
+	}{
+		// 3/3 live -> 3/4 live: ok
+		{replicas(1, 2, 3), 6},
+		// 2/3 live -> 2/4 live: nope
+		{replicas(1, 2, 7), 0},
+		// 4/4 live -> 4/5 live: ok
+		{replicas(1, 2, 3, 4), 6},
+		// 3/4 live -> 3/5 live: ok
+		{replicas(1, 2, 3, 7), 6},
+		// 5/5 live -> 5/6 live: ok
+		{replicas(1, 2, 3, 4, 5), 6},
+		// 4/5 live -> 4/6 live: ok
+		{replicas(1, 2, 3, 4, 7), 6},
+		// 3/5 live -> 3/6 live: nope
+		{replicas(1, 2, 3, 7, 8), 0},
+	}
+
+	for _, c := range testCases {
+		t.Run("", func(t *testing.T) {
+			result, err := a.RebalanceTarget(
+				ctx, config.Constraints{}, c.existing, firstRange)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.expected > 0 {
+				if result == nil {
+					t.Fatalf("expected %d, but found nil", c.expected)
+				} else if c.expected != result.StoreID {
+					t.Fatalf("expected %d, but found %d", c.expected, result.StoreID)
+				}
+			} else if result != nil {
+				t.Fatalf("expected nil, but found %d", result.StoreID)
+			}
+		})
 	}
 }
 
@@ -744,7 +827,7 @@ func TestAllocatorRebalanceThrashing(t *testing.T) {
 			// Deterministic is required when stressing as test case 8 may rebalance
 			// to different configurations.
 			stopper, g, _, a, _ := createTestAllocator( /* deterministic */ true)
-			defer stopper.Stop()
+			defer stopper.Stop(context.Background())
 
 			// Create stores with the range counts from the test case and gossip them.
 			var stores []*roachpb.StoreDescriptor
@@ -814,7 +897,7 @@ func TestAllocatorRebalanceByCount(t *testing.T) {
 	}
 
 	stopper, g, _, a, _ := createTestAllocator( /* deterministic */ false)
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 
 	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
 	ctx := context.Background()
@@ -852,7 +935,7 @@ func TestAllocatorRebalanceByCount(t *testing.T) {
 func TestAllocatorTransferLeaseTarget(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, a, _ := createTestAllocator( /* deterministic */ true)
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 
 	// 3 stores where the lease count for each store is equal to 10x the store
 	// ID.
@@ -914,7 +997,7 @@ func TestAllocatorTransferLeaseTarget(t *testing.T) {
 func TestAllocatorTransferLeaseTargetMultiStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, a, _ := createTestAllocator( /* deterministic */ true)
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 
 	// 3 nodes and 6 stores where the lease count for the first store on each
 	// node is equal to 10x the node ID.
@@ -967,7 +1050,7 @@ func TestAllocatorTransferLeaseTargetMultiStore(t *testing.T) {
 func TestAllocatorShouldTransferLease(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, g, _, a, _ := createTestAllocator( /* deterministic */ true)
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 
 	// 4 stores where the lease count for each store is equal to 10x the store
 	// ID.
@@ -1029,15 +1112,9 @@ func TestAllocatorShouldTransferLease(t *testing.T) {
 func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	// TODO(a-robinson): Remove when load-based lease rebalancing is the default.
-	defer func(v bool) {
-		EnableLoadBasedLeaseRebalancing = v
-	}(EnableLoadBasedLeaseRebalancing)
-	EnableLoadBasedLeaseRebalancing = true
-
 	stopper, g, _, storePool, _ := createTestStorePool(
 		TestTimeUntilStoreDeadOff, true /* deterministic */, nodeStatusLive)
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 
 	// 3 stores where the lease count for each store is equal to 10x the store ID.
 	var stores []*roachpb.StoreDescriptor
@@ -1221,66 +1298,66 @@ func TestLoadBasedLeaseRebalanceScore(t *testing.T) {
 		expected      int32
 	}{
 		// Evenly balanced leases stay balanced if requests are even
-		{1, 0 * time.Millisecond, 10, 1, 10, 10, -1},
-		{1, 0 * time.Millisecond, 100, 1, 100, 100, -10},
-		{1, 0 * time.Millisecond, 1000, 1, 1000, 1000, -100},
-		{1, 10 * time.Millisecond, 10, 1, 10, 10, -1},
-		{1, 10 * time.Millisecond, 100, 1, 100, 100, -10},
-		{1, 10 * time.Millisecond, 1000, 1, 1000, 1000, -100},
-		{1, 50 * time.Millisecond, 10, 1, 10, 10, -1},
-		{1, 50 * time.Millisecond, 100, 1, 100, 100, -10},
-		{1, 50 * time.Millisecond, 1000, 1, 1000, 1000, -100},
-		{1000, 0 * time.Millisecond, 10, 1000, 10, 10, -1},
-		{1000, 0 * time.Millisecond, 100, 1000, 100, 100, -10},
-		{1000, 0 * time.Millisecond, 1000, 1000, 1000, 1000, -100},
-		{1000, 10 * time.Millisecond, 10, 1000, 10, 10, -1},
-		{1000, 10 * time.Millisecond, 100, 1000, 100, 100, -10},
-		{1000, 10 * time.Millisecond, 1000, 1000, 1000, 1000, -100},
-		{1000, 50 * time.Millisecond, 10, 1000, 10, 10, -1},
-		{1000, 50 * time.Millisecond, 100, 1000, 100, 100, -10},
-		{1000, 50 * time.Millisecond, 1000, 1000, 1000, 1000, -100},
+		{1, 0 * time.Millisecond, 10, 1, 10, 10, -2},
+		{1, 0 * time.Millisecond, 100, 1, 100, 100, -21},
+		{1, 0 * time.Millisecond, 1000, 1, 1000, 1000, -200},
+		{1, 10 * time.Millisecond, 10, 1, 10, 10, -2},
+		{1, 10 * time.Millisecond, 100, 1, 100, 100, -21},
+		{1, 10 * time.Millisecond, 1000, 1, 1000, 1000, -200},
+		{1, 50 * time.Millisecond, 10, 1, 10, 10, -2},
+		{1, 50 * time.Millisecond, 100, 1, 100, 100, -21},
+		{1, 50 * time.Millisecond, 1000, 1, 1000, 1000, -200},
+		{1000, 0 * time.Millisecond, 10, 1000, 10, 10, -2},
+		{1000, 0 * time.Millisecond, 100, 1000, 100, 100, -21},
+		{1000, 0 * time.Millisecond, 1000, 1000, 1000, 1000, -200},
+		{1000, 10 * time.Millisecond, 10, 1000, 10, 10, -2},
+		{1000, 10 * time.Millisecond, 100, 1000, 100, 100, -21},
+		{1000, 10 * time.Millisecond, 1000, 1000, 1000, 1000, -200},
+		{1000, 50 * time.Millisecond, 10, 1000, 10, 10, -2},
+		{1000, 50 * time.Millisecond, 100, 1000, 100, 100, -21},
+		{1000, 50 * time.Millisecond, 1000, 1000, 1000, 1000, -200},
 		// No latency favors lease balance despite request imbalance
-		{10, 0 * time.Millisecond, 100, 1, 100, 100, -10},
-		{100, 0 * time.Millisecond, 100, 1, 100, 100, -10},
-		{1000, 0 * time.Millisecond, 100, 1, 100, 100, -10},
-		{10000, 0 * time.Millisecond, 100, 1, 100, 100, -10},
+		{10, 0 * time.Millisecond, 100, 1, 100, 100, -21},
+		{100, 0 * time.Millisecond, 100, 1, 100, 100, -21},
+		{1000, 0 * time.Millisecond, 100, 1, 100, 100, -21},
+		{10000, 0 * time.Millisecond, 100, 1, 100, 100, -21},
 		// Adding some latency changes that (perhaps a bit too much?)
-		{10, 1 * time.Millisecond, 100, 1, 100, 100, 3},
-		{100, 1 * time.Millisecond, 100, 1, 100, 100, 17},
-		{1000, 1 * time.Millisecond, 100, 1, 100, 100, 31},
-		{10000, 1 * time.Millisecond, 100, 1, 100, 100, 45},
-		{10, 10 * time.Millisecond, 100, 1, 100, 100, 37},
-		{100, 10 * time.Millisecond, 100, 1, 100, 100, 85},
-		{1000, 10 * time.Millisecond, 100, 1, 100, 100, 133},
-		{10000, 10 * time.Millisecond, 100, 1, 100, 100, 181},
+		{10, 1 * time.Millisecond, 100, 1, 100, 100, -8},
+		{100, 1 * time.Millisecond, 100, 1, 100, 100, 6},
+		{1000, 1 * time.Millisecond, 100, 1, 100, 100, 20},
+		{10000, 1 * time.Millisecond, 100, 1, 100, 100, 34},
+		{10, 10 * time.Millisecond, 100, 1, 100, 100, 26},
+		{100, 10 * time.Millisecond, 100, 1, 100, 100, 74},
+		{1000, 10 * time.Millisecond, 100, 1, 100, 100, 122},
+		{10000, 10 * time.Millisecond, 100, 1, 100, 100, 170},
 		// Moving from very unbalanced to more balanced
-		{1, 1 * time.Millisecond, 0, 1, 500, 200, 480},
-		{1, 1 * time.Millisecond, 0, 10, 500, 200, 453},
-		{1, 1 * time.Millisecond, 0, 100, 500, 200, 425},
-		{1, 10 * time.Millisecond, 0, 1, 500, 200, 480},
-		{1, 10 * time.Millisecond, 0, 10, 500, 200, 385},
-		{1, 10 * time.Millisecond, 0, 100, 500, 200, 289},
-		{1, 50 * time.Millisecond, 0, 1, 500, 200, 480},
-		{1, 50 * time.Millisecond, 0, 10, 500, 200, 323},
-		{1, 50 * time.Millisecond, 0, 100, 500, 200, 165},
-		{1, 1 * time.Millisecond, 50, 1, 500, 250, 425},
-		{1, 1 * time.Millisecond, 50, 10, 500, 250, 391},
-		{1, 1 * time.Millisecond, 50, 100, 500, 250, 355},
-		{1, 10 * time.Millisecond, 50, 1, 500, 250, 425},
-		{1, 10 * time.Millisecond, 50, 10, 500, 250, 305},
-		{1, 10 * time.Millisecond, 50, 100, 500, 250, 185},
-		{1, 50 * time.Millisecond, 50, 1, 500, 250, 425},
-		{1, 50 * time.Millisecond, 50, 10, 500, 250, 229},
-		{1, 50 * time.Millisecond, 50, 100, 500, 250, 31},
+		{1, 1 * time.Millisecond, 0, 1, 500, 200, 459},
+		{1, 1 * time.Millisecond, 0, 10, 500, 200, 432},
+		{1, 1 * time.Millisecond, 0, 100, 500, 200, 404},
+		{1, 10 * time.Millisecond, 0, 1, 500, 200, 459},
+		{1, 10 * time.Millisecond, 0, 10, 500, 200, 364},
+		{1, 10 * time.Millisecond, 0, 100, 500, 200, 268},
+		{1, 50 * time.Millisecond, 0, 1, 500, 200, 459},
+		{1, 50 * time.Millisecond, 0, 10, 500, 200, 302},
+		{1, 50 * time.Millisecond, 0, 100, 500, 200, 144},
+		{1, 1 * time.Millisecond, 50, 1, 500, 250, 400},
+		{1, 1 * time.Millisecond, 50, 10, 500, 250, 364},
+		{1, 1 * time.Millisecond, 50, 100, 500, 250, 330},
+		{1, 10 * time.Millisecond, 50, 1, 500, 250, 400},
+		{1, 10 * time.Millisecond, 50, 10, 500, 250, 280},
+		{1, 10 * time.Millisecond, 50, 100, 500, 250, 160},
+		{1, 50 * time.Millisecond, 50, 1, 500, 250, 400},
+		{1, 50 * time.Millisecond, 50, 10, 500, 250, 202},
+		{1, 50 * time.Millisecond, 50, 100, 500, 250, 6},
 		// Miscellaneous cases with uneven balance
-		{10, 1 * time.Millisecond, 100, 1, 50, 67, -47},
-		{1, 1 * time.Millisecond, 50, 10, 100, 67, 35},
-		{10, 10 * time.Millisecond, 100, 1, 50, 67, -25},
-		{1, 10 * time.Millisecond, 50, 10, 100, 67, 11},
-		{10, 1 * time.Millisecond, 100, 1, 50, 80, -47},
-		{1, 1 * time.Millisecond, 50, 10, 100, 80, 31},
-		{10, 10 * time.Millisecond, 100, 1, 50, 80, -19},
-		{1, 10 * time.Millisecond, 50, 10, 100, 80, 3},
+		{10, 1 * time.Millisecond, 100, 1, 50, 67, -56},
+		{1, 1 * time.Millisecond, 50, 10, 100, 67, 26},
+		{10, 10 * time.Millisecond, 100, 1, 50, 67, -32},
+		{1, 10 * time.Millisecond, 50, 10, 100, 67, 4},
+		{10, 1 * time.Millisecond, 100, 1, 50, 80, -56},
+		{1, 1 * time.Millisecond, 50, 10, 100, 80, 22},
+		{10, 10 * time.Millisecond, 100, 1, 50, 80, -28},
+		{1, 10 * time.Millisecond, 50, 10, 100, 80, -6},
 	}
 
 	for _, c := range testCases {
@@ -1365,11 +1442,11 @@ func TestAllocatorRemoveTarget(t *testing.T) {
 		},
 	}
 
+	ctx := context.Background()
 	stopper, g, _, a, _ := createTestAllocator( /* deterministic */ false)
-	defer stopper.Stop()
+	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(stores, t)
-	ctx := context.Background()
 
 	// Repeat this test 10 times, it should always be either store 2 or 3.
 	for i := 0; i < 10; i++ {
@@ -1748,7 +1825,8 @@ func TestAllocatorComputeAction(t *testing.T) {
 	}
 
 	stopper, _, sp, a, _ := createTestAllocator( /* deterministic */ false)
-	defer stopper.Stop()
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
 
 	// Set up eight stores. Stores six and seven are marked as dead. Replica eight
 	// is dead.
@@ -1765,7 +1843,6 @@ func TestAllocatorComputeAction(t *testing.T) {
 		}})
 
 	lastPriority := float64(999999999)
-	ctx := context.Background()
 	for i, tcase := range testCases {
 		action, priority := a.ComputeAction(ctx, tcase.zone, &tcase.desc)
 		if tcase.expectedAction != action {
@@ -1839,8 +1916,8 @@ func TestAllocatorThrottled(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper, g, _, a, _ := createTestAllocator( /* deterministic */ false)
-	defer stopper.Stop()
 	ctx := context.Background()
+	defer stopper.Stop(ctx)
 
 	// First test to make sure we would send the replica to purgatory.
 	_, err := a.AllocateTarget(
@@ -2057,7 +2134,7 @@ func TestAllocatorRebalanceAway(t *testing.T) {
 	}
 
 	stopper, g, _, a, _ := createTestAllocator( /* deterministic */ false)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
 	ctx := context.Background()
 
@@ -2111,7 +2188,7 @@ func (ts *testStore) rebalance(ots *testStore, bytes int64) {
 
 func Example_rebalancing() {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 
@@ -2124,7 +2201,7 @@ func Example_rebalancing() {
 		stopper,
 	)
 	server := rpc.NewServer(rpcContext) // never started
-	g := gossip.NewTest(1, rpcContext, server, nil, stopper, metric.NewRegistry())
+	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry())
 	// Deterministic must be set as this test is comparing the exact output
 	// after each rebalance.
 	sp := NewStorePool(
@@ -2132,7 +2209,7 @@ func Example_rebalancing() {
 		g,
 		clock,
 		newMockNodeLiveness(nodeStatusLive).nodeLivenessFunc,
-		TestTimeUntilStoreDeadOff,
+		settings.TestingDuration(TestTimeUntilStoreDeadOff),
 		/* deterministic */ true,
 	)
 	alloc := MakeAllocator(sp, func(string) (time.Duration, bool) {

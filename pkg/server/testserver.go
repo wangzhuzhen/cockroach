@@ -19,7 +19,6 @@ package server
 import (
 	"fmt"
 	"net/http"
-	"path/filepath"
 	"time"
 
 	"github.com/pkg/errors"
@@ -66,13 +65,11 @@ func makeTestConfig() Config {
 	cfg.Insecure = false
 
 	// Load test certs. In addition, the tests requiring certs
-	// need to call security.SetReadFileFn(securitytest.Asset)
+	// need to call security.SetAssetLoader(securitytest.EmbeddedAssets)
 	// in their init to mock out the file system calls for calls to AssetFS,
 	// which has the test certs compiled in. Typically this is done
 	// once per package, in main_test.go.
-	cfg.SSLCA = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert)
-	cfg.SSLCert = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeCert)
-	cfg.SSLCertKey = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeKey)
+	cfg.SSLCertsDir = security.EmbeddedCertsDir
 
 	// Addr defaults to localhost with port set at time of call to
 	// Start() to an available port. May be overridden later (as in
@@ -88,7 +85,7 @@ func makeTestConfig() Config {
 	return cfg
 }
 
-// makeTestConfigtFromParams creates a Config from a TestServerParams.
+// makeTestConfigFromParams creates a Config from a TestServerParams.
 func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	cfg := makeTestConfig()
 	cfg.TestingKnobs = params.Knobs
@@ -118,14 +115,8 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.ScanMaxIdleTime != 0 {
 		cfg.ScanMaxIdleTime = params.ScanMaxIdleTime
 	}
-	if params.SSLCA != "" {
-		cfg.SSLCA = params.SSLCA
-	}
-	if params.SSLCert != "" {
-		cfg.SSLCert = params.SSLCert
-	}
-	if params.SSLCertKey != "" {
-		cfg.SSLCertKey = params.SSLCertKey
+	if params.SSLCertsDir != "" {
+		cfg.SSLCertsDir = params.SSLCertsDir
 	}
 	if params.TimeSeriesQueryWorkerMax != 0 {
 		cfg.TimeSeriesServerConfig.QueryWorkerMax = params.TimeSeriesQueryWorkerMax
@@ -135,6 +126,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	}
 	if params.SQLMemoryPoolSize != 0 {
 		cfg.SQLMemoryPoolSize = params.SQLMemoryPoolSize
+	}
+	if params.SendNextTimeout != 0 {
+		cfg.SendNextTimeout = params.SendNextTimeout
 	}
 	cfg.JoinList = []string{params.JoinAddr}
 	if cfg.Insecure {
@@ -152,6 +146,13 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.Addr != "" {
 		cfg.Addr = params.Addr
 		cfg.AdvertiseAddr = params.Addr
+	}
+	if params.HTTPAddr != "" {
+		cfg.HTTPAddr = params.HTTPAddr
+	}
+
+	if params.ListeningURLFile != "" {
+		cfg.ListeningURLFile = params.ListeningURLFile
 	}
 
 	// Ensure we have the correct number of engines. Add in-memory ones where
@@ -309,17 +310,6 @@ func (ts *TestServer) Start(params base.TestServerArgs) error {
 	return nil
 }
 
-// ExpectedInitialRangeCountWithoutMigrations is like ExpectedInitialRangeCount,
-// but does not take into account any ranges that may have been added by
-// migrations. This function should be used when only a lower bound, and not
-// an exact count, is needed.
-func ExpectedInitialRangeCountWithoutMigrations() int {
-	bootstrap := GetBootstrapSchema()
-	return bootstrap.SystemDescriptorCount() -
-		bootstrap.SystemConfigDescriptorCount() +
-		2 /* first-range + system-config-range */
-}
-
 // ExpectedInitialRangeCount returns the expected number of ranges that should
 // be on the server after initial (asynchronous) splits have been completed,
 // assuming no additional information is added outside of the normal bootstrap
@@ -333,14 +323,12 @@ func (ts *TestServer) ExpectedInitialRangeCount() (int, error) {
 // assuming no additional information is added outside of the normal bootstrap
 // process.
 func ExpectedInitialRangeCount(db *client.DB) (int, error) {
-	// XXX: This assumes that the number of descriptors added by migrations is equal
-	// to the number of ranges added, which may not be true in the future.
-	migrationRangeCount, err := migrations.AdditionalInitialDescriptors(
+	_, migrationRangeCount, err := migrations.AdditionalInitialDescriptors(
 		context.Background(), db)
 	if err != nil {
 		return 0, errors.Wrap(err, "counting initial migration ranges")
 	}
-	return ExpectedInitialRangeCountWithoutMigrations() + migrationRangeCount, nil
+	return GetBootstrapSchema().InitialRangeCount() + migrationRangeCount, nil
 }
 
 // WaitForInitialSplits waits for the server to complete its expected initial
@@ -509,18 +497,10 @@ func (ts *TestServer) LookupRange(key roachpb.Key) (roachpb.RangeDescriptor, err
 func (ts *TestServer) SplitRange(
 	splitKey roachpb.Key,
 ) (roachpb.RangeDescriptor, roachpb.RangeDescriptor, error) {
+	ctx := context.Background()
 	splitRKey, err := keys.Addr(splitKey)
 	if err != nil {
 		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{}, err
-	}
-	origRangeDesc, err := ts.LookupRange(splitKey)
-	if err != nil {
-		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{}, err
-	}
-	if origRangeDesc.StartKey.Equal(splitRKey) {
-		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{},
-			errors.Errorf(
-				"cannot split range %+v at start key %q", origRangeDesc, splitKey)
 	}
 	splitReq := roachpb.AdminSplitRequest{
 		Span: roachpb.Span{
@@ -528,29 +508,106 @@ func (ts *TestServer) SplitRange(
 		},
 		SplitKey: splitKey,
 	}
-	_, pErr := client.SendWrapped(context.Background(), ts.DistSender(), &splitReq)
+	_, pErr := client.SendWrapped(ctx, ts.DistSender(), &splitReq)
 	if pErr != nil {
 		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{},
 			errors.Errorf(
 				"%q: split unexpected error: %s", splitReq.SplitKey, pErr)
 	}
 
+	// The split point may not be exactly at the key we requested (we request
+	// splits at valid table keys, and the split point corresponds to the row's
+	// prefix). We scan for the range that includes the key we requested and the
+	// one that precedes it.
+
+	// We use a transaction so that we get consistent results between the two
+	// scans (in case there are other splits happening).
 	var leftRangeDesc, rightRangeDesc roachpb.RangeDescriptor
-	if err := ts.DB().GetProto(context.TODO(),
-		keys.RangeDescriptorKey(origRangeDesc.StartKey), &leftRangeDesc); err != nil {
-		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{},
-			errors.Wrap(err, "could not look up left-hand side descriptor")
+
+	// Errors returned from scanMeta cannot be wrapped or retryable errors won't
+	// be retried. Instead, the message to wrap is stored in case of
+	// non-retryable failures and then wrapped when the full transaction fails.
+	var wrappedMsg string
+	if err := ts.DB().Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		scanMeta := func(key roachpb.RKey, reverse bool) (desc roachpb.RangeDescriptor, err error) {
+			var kvs []client.KeyValue
+			if reverse {
+				// Find the last range that ends at or before key.
+				kvs, err = txn.ReverseScan(
+					ctx, keys.Meta2Prefix, keys.RangeMetaKey(key.Next()), 1, /* one result */
+				)
+			} else {
+				// Find the first range that ends after key.
+				kvs, err = txn.Scan(
+					ctx, keys.RangeMetaKey(key.Next()), keys.Meta2Prefix.PrefixEnd(), 1, /* one result */
+				)
+			}
+			if err != nil {
+				return desc, err
+			}
+			if len(kvs) != 1 {
+				return desc, fmt.Errorf("expected 1 result, got %d", len(kvs))
+			}
+			err = kvs[0].ValueProto(&desc)
+			return desc, err
+		}
+
+		rightRangeDesc, err = scanMeta(splitRKey, false /* !reverse */)
+		if err != nil {
+			wrappedMsg = "could not look up right-hand side descriptor"
+			return err
+		}
+
+		leftRangeDesc, err = scanMeta(splitRKey, true /* reverse */)
+		if err != nil {
+			wrappedMsg = "could not look up left-hand side descriptor"
+			return err
+		}
+
+		if !leftRangeDesc.EndKey.Equal(rightRangeDesc.StartKey) {
+			return errors.Errorf(
+				"inconsistent left (%v) and right (%v) descriptors", leftRangeDesc, rightRangeDesc,
+			)
+		}
+		return nil
+	}); err != nil {
+		if len(wrappedMsg) > 0 {
+			return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{}, errors.Wrap(err, wrappedMsg)
+		}
+		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{}, err
 	}
-	// The split point might not be exactly the one we requested (it can be
-	// adjusted slightly so we don't split in the middle of SQL rows). Update it
-	// to the real point.
-	splitRKey = leftRangeDesc.EndKey
-	if err := ts.DB().GetProto(context.TODO(),
-		keys.RangeDescriptorKey(splitRKey), &rightRangeDesc); err != nil {
-		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{},
-			errors.Wrap(err, "could not look up right-hand side descriptor")
-	}
+
 	return leftRangeDesc, rightRangeDesc, nil
+}
+
+// GetRangeLease returns the current lease for the range containing key, and a
+// timestamp taken from the node.
+//
+// The lease is returned regardless of its status.
+func (ts *TestServer) GetRangeLease(
+	ctx context.Context, key roachpb.Key,
+) (_ roachpb.Lease, now hlc.Timestamp, _ error) {
+	leaseReq := roachpb.LeaseInfoRequest{
+		Span: roachpb.Span{
+			Key: key,
+		},
+	}
+	leaseResp, pErr := client.SendWrappedWith(
+		ctx,
+		ts.DB().GetSender(),
+		roachpb.Header{
+			// INCONSISTENT read, since we want to make sure that the node used to
+			// send this is the one that processes the command, for the hint to
+			// matter.
+			ReadConsistency: roachpb.INCONSISTENT,
+		},
+		&leaseReq,
+	)
+	if pErr != nil {
+		return roachpb.Lease{}, hlc.Timestamp{}, pErr.GoError()
+	}
+	return leaseResp.(*roachpb.LeaseInfoResponse).Lease, ts.Clock().Now(), nil
+
 }
 
 type testServerFactoryImpl struct{}

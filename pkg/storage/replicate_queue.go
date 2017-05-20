@@ -17,9 +17,12 @@
 package storage
 
 import (
+	"bytes"
+	"fmt"
 	"sync/atomic"
 	"time"
 
+	"github.com/coreos/etcd/raft"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
@@ -45,15 +48,20 @@ const (
 )
 
 var (
-	metaReplicateQueueAddReplicaCount = metric.Metadata{Name: "queue.replicate.addreplica",
+	metaReplicateQueueAddReplicaCount = metric.Metadata{
+		Name: "queue.replicate.addreplica",
 		Help: "Number of replica additions attempted by the replicate queue"}
-	metaReplicateQueueRemoveReplicaCount = metric.Metadata{Name: "queue.replicate.removereplica",
+	metaReplicateQueueRemoveReplicaCount = metric.Metadata{
+		Name: "queue.replicate.removereplica",
 		Help: "Number of replica removals attempted by the replicate queue (typically in response to a rebalancer-initiated addition)"}
-	metaReplicateQueueRemoveDeadReplicaCount = metric.Metadata{Name: "queue.replicate.removedeadreplica",
+	metaReplicateQueueRemoveDeadReplicaCount = metric.Metadata{
+		Name: "queue.replicate.removedeadreplica",
 		Help: "Number of dead replica removals attempted by the replicate queue (typically in response to a node outage)"}
-	metaReplicateQueueRebalanceReplicaCount = metric.Metadata{Name: "queue.replicate.rebalancereplica",
+	metaReplicateQueueRebalanceReplicaCount = metric.Metadata{
+		Name: "queue.replicate.rebalancereplica",
 		Help: "Number of replica rebalancer-initiated additions attempted by the replicate queue"}
-	metaReplicateQueueTransferLeaseCount = metric.Metadata{Name: "queue.replicate.transferlease",
+	metaReplicateQueueTransferLeaseCount = metric.Metadata{
+		Name: "queue.replicate.transferlease",
 		Help: "Number of range lease transfers attempted by the replicate queue"}
 )
 
@@ -167,7 +175,7 @@ func (rq *replicateQueue) shouldQueue(
 	}
 
 	// If the lease is valid, check to see if we should transfer it.
-	if lease, _ := repl.getLease(); lease != nil && repl.IsLeaseValid(lease, now) {
+	if lease, _ := repl.getLease(); repl.IsLeaseValid(lease, now) {
 		if rq.canTransferLease() &&
 			rq.allocator.ShouldTransferLease(
 				ctx, zone.Constraints, desc.Replicas, lease.Replica.StoreID, desc.RangeID, repl.stats) {
@@ -178,9 +186,6 @@ func (rq *replicateQueue) shouldQueue(
 		}
 	}
 
-	// Check for a rebalancing opportunity. Note that leaseStoreID will be 0 if
-	// the range doesn't currently have a lease which will allow the current
-	// replica to be considered a rebalancing source.
 	target, err := rq.allocator.RebalanceTarget(
 		ctx,
 		zone.Constraints,
@@ -233,7 +238,7 @@ func (rq *replicateQueue) process(
 		}
 		return nil
 	}
-	return errors.Errorf("failed to replicate %s after %d retries", repl, retryOpts.MaxRetries)
+	return errors.Errorf("failed to replicate after %d retries", retryOpts.MaxRetries)
 }
 
 func (rq *replicateQueue) processOneChange(
@@ -272,16 +277,18 @@ func (rq *replicateQueue) processOneChange(
 		if err != nil {
 			return false, err
 		}
-		newReplica := roachpb.ReplicaDescriptor{
+		newReplica := roachpb.ReplicationTarget{
 			NodeID:  newStore.Node.NodeID,
 			StoreID: newStore.StoreID,
 		}
 
 		rq.metrics.AddReplicaCount.Inc(1)
 		if log.V(1) {
-			log.Infof(ctx, "adding replica to %+v due to under-replication", newReplica)
+			log.Infof(ctx, "adding replica %+v due to under-replication: %s",
+				newReplica, rangeRaftProgress(repl.RaftStatus(), desc.Replicas))
 		}
-		if err := rq.addReplica(ctx, repl, newReplica, desc); err != nil {
+		if err := rq.addReplica(
+			ctx, repl, newReplica, desc, SnapshotRequest_RECOVERY); err != nil {
 			return false, err
 		}
 	case AllocatorRemove:
@@ -325,9 +332,14 @@ func (rq *replicateQueue) processOneChange(
 		} else {
 			rq.metrics.RemoveReplicaCount.Inc(1)
 			if log.V(1) {
-				log.Infof(ctx, "removing replica %+v due to over-replication", removeReplica)
+				log.Infof(ctx, "removing replica %+v due to over-replication: %s",
+					removeReplica, rangeRaftProgress(repl.RaftStatus(), desc.Replicas))
 			}
-			if err := rq.removeReplica(ctx, repl, removeReplica, desc); err != nil {
+			target := roachpb.ReplicationTarget{
+				NodeID:  removeReplica.NodeID,
+				StoreID: removeReplica.StoreID,
+			}
+			if err := rq.removeReplica(ctx, repl, target, desc); err != nil {
 				return false, err
 			}
 		}
@@ -346,7 +358,11 @@ func (rq *replicateQueue) processOneChange(
 		if log.V(1) {
 			log.Infof(ctx, "removing dead replica %+v from store", deadReplica)
 		}
-		if err := rq.removeReplica(ctx, repl, deadReplica, desc); err != nil {
+		target := roachpb.ReplicationTarget{
+			NodeID:  deadReplica.NodeID,
+			StoreID: deadReplica.StoreID,
+		}
+		if err := rq.removeReplica(ctx, repl, target, desc); err != nil {
 			return false, err
 		}
 	case AllocatorNoop:
@@ -394,15 +410,17 @@ func (rq *replicateQueue) processOneChange(
 			// without re-queuing this replica.
 			return false, nil
 		}
-		rebalanceReplica := roachpb.ReplicaDescriptor{
+		rebalanceReplica := roachpb.ReplicationTarget{
 			NodeID:  rebalanceStore.Node.NodeID,
 			StoreID: rebalanceStore.StoreID,
 		}
 		rq.metrics.RebalanceReplicaCount.Inc(1)
 		if log.V(1) {
-			log.Infof(ctx, "rebalancing to %+v", rebalanceReplica)
+			log.Infof(ctx, "rebalancing to %+v: %s",
+				rebalanceReplica, rangeRaftProgress(repl.RaftStatus(), desc.Replicas))
 		}
-		if err := rq.addReplica(ctx, repl, rebalanceReplica, desc); err != nil {
+		if err := rq.addReplica(
+			ctx, repl, rebalanceReplica, desc, SnapshotRequest_REBALANCE); err != nil {
 			return false, err
 		}
 	}
@@ -445,19 +463,20 @@ func (rq *replicateQueue) transferLease(
 func (rq *replicateQueue) addReplica(
 	ctx context.Context,
 	repl *Replica,
-	repDesc roachpb.ReplicaDescriptor,
+	target roachpb.ReplicationTarget,
 	desc *roachpb.RangeDescriptor,
+	priority SnapshotRequest_Priority,
 ) error {
-	return repl.ChangeReplicas(ctx, roachpb.ADD_REPLICA, repDesc, desc)
+	return repl.changeReplicas(ctx, roachpb.ADD_REPLICA, target, desc, priority)
 }
 
 func (rq *replicateQueue) removeReplica(
 	ctx context.Context,
 	repl *Replica,
-	repDesc roachpb.ReplicaDescriptor,
+	target roachpb.ReplicationTarget,
 	desc *roachpb.RangeDescriptor,
 ) error {
-	return repl.ChangeReplicas(ctx, roachpb.REMOVE_REPLICA, repDesc, desc)
+	return repl.ChangeReplicas(ctx, roachpb.REMOVE_REPLICA, target, desc)
 }
 
 func (rq *replicateQueue) canTransferLease() bool {
@@ -474,4 +493,30 @@ func (*replicateQueue) timer(_ time.Duration) time.Duration {
 // purgatoryChan returns the replicate queue's store update channel.
 func (rq *replicateQueue) purgatoryChan() <-chan struct{} {
 	return rq.updateChan
+}
+
+// rangeRaftStatus pretty-prints the Raft progress (i.e. Raft log position) of
+// the replicas.
+func rangeRaftProgress(raftStatus *raft.Status, replicas []roachpb.ReplicaDescriptor) string {
+	if raftStatus == nil || len(raftStatus.Progress) == 0 {
+		return ""
+	}
+	var buf bytes.Buffer
+	buf.WriteString("[")
+	for i, r := range replicas {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		fmt.Fprintf(&buf, "%d", r.ReplicaID)
+		if uint64(r.ReplicaID) == raftStatus.Lead {
+			buf.WriteString("*")
+		}
+		if progress, ok := raftStatus.Progress[uint64(r.ReplicaID)]; ok {
+			fmt.Fprintf(&buf, ":%d", progress.Match)
+		} else {
+			buf.WriteString(":?")
+		}
+	}
+	buf.WriteString("]")
+	return buf.String()
 }

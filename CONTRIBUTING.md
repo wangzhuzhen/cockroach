@@ -9,7 +9,13 @@
     the Makefile enforces the specific version required, as it is updated
     frequently.
   - Git 1.8+
-  - Bash
+  - Bash (4+ is preferred)
+  - GNU Make (3.81+ is known to work)
+  - CMake 2.8.12+
+  - XZ Utils (5.2.3+ is known to work), except on macOS, where xz support is
+    built in to `tar`.
+  - Optional: NodeJS 6.x and Yarn 0.22.0+. Required when compiling protocol
+    buffers.
 
   Note that at least 4GB of RAM is required to build from source and run tests.
 
@@ -37,19 +43,19 @@ executable will be in your current directory and can be run as shown in the
   [blog post]: https://www.cockroachlabs.com/blog/how-were-building-a-business-to-last/
 
 - If you edit a `.proto` or `.ts` file, you will need to manually regenerate
-  the associated `.pb.{go,cc,h}` or `.js` files using `go generate ./pkg/...`.
+  the associated `.pb.{go,cc,h}` or `.js` files using `make generate`.
 
-- We advise to run `go generate` using our embedded Docker setup.
+- We advise to run `make generate` using our embedded Docker setup.
   `build/builder.sh` is a wrapper script designed to make this convenient. You
-  can run `build/builder.sh go generate ./pkg/...` from the repository root to
-  get the intended result.
+  can run `build/builder.sh make generate` from the repository root to get the
+  intended result.
 
 - If you plan on working on the UI, check out [the UI README](pkg/ui).
 
 - To add or update a Go dependency:
   - See [`build/README.md`](build/README.md) for details on adding or updating
     dependencies.
-  - Run `go generate ./pkg/...` to update generated files.
+  - Run `make generate` to update generated files.
   - Create a PR with all the changes.
 
 ## Style Guide
@@ -58,12 +64,10 @@ executable will be in your current directory and can be run as shown in the
 
 ## Code Review Workflow
 
-+ All contributors need to sign the [Contributor License Agreement]
-  (https://cla-assistant.io/cockroachdb/cockroach).
++ All contributors need to sign the [Contributor License Agreement](https://cla-assistant.io/cockroachdb/cockroach).
 
 + Create a local feature branch to do work on, ideally on one thing at a time.
-  If you are working on your own fork, see [this tip]
-  (http://blog.campoy.cat/2014/03/github-and-go-forking-pull-requests-and.html)
+  If you are working on your own fork, see [this tip](http://blog.campoy.cat/2014/03/github-and-go-forking-pull-requests-and.html)
   on forking in Go, which ensures that Go import paths will be correct.
 
   `git checkout -b update-readme`
@@ -76,8 +80,23 @@ executable will be in your current directory and can be run as shown in the
   make test
   # Run all tests in ./pkg/storage
   make test PKG=./pkg/storage
-  # Run all kv tests matching `^TestFoo` with a timeout of 10s
+  # Run all kv tests matching '^TestFoo' with a timeout of 10s
   make test PKG=./pkg/kv TESTS='^TestFoo' TESTTIMEOUT=10s
+  # Run the sql logic tests
+  make test PKG=./pkg/sql TESTS='TestLogic$$'
+  # or, using a shortcut,
+  make testlogic
+  # Run a specific sql logic subtest
+  make test PKG=./pkg/sql TESTS='TestLogic$$/select$$'
+  # or, using a shortcut,
+  make testlogic FILES=select
+  ```
+
+  Logs are disabled during tests by default. To enable them, include
+  `TESTFLAGS="-v -show-logs"` as an argument the test command:
+
+  ```shell
+  make test ... TESTFLAGS="-v -show-logs"
   ```
 
   When you're ready to commit, be sure to write a Good Commit Message™. Consult
@@ -93,25 +112,28 @@ executable will be in your current directory and can be run as shown in the
   not point to a specific package; those commits may begin with "*:" or "all:"
   to indicate their reach.
 
-+ Run the test suite locally:
++ Run the linters, code generators, and unit test suites locally:
 
-  `go generate ./pkg/... && make check test testrace`
+  ```
+  make pre-push
+  ````
+
+  This will take several minutes.
 
 + When you’re ready for review, groom your work: each commit should pass tests
   and contain a substantial (but not overwhelming) unit of work. You may also
   want to `git fetch origin` and run
-  `git rebase -i --exec "make check test" origin/master` to make sure you're
+  `git rebase -i --exec "make lint test" origin/master` to make sure you're
   submitting your changes on top of the newest version of our code. Next, push
   to your fork:
 
   `git push -u <yourfork> update-readme`
 
-+ Then [create a pull request using GitHub’s UI]
-  (https://help.github.com/articles/creating-a-pull-request). If you know of
++ Then [create a pull request using GitHub’s UI](https://help.github.com/articles/creating-a-pull-request). If you know of
   another GitHub user particularly suited to reviewing your pull request, be
   sure to mention them in the pull request body. If you possess the necessary
   GitHub privileges, please also [assign them to the pull request using
-  GitHub's UI] (https://help.github.com/articles/assigning-issues-and-pull-requests-to-other-github-users/).
+  GitHub's UI](https://help.github.com/articles/assigning-issues-and-pull-requests-to-other-github-users/).
   This will help focus and expedite the code review process.
 
 + If you get a test failure in CircleCI, check the Test Failure tab to see why
@@ -138,10 +160,8 @@ Peeking into a running cluster can be done in several ways:
   `Node`/`Store`/`Replica` and the other inside of the coordinator
   (`TxnCoordSender`).
 * [pprof](https://golang.org/pkg/net/http/pprof/) gives us (among other things)
-  heap and cpu profiles; [this golang blog post]
-  (http://blog.golang.org/profiling-go-programs) explains it extremely well and
-  [this one by Dmitry Vuykov]
-  (https://software.intel.com/en-us/blogs/2014/05/10/debugging-performance-issues-in-go-programs)
+  heap and cpu profiles; [this golang blog post](http://blog.golang.org/profiling-go-programs) explains it extremely well and
+  [this one by Dmitry Vuykov](https://software.intel.com/en-us/blogs/2014/05/10/debugging-performance-issues-in-go-programs)
   goes into even more detail.
 
 An easy way to locally run a workload against a cluster are the acceptance

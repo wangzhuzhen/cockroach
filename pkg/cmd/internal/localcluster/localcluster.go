@@ -20,13 +20,11 @@ import (
 	"bytes"
 	gosql "database/sql"
 	"fmt"
-	"io"
 	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -140,7 +138,7 @@ func (c *Cluster) Close() {
 	for _, n := range c.Nodes {
 		n.Kill()
 	}
-	c.stopper.Stop()
+	c.stopper.Stop(context.Background())
 }
 
 // IPAddr returns the IP address of the specified node.
@@ -341,34 +339,6 @@ func (c *Cluster) lookupRange(nodeIdx int, key roachpb.Key) (*roachpb.RangeDescr
 	return &resp.(*roachpb.RangeLookupResponse).Ranges[0], nil
 }
 
-// Freeze freezes (or thaws) the cluster. The freeze request is sent to the
-// specified node.
-func (c *Cluster) Freeze(nodeIdx int, freeze bool) {
-	addr := c.RPCAddr(nodeIdx)
-	conn, err := c.rpcCtx.GRPCDial(addr)
-	if err != nil {
-		log.Fatalf(context.Background(), "unable to dial: %s: %v", addr, err)
-	}
-
-	adminClient := serverpb.NewAdminClient(conn)
-	stream, err := adminClient.ClusterFreeze(
-		context.Background(), &serverpb.ClusterFreezeRequest{Freeze: freeze})
-	if err != nil {
-		log.Fatal(context.Background(), err)
-	}
-	for {
-		resp, err := stream.Recv()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			log.Fatal(context.Background(), err)
-		}
-		fmt.Println(resp.Message)
-	}
-	fmt.Println("ok")
-}
-
 // RandNode returns the index of a random alive node.
 func (c *Cluster) RandNode(f func(int) int) int {
 	for {
@@ -410,79 +380,54 @@ func (n *Node) Start() {
 	n.cmd.Env = os.Environ()
 	n.cmd.Env = append(n.cmd.Env, n.env...)
 
+	ctx := context.Background()
+
 	stdoutPath := filepath.Join(n.logDir, "stdout")
-	stdout, err := os.OpenFile(stdoutPath,
-		os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	stdout, err := os.OpenFile(stdoutPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
-		log.Fatalf(context.Background(), "unable to open file %s: %s", stdoutPath, err)
+		log.Fatalf(ctx, "unable to open file %s: %s", stdoutPath, err)
 	}
 	n.cmd.Stdout = stdout
 
 	stderrPath := filepath.Join(n.logDir, "stderr")
-	stderr, err := os.OpenFile(stderrPath,
-		os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	stderr, err := os.OpenFile(stderrPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
-		log.Fatalf(context.Background(), "unable to open file %s: %s", stderrPath, err)
+		log.Fatalf(ctx, "unable to open file %s: %s", stderrPath, err)
 	}
 	n.cmd.Stderr = stderr
 
-	err = n.cmd.Start()
-	if n.cmd.Process != nil {
-		log.Infof(context.Background(), "process %d started: %s",
-			n.cmd.Process.Pid, strings.Join(n.args, " "))
-	}
-	if err != nil {
-		log.Infof(context.Background(), "%v", err)
-		_ = stdout.Close()
-		_ = stderr.Close()
+	if err := n.cmd.Start(); err != nil {
+		log.Error(ctx, err)
+		if err := stdout.Close(); err != nil {
+			log.Warning(ctx, err)
+		}
+		if err := stderr.Close(); err != nil {
+			log.Warning(ctx, err)
+		}
 		return
 	}
 
+	pid := n.cmd.Process.Pid
+	log.Infof(ctx, "process %d started: %s", pid, n.cmd.Args)
+
 	go func(cmd *exec.Cmd) {
 		if err := cmd.Wait(); err != nil {
-			log.Errorf(context.Background(), "waiting for command: %v", err)
+			log.Errorf(ctx, "waiting for command: %s", err)
 		}
-		_ = stdout.Close()
-		_ = stderr.Close()
+		if err := stdout.Close(); err != nil {
+			log.Warning(ctx, err)
+		}
+		if err := stderr.Close(); err != nil {
+			log.Warning(ctx, err)
+		}
 
-		ps := cmd.ProcessState
-		sy := ps.Sys().(syscall.WaitStatus)
-
-		log.Infof(context.Background(), "Process %d exited with status %d",
-			ps.Pid(), sy.ExitStatus())
-		log.Infof(context.Background(), ps.String())
+		log.Infof(ctx, "Process %d: %s", pid, cmd.ProcessState)
 
 		n.Lock()
 		n.cmd = nil
 		n.Unlock()
 	}(n.cmd)
 }
-
-// Pause pauses a node by sending it SIGSTOP.
-func (n *Node) Pause() {
-	n.Lock()
-	defer n.Unlock()
-	if n.cmd == nil || n.cmd.Process == nil {
-		return
-	}
-	_ = n.cmd.Process.Signal(syscall.SIGSTOP)
-}
-
-// TODO(peter): Node.Pause is currently unused.
-var _ = (*Node).Pause
-
-// Resume resumes a node by sending it SIGCONT.
-func (n *Node) Resume() {
-	n.Lock()
-	defer n.Unlock()
-	if n.cmd == nil || n.cmd.Process == nil {
-		return
-	}
-	_ = n.cmd.Process.Signal(syscall.SIGCONT)
-}
-
-// TODO(peter): Node.Resume is currently unused.
-var _ = (*Node).Resume
 
 // Kill stops a node abruptly by sending it SIGKILL.
 func (n *Node) Kill() {

@@ -26,12 +26,16 @@ import "bytes"
 
 // Show represents a SHOW statement.
 type Show struct {
-	Name string
+	Name           string
+	ClusterSetting bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *Show) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("SHOW ")
+	if node.ClusterSetting {
+		buf.WriteString("CLUSTER SETTING ")
+	}
 	buf.WriteString(node.Name)
 }
 
@@ -163,4 +167,51 @@ type Help struct {
 func (node *Help) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("HELP ")
 	FormatNode(buf, f, node.Name)
+}
+
+// ShowRanges represents a SHOW TESTING_RANGES statement.
+// Only one of Table and Index can be set.
+type ShowRanges struct {
+	Table *NormalizableTableName
+	Index *TableNameWithIndex
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowRanges) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteString("SHOW TESTING_RANGES FROM ")
+	if node.Index != nil {
+		buf.WriteString("INDEX ")
+		FormatNode(buf, f, node.Index)
+	} else {
+		buf.WriteString("TABLE ")
+		FormatNode(buf, f, node.Table)
+	}
+}
+
+// ShowSource encapsulates one of the other SHOW statements as a data source.
+type ShowSource struct {
+	Statement Statement
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowSource) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteByte('[')
+	node.Statement.Format(buf, f)
+	buf.WriteByte(']')
+}
+
+// ShowFingerprints represents a SHOW EXPERIMENTAL_FINGERPRINTS statement.
+type ShowFingerprints struct {
+	Table *NormalizableTableName
+	AsOf  AsOfClause
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowFingerprints) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteString("SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE ")
+	FormatNode(buf, f, node.Table)
+	if node.AsOf.Expr != nil {
+		buf.WriteString(" ")
+		FormatNode(buf, f, node.AsOf)
+	}
 }

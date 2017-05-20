@@ -4,7 +4,7 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/pkg/ccl/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
 
 package storageccl
 
@@ -21,9 +21,11 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	security.SetReadFileFn(securitytest.Asset)
+	security.SetAssetLoader(securitytest.EmbeddedAssets)
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
 	os.Exit(m.Run())
 }
+
+//go:generate ../../util/leaktest/add-leaktest.sh *_test.go

@@ -73,7 +73,6 @@ type SelectClause struct {
 	GroupBy     GroupBy
 	Having      *Where
 	Window      Window
-	Lock        string
 	tableSelect bool
 }
 
@@ -93,7 +92,6 @@ func (node *SelectClause) Format(buf *bytes.Buffer, f FmtFlags) {
 		FormatNode(buf, f, node.GroupBy)
 		FormatNode(buf, f, node.Having)
 		FormatNode(buf, f, node.Window)
-		buf.WriteString(node.Lock)
 	}
 }
 
@@ -222,6 +220,10 @@ func (*FuncExpr) tableExpr()         {}
 // interface.
 
 func (*Explain) tableExpr() {}
+
+// Ditto for ShowSource, used for [SHOW ...]
+
+func (*ShowSource) tableExpr() {}
 
 // IndexID is a custom type for IndexDescriptor IDs.
 type IndexID uint32

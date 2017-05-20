@@ -77,7 +77,7 @@ func checkLen(t *testing.T, expected, count int) {
 func TestDB_Get(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db := setup(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	result, err := db.Get(context.TODO(), "aa")
 	if err != nil {
@@ -89,7 +89,7 @@ func TestDB_Get(t *testing.T) {
 func TestDB_Put(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db := setup(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
 
 	if err := db.Put(context.TODO(), "aa", "1"); err != nil {
@@ -105,7 +105,7 @@ func TestDB_Put(t *testing.T) {
 func TestDB_CPut(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db := setup(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
 
 	if err := db.Put(ctx, "aa", "1"); err != nil {
@@ -151,7 +151,7 @@ func TestDB_CPut(t *testing.T) {
 func TestDB_InitPut(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db := setup(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
 
 	if err := db.InitPut(ctx, "aa", "1"); err != nil {
@@ -173,7 +173,7 @@ func TestDB_InitPut(t *testing.T) {
 func TestDB_Inc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db := setup(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
 
 	if _, err := db.Inc(ctx, "aa", 100); err != nil {
@@ -189,7 +189,7 @@ func TestDB_Inc(t *testing.T) {
 func TestBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db := setup(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	b := &client.Batch{}
 	b.Get("aa")
@@ -208,7 +208,7 @@ func TestBatch(t *testing.T) {
 func TestDB_Scan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db := setup(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	b := &client.Batch{}
 	b.Put("aa", "1")
@@ -233,7 +233,7 @@ func TestDB_Scan(t *testing.T) {
 func TestDB_ReverseScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db := setup(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	b := &client.Batch{}
 	b.Put("aa", "1")
@@ -258,7 +258,7 @@ func TestDB_ReverseScan(t *testing.T) {
 func TestDB_Del(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db := setup(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	b := &client.Batch{}
 	b.Put("aa", "1")
@@ -285,7 +285,7 @@ func TestDB_Del(t *testing.T) {
 func TestTxn_Commit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db := setup(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	err := db.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 		b := txn.NewBatch()
@@ -313,7 +313,7 @@ func TestTxn_Commit(t *testing.T) {
 func TestDB_Put_insecure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, db := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
 
 	if err := db.Put(context.TODO(), "aa", "1"); err != nil {
@@ -329,7 +329,7 @@ func TestDB_Put_insecure(t *testing.T) {
 func TestDebugName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db := setup(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 		const expected = "unnamed"
@@ -359,47 +359,54 @@ func TestCommonMethods(t *testing.T) {
 		// request with the information that this particular Get must be
 		// unmarshaled, which didn't seem worth doing as we're not using
 		// Batch.GetProto at the moment.
-		{dbType, "GetProto"}:                   {},
-		{txnType, "GetProto"}:                  {},
-		{batchType, "CheckConsistency"}:        {},
-		{batchType, "AddRawRequest"}:           {},
-		{batchType, "PutInline"}:               {},
-		{batchType, "RawResponse"}:             {},
-		{batchType, "MustPErr"}:                {},
-		{dbType, "AdminMerge"}:                 {},
-		{dbType, "AdminSplit"}:                 {},
-		{dbType, "AdminTransferLease"}:         {},
-		{dbType, "CheckConsistency"}:           {},
-		{dbType, "Run"}:                        {},
-		{dbType, "Txn"}:                        {},
-		{dbType, "GetSender"}:                  {},
-		{dbType, "PutInline"}:                  {},
-		{dbType, "WriteBatch"}:                 {},
-		{txnType, "Commit"}:                    {},
-		{txnType, "CommitInBatch"}:             {},
-		{txnType, "CommitOrCleanup"}:           {},
-		{txnType, "Rollback"}:                  {},
-		{txnType, "CleanupOnError"}:            {},
-		{txnType, "DebugName"}:                 {},
-		{txnType, "InternalSetPriority"}:       {},
-		{txnType, "IsFinalized"}:               {},
-		{txnType, "NewBatch"}:                  {},
-		{txnType, "Exec"}:                      {},
-		{txnType, "GetDeadline"}:               {},
-		{txnType, "ResetDeadline"}:             {},
-		{txnType, "Run"}:                       {},
-		{txnType, "SetDebugName"}:              {},
-		{txnType, "SetIsolation"}:              {},
-		{txnType, "SetUserPriority"}:           {},
-		{txnType, "SetSystemConfigTrigger"}:    {},
-		{txnType, "SetTxnAnchorKey"}:           {},
-		{txnType, "UpdateDeadlineMaybe"}:       {},
-		{txnType, "AddCommitTrigger"}:          {},
-		{txnType, "IsInitialized"}:             {},
-		{txnType, "IsRetryableErrMeantForTxn"}: {},
-		{txnType, "Isolation"}:                 {},
-		{txnType, "Proto"}:                     {},
-		{txnType, "UserPriority"}:              {},
+		{dbType, "GetProto"}:                         {},
+		{txnType, "GetProto"}:                        {},
+		{batchType, "CheckConsistency"}:              {},
+		{batchType, "AddRawRequest"}:                 {},
+		{batchType, "PutInline"}:                     {},
+		{batchType, "RawResponse"}:                   {},
+		{batchType, "MustPErr"}:                      {},
+		{dbType, "AdminMerge"}:                       {},
+		{dbType, "AdminSplit"}:                       {},
+		{dbType, "AdminTransferLease"}:               {},
+		{dbType, "AdminChangeReplicas"}:              {},
+		{dbType, "CheckConsistency"}:                 {},
+		{dbType, "Run"}:                              {},
+		{dbType, "Txn"}:                              {},
+		{dbType, "GetSender"}:                        {},
+		{dbType, "PutInline"}:                        {},
+		{dbType, "WriteBatch"}:                       {},
+		{txnType, "AcceptUnhandledRetryableErrors"}:  {},
+		{txnType, "Commit"}:                          {},
+		{txnType, "CommitInBatch"}:                   {},
+		{txnType, "CommitOrCleanup"}:                 {},
+		{txnType, "Rollback"}:                        {},
+		{txnType, "CleanupOnError"}:                  {},
+		{txnType, "DebugName"}:                       {},
+		{txnType, "EnsureProto"}:                     {},
+		{txnType, "InternalSetPriority"}:             {},
+		{txnType, "IsFinalized"}:                     {},
+		{txnType, "NewBatch"}:                        {},
+		{txnType, "Exec"}:                            {},
+		{txnType, "GetDeadline"}:                     {},
+		{txnType, "ResetDeadline"}:                   {},
+		{txnType, "Run"}:                             {},
+		{txnType, "SetDebugName"}:                    {},
+		{txnType, "SetFixedTimestamp"}:               {},
+		{txnType, "SetIsolation"}:                    {},
+		{txnType, "SetUserPriority"}:                 {},
+		{txnType, "SetSystemConfigTrigger"}:          {},
+		{txnType, "SetTxnAnchorKey"}:                 {},
+		{txnType, "UpdateDeadlineMaybe"}:             {},
+		{txnType, "UpdateStateOnRemoteRetryableErr"}: {},
+		{txnType, "AddCommitTrigger"}:                {},
+		{txnType, "CommandCount"}:                    {},
+		{txnType, "IsRetryableErrMeantForTxn"}:       {},
+		{txnType, "Isolation"}:                       {},
+		{txnType, "OrigTimestamp"}:                   {},
+		{txnType, "Proto"}:                           {},
+		{txnType, "UserPriority"}:                    {},
+		{txnType, "AnchorKey"}:                       {},
 	}
 
 	for b := range omittedChecks {

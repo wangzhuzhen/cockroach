@@ -25,6 +25,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
 
@@ -175,8 +176,12 @@ func (fr *flowRegistry) RegisterFlow(
 				}
 			}
 			if numTimedOut != 0 {
+				// The span in the context might be finished by the time this runs. In
+				// principle, we could ForkCtxSpan() beforehand, but we don't want to
+				// create the extra span every time.
+				timeoutCtx := opentracing.ContextWithSpan(ctx, nil)
 				log.Errorf(
-					ctx,
+					timeoutCtx,
 					"flow id:%s : %d inbound streams timed out after %s; propagated error throughout flow",
 					id,
 					numTimedOut,
@@ -205,7 +210,9 @@ func (fr *flowRegistry) UnregisterFlow(id FlowID) {
 // given timeout. If the timeout elapses, returns nil. It should only be called
 // while holding the mutex. The mutex is temporarily unlocked if we need to
 // wait.
-func (fr *flowRegistry) waitForFlowLocked(id FlowID, timeout time.Duration) *flowEntry {
+func (fr *flowRegistry) waitForFlowLocked(
+	ctx context.Context, id FlowID, timeout time.Duration,
+) *flowEntry {
 	entry := fr.getEntryLocked(id)
 	if entry.flow != nil {
 		return entry
@@ -224,10 +231,10 @@ func (fr *flowRegistry) waitForFlowLocked(id FlowID, timeout time.Duration) *flo
 	entry.refCount++
 	fr.Unlock()
 
-	// Wait until waitCh gets closed or the timeout elapses.
 	select {
 	case <-waitCh:
 	case <-time.After(timeout):
+	case <-ctx.Done():
 	}
 
 	fr.Lock()
@@ -251,11 +258,11 @@ func (fr *flowRegistry) waitForFlowLocked(id FlowID, timeout time.Duration) *flo
 // The cleanup function will decrement the flow's WaitGroup, so that Flow.Wait()
 // is not blocked on this stream any more.
 func (fr *flowRegistry) ConnectInboundStream(
-	flowID FlowID, streamID StreamID, timeout time.Duration,
+	ctx context.Context, flowID FlowID, streamID StreamID, timeout time.Duration,
 ) (*Flow, RowReceiver, func(), error) {
 	fr.Lock()
 	defer fr.Unlock()
-	entry := fr.waitForFlowLocked(flowID, timeout)
+	entry := fr.waitForFlowLocked(ctx, flowID, timeout)
 	if entry == nil {
 		return nil, nil, nil, errors.Errorf("flow %s not found", flowID)
 	}

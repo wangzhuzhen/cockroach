@@ -22,7 +22,6 @@ package client_test
 import (
 	"bytes"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -125,12 +124,12 @@ func createTestClient(t *testing.T, s serverutils.TestServerInterface) *client.D
 func createTestClientForUser(
 	t *testing.T, s serverutils.TestServerInterface, user string, dbCtx client.DBContext,
 ) *client.DB {
-	rpcContext := rpc.NewContext(log.AmbientContext{}, &base.Config{
-		User:       user,
-		SSLCA:      filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert),
-		SSLCert:    filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.crt", user)),
-		SSLCertKey: filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.key", user)),
-	}, s.Clock(), s.Stopper())
+	cfg := &base.Config{
+		User: user,
+	}
+	testutils.FillCerts(cfg)
+
+	rpcContext := rpc.NewContext(log.AmbientContext{}, cfg, s.Clock(), s.Stopper())
 	conn, err := rpcContext.GRPCDial(s.ServingAddr())
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +182,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 		},
 	}
 	s, _, _ := serverutils.StartServer(t, args)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	testCases := []struct {
 		args        roachpb.Request
@@ -308,7 +307,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 func TestClientRunTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	dbCtx := client.DefaultDBContext()
 	db := createTestClientForUser(t, s, security.NodeUser, dbCtx)
 
@@ -369,7 +368,7 @@ func TestClientRunTransaction(t *testing.T) {
 func TestClientRunConcurrentTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	dbCtx := client.DefaultDBContext()
 	db := createTestClientForUser(t, s, security.NodeUser, dbCtx)
 
@@ -426,7 +425,7 @@ func TestClientRunConcurrentTransaction(t *testing.T) {
 			for _, err := range concErrs {
 				if err != nil {
 					anyError = err
-					if _, ok := err.(*roachpb.RetryableTxnError); ok {
+					if _, ok := err.(*roachpb.HandledRetryableTxnError); ok {
 						return err
 					}
 				}
@@ -467,7 +466,7 @@ func TestClientRunConcurrentTransaction(t *testing.T) {
 func TestClientGetAndPutProto(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	db := createTestClient(t, s)
 
 	zoneConfig := config.ZoneConfig{
@@ -496,7 +495,7 @@ func TestClientGetAndPutProto(t *testing.T) {
 func TestClientGetAndPut(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	db := createTestClient(t, s)
 
 	value := []byte("value")
@@ -518,7 +517,7 @@ func TestClientGetAndPut(t *testing.T) {
 func TestClientPutInline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	db := createTestClient(t, s)
 
 	value := []byte("value")
@@ -545,7 +544,7 @@ func TestClientPutInline(t *testing.T) {
 func TestClientEmptyValues(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	db := createTestClient(t, s)
 
 	if err := db.Put(context.TODO(), testUser+"/a", []byte{}); err != nil {
@@ -574,7 +573,7 @@ func TestClientEmptyValues(t *testing.T) {
 func TestClientBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	db := createTestClient(t, s)
 	ctx := context.TODO()
 
@@ -830,7 +829,7 @@ func concurrentIncrements(db *client.DB, t *testing.T) {
 func TestConcurrentIncrements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	db := createTestClient(t, s)
 
 	// Convenience loop: Crank up this number for testing this
@@ -847,7 +846,7 @@ func TestConcurrentIncrements(t *testing.T) {
 func TestClientPermissions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// NodeUser certs are required for all KV operations.
 	// RootUser has no KV privileges whatsoever.
@@ -948,7 +947,7 @@ func TestInconsistentReads(t *testing.T) {
 func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	db := createTestClient(t, s)
 
 	if err := db.Put(context.TODO(), "k", "v"); err != nil {
@@ -974,7 +973,7 @@ func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 func TestTxn_ReverseScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	db := createTestClient(t, s)
 
 	keys := []roachpb.Key{}

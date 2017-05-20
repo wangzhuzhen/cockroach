@@ -101,21 +101,22 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 		livenessName = base + "/liveness"
 		nodesPrefix  = base + "/nodes"
 		schemaPrefix = base + "/schema"
+		settingsName = base + "/settings"
 	)
 
 	if len(args) != 1 {
 		return errors.New("exactly one argument is required")
 	}
 
-	conn, _, stopper, err := getGRPCConn()
+	conn, _, stopper, err := getClientGRPCConn()
 	if err != nil {
 		return err
 	}
-	defer stopper.Stop()
+	ctx := stopperContext(stopper)
+	defer stopper.Stop(ctx)
 
 	status := serverpb.NewStatusClient(conn)
 	admin := serverpb.NewAdminClient(conn)
-	ctx := stopperContext(stopper)
 
 	name := args[0]
 	out, err := os.Create(name)
@@ -143,6 +144,16 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 		}
 	} else {
 		if err := z.createJSON(livenessName, liveness); err != nil {
+			return err
+		}
+	}
+
+	if settings, err := admin.Settings(ctx, &serverpb.SettingsRequest{}); err != nil {
+		if err := z.createError(settingsName, err); err != nil {
+			return err
+		}
+	} else {
+		if err := z.createJSON(settingsName, settings); err != nil {
 			return err
 		}
 	}

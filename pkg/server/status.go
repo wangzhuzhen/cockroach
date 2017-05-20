@@ -67,6 +67,10 @@ const (
 	// rangeDebugEndpoint exposes an html page with information about a specific range.
 	rangeDebugEndpoint = "/debug/range"
 
+	// problemRangesDebugEndpoint exposes an html page with a list of all ranges
+	// that are experiencing problems.
+	problemRangesDebugEndpoint = "/debug/problemranges"
+
 	// raftStateDormant is used when there is no known raft state.
 	raftStateDormant = "StateDormant"
 )
@@ -83,6 +87,7 @@ type metricMarshaler interface {
 type statusServer struct {
 	log.AmbientContext
 
+	admin        *adminServer
 	db           *client.DB
 	gossip       *gossip.Gossip
 	metricSource metricMarshaler
@@ -95,6 +100,7 @@ type statusServer struct {
 // newStatusServer allocates and returns a statusServer.
 func newStatusServer(
 	ambient log.AmbientContext,
+	adminServer *adminServer,
 	db *client.DB,
 	gossip *gossip.Gossip,
 	metricSource metricMarshaler,
@@ -106,6 +112,7 @@ func newStatusServer(
 	ambient.AddLogTag("status", nil)
 	server := &statusServer{
 		AmbientContext: ambient,
+		admin:          adminServer,
 		db:             db,
 		gossip:         gossip,
 		metricSource:   metricSource,
@@ -295,8 +302,11 @@ func parseInt64WithDefault(s string, defaultValue int64) (int64, error) {
 //   pattern if it exists. Defaults to nil.
 // * "max" query parameter is the hard limit of the number of returned log
 //   entries. Defaults to defaultMaxLogEntries.
-// * "level" query parameter filters the log entries to be those of the
-//   corresponding severity level or worse. Defaults to "info".
+// To filter the log messages to only retrieve messages from a given level,
+// use a pattern that excludes all messages at the undesired levels.
+// (e.g. "^[^IW]" to only get errors, fatals and panics). An exclusive
+// pattern is better because panics and some other errors do not use
+// a prefix character.
 func (s *statusServer) Logs(
 	ctx context.Context, req *serverpb.LogsRequest,
 ) (*serverpb.LogEntriesResponse, error) {
@@ -314,17 +324,6 @@ func (s *statusServer) Logs(
 	}
 
 	log.Flush()
-
-	var sev log.Severity
-	if len(req.Level) == 0 {
-		sev = log.Severity_INFO
-	} else {
-		var sevFound bool
-		sev, sevFound = log.SeverityByName(req.Level)
-		if !sevFound {
-			return nil, fmt.Errorf("level could not be determined: %s", req.Level)
-		}
-	}
 
 	startTimestamp, err := parseInt64WithDefault(
 		req.StartTime,
@@ -357,7 +356,7 @@ func (s *statusServer) Logs(
 		}
 	}
 
-	entries, err := log.FetchEntriesFromFiles(sev, startTimestamp, endTimestamp, int(maxEntries), regex)
+	entries, err := log.FetchEntriesFromFiles(startTimestamp, endTimestamp, int(maxEntries), regex)
 	if err != nil {
 		return nil, err
 	}
@@ -632,20 +631,40 @@ func (s *statusServer) Ranges(
 		return state
 	}
 
-	constructRangeInfo := func(desc roachpb.RangeDescriptor, rep *storage.Replica, storeID roachpb.StoreID) serverpb.RangeInfo {
+	constructRangeInfo := func(
+		desc roachpb.RangeDescriptor, rep *storage.Replica, storeID roachpb.StoreID, metrics storage.ReplicaMetrics,
+	) serverpb.RangeInfo {
+		raftStatus := rep.RaftStatus()
+		raftState := convertRaftStatus(raftStatus)
+		leaseHistory := rep.GetLeaseHistory()
 		return serverpb.RangeInfo{
 			Span: serverpb.PrettySpan{
 				StartKey: desc.StartKey.String(),
 				EndKey:   desc.EndKey.String(),
 			},
-			RaftState:     convertRaftStatus(rep.RaftStatus()),
+			RaftState:     raftState,
 			State:         rep.State(),
 			SourceNodeID:  nodeID,
 			SourceStoreID: storeID,
+			LeaseHistory:  leaseHistory,
+			Problems: serverpb.RangeProblems{
+				Unavailable:          metrics.RangeCounter && metrics.Unavailable,
+				LeaderNotLeaseHolder: metrics.Leader && metrics.LeaseValid && !metrics.Leaseholder,
+				NoRaftLeader:         !storage.HasRaftLeader(raftStatus) && !metrics.Quiescent,
+				Underreplicated:      metrics.Leader && metrics.Underreplicated,
+				NoLease:              metrics.Leader && !metrics.LeaseValid && !metrics.Quiescent,
+			},
 		}
 	}
 
+	cfg, ok := s.gossip.GetSystemConfig()
+	if !ok {
+		return nil, grpc.Errorf(codes.Internal, "system config not yet available")
+	}
+	isLiveMap := s.nodeLiveness.GetIsLiveMap()
+
 	err = s.stores.VisitStores(func(store *storage.Store) error {
+		timestamp := store.Clock().Now()
 		if len(req.RangeIDs) == 0 {
 			// All ranges requested.
 
@@ -657,7 +676,13 @@ func (s *statusServer) Ranges(
 					if err != nil {
 						return true, err
 					}
-					output.Ranges = append(output.Ranges, constructRangeInfo(desc, rep, store.Ident.StoreID))
+					output.Ranges = append(output.Ranges,
+						constructRangeInfo(
+							desc,
+							rep,
+							store.Ident.StoreID,
+							rep.Metrics(ctx, timestamp, cfg, isLiveMap),
+						))
 					return false, nil
 				})
 			return err
@@ -671,7 +696,13 @@ func (s *statusServer) Ranges(
 				continue
 			}
 			desc := rep.Desc()
-			output.Ranges = append(output.Ranges, constructRangeInfo(*desc, rep, store.Ident.StoreID))
+			output.Ranges = append(output.Ranges,
+				constructRangeInfo(
+					*desc,
+					rep,
+					store.Ident.StoreID,
+					rep.Metrics(ctx, timestamp, cfg, isLiveMap),
+				))
 		}
 		return nil
 	})

@@ -17,6 +17,7 @@
 package distsqlrun
 
 import (
+	"fmt"
 	"io"
 	"testing"
 
@@ -24,6 +25,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -33,7 +35,7 @@ func TestServer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	conn, err := s.RPCContext().GRPCDial(s.ServingAddr())
 	if err != nil {
 		t.Fatal(err)
@@ -55,10 +57,11 @@ func TestServer(t *testing.T) {
 	}
 	post := PostProcessSpec{
 		Filter:        Expression{Expr: "@1 != 2"}, // a != 2
-		OutputColumns: []uint32{0, 1},              // a
+		Projection:    true,
+		OutputColumns: []uint32{0, 1}, // a
 	}
 
-	req := &SetupFlowRequest{}
+	req := &SetupFlowRequest{Version: Version}
 	req.Flow = FlowSpec{
 		Processors: []ProcessorSpec{{
 			Core: ProcessorCoreUnion{TableReader: &ts},
@@ -104,4 +107,42 @@ func TestServer(t *testing.T) {
 	if str != expected {
 		t.Errorf("invalid results: %s, expected %s'", str, expected)
 	}
+
+	// Verify version handling.
+	t.Run("version", func(t *testing.T) {
+		testCases := []struct {
+			version     uint32
+			expectedErr string
+		}{
+			{
+				version:     Version + 1,
+				expectedErr: "version mismatch",
+			},
+			{
+				version:     Version - 1,
+				expectedErr: "version mismatch",
+			},
+			{
+				version:     MinAcceptedVersion,
+				expectedErr: "",
+			},
+		}
+		for _, tc := range testCases {
+			t.Run(fmt.Sprintf("%d", tc.version), func(t *testing.T) {
+				distSQLClient := NewDistSQLClient(conn)
+				stream, err := distSQLClient.RunSyncFlow(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Version = tc.version
+				if err := stream.Send(&ConsumerSignal{SetupFlowRequest: req}); err != nil {
+					t.Fatal(err)
+				}
+				_, err = stream.Recv()
+				if !testutils.IsError(err, tc.expectedErr) {
+					t.Errorf("expected error '%s', got %v", tc.expectedErr, err)
+				}
+			})
+		}
+	})
 }

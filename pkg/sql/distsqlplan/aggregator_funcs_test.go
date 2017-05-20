@@ -42,6 +42,7 @@ func runTestFlow(
 	distSQLSrv := srv.DistSQLServer().(*distsqlrun.ServerImpl)
 
 	req := distsqlrun.SetupFlowRequest{
+		Version: distsqlrun.Version,
 		Flow: distsqlrun.FlowSpec{
 			FlowID:     distsqlrun.FlowID{UUID: uuid.MakeV4()},
 			Processors: procs,
@@ -114,6 +115,7 @@ func checkDistAggregationInfo(
 		return distsqlrun.ProcessorSpec{
 			Core: distsqlrun.ProcessorCoreUnion{TableReader: &tr},
 			Post: distsqlrun.PostProcessSpec{
+				Projection:    true,
 				OutputColumns: []uint32{uint32(colIdx)},
 			},
 			Output: []distsqlrun.OutputRouterSpec{{
@@ -150,15 +152,36 @@ func checkDistAggregationInfo(
 		},
 	)
 
+	numIntermediary := len(info.LocalStage)
+	if len(info.FinalStage) != numIntermediary {
+		t.Fatalf("local and final stages have different lengths: %#v", info)
+	}
+
 	// Now run a flow with 4 separate table readers, each with its own local
 	// stage, all feeding into a single final stage.
 
 	numParallel := 4
-	// The type outputted by the local stage can be different than the input type
+
+	// The type(s) outputted by the local stage can be different than the input type
 	// (e.g. DECIMAL instead of INT).
-	_, intermediaryType, err := distsqlrun.GetAggregateInfo(fn, colType)
-	if err != nil {
-		t.Fatal(err)
+	intermediaryTypes := make([]sqlbase.ColumnType, numIntermediary)
+	for i, fn := range info.LocalStage {
+		var err error
+		_, intermediaryTypes[i], err = distsqlrun.GetAggregateInfo(fn, colType)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	localAggregations := make([]distsqlrun.AggregatorSpec_Aggregation, numIntermediary)
+	for i, fn := range info.LocalStage {
+		// Local aggregations have the same input.
+		localAggregations[i] = distsqlrun.AggregatorSpec_Aggregation{Func: fn, ColIdx: 0}
+	}
+	finalAggregations := make([]distsqlrun.AggregatorSpec_Aggregation, numIntermediary)
+	for i, fn := range info.FinalStage {
+		// Each local aggregation feeds into a final aggregation.
+		finalAggregations[i] = distsqlrun.AggregatorSpec_Aggregation{Func: fn, ColIdx: uint32(i)}
 	}
 
 	if numParallel < numRows {
@@ -167,10 +190,10 @@ func checkDistAggregationInfo(
 	finalProc := distsqlrun.ProcessorSpec{
 		Input: []distsqlrun.InputSyncSpec{{
 			Type:        distsqlrun.InputSyncSpec_UNORDERED,
-			ColumnTypes: []sqlbase.ColumnType{intermediaryType},
+			ColumnTypes: intermediaryTypes,
 		}},
 		Core: distsqlrun.ProcessorCoreUnion{Aggregator: &distsqlrun.AggregatorSpec{
-			Aggregations: []distsqlrun.AggregatorSpec_Aggregation{{Func: info.FinalStage, ColIdx: 0}},
+			Aggregations: finalAggregations,
 		}},
 		Output: []distsqlrun.OutputRouterSpec{{
 			Type: distsqlrun.OutputRouterSpec_PASS_THROUGH,
@@ -191,7 +214,7 @@ func checkDistAggregationInfo(
 				},
 			}},
 			Core: distsqlrun.ProcessorCoreUnion{Aggregator: &distsqlrun.AggregatorSpec{
-				Aggregations: []distsqlrun.AggregatorSpec_Aggregation{{Func: info.LocalStage, ColIdx: 0}},
+				Aggregations: localAggregations,
 			}},
 			Output: []distsqlrun.OutputRouterSpec{{
 				Type: distsqlrun.OutputRouterSpec_PASS_THROUGH,
@@ -206,6 +229,15 @@ func checkDistAggregationInfo(
 			StreamID: distsqlrun.StreamID(2*i + 1),
 		})
 	}
+	if info.FinalRendering != nil {
+		h := MakeTypeIndexedVarHelper(intermediaryTypes)
+		expr, err := info.FinalRendering(&h, 0 /* varIdxOffset */)
+		if err != nil {
+			t.Fatal(err)
+		}
+		finalProc.Post.RenderExprs = []distsqlrun.Expression{MakeExpression(expr, nil)}
+	}
+
 	procs = append(procs, finalProc)
 	rowsDist := runTestFlow(t, srv, procs...)
 
@@ -225,7 +257,7 @@ func checkDistAggregationInfo(
 	}
 }
 
-// Test that distributing  agg functions according to DistAggregationTable
+// Test that distributing agg functions according to DistAggregationTable
 // yields correct results. We're going to run each aggregation as either the
 // two-stage process described by the DistAggregationTable or as a single global
 // process, and verify that the results are the same.
@@ -234,7 +266,7 @@ func TestDistAggregationTable(t *testing.T) {
 	const numRows = 100
 
 	tc := serverutils.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	// Create a table with a few columns:
 	//  - random integer values from 0 to numRows
@@ -246,7 +278,7 @@ func TestDistAggregationTable(t *testing.T) {
 	rng, _ := randutil.NewPseudoRand()
 	sqlutils.CreateTable(
 		t, tc.ServerConn(0), "t",
-		"k INT PRIMARY KEY, int1 INT, int2 INT, bool1 BOOL, bool2 BOOL, dec1 DECIMAL, dec2 DECIMAL",
+		"k INT PRIMARY KEY, int1 INT, int2 INT, bool1 BOOL, bool2 BOOL, dec1 DECIMAL, dec2 DECIMAL, b BYTES",
 		numRows,
 		func(row int) []parser.Datum {
 			return []parser.Datum{
@@ -257,6 +289,7 @@ func TestDistAggregationTable(t *testing.T) {
 				parser.MakeDBool(parser.DBool(rng.Intn(10) != 0)),
 				sqlbase.RandDatum(rng, sqlbase.ColumnType{Kind: sqlbase.ColumnType_DECIMAL}, false),
 				sqlbase.RandDatum(rng, sqlbase.ColumnType{Kind: sqlbase.ColumnType_DECIMAL}, true),
+				parser.NewDBytes(parser.DBytes(randutil.RandBytes(rng, 10))),
 			}
 		},
 	)
@@ -265,8 +298,8 @@ func TestDistAggregationTable(t *testing.T) {
 	desc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
 
 	for fn, info := range DistAggregationTable {
-		if info.LocalStage == distsqlrun.AggregatorSpec_IDENT &&
-			info.FinalStage == distsqlrun.AggregatorSpec_IDENT {
+		if info.LocalStage[0] == distsqlrun.AggregatorSpec_IDENT &&
+			info.FinalStage[0] == distsqlrun.AggregatorSpec_IDENT {
 			// IDENT only works as expected if all rows have the same value on the
 			// relevant column; skip testing this trivial case.
 			continue

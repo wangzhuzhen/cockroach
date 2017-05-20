@@ -17,9 +17,6 @@
 package distsqlrun
 
 import (
-	"sync"
-
-	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -27,36 +24,40 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
-// indexBackfiller is a processor for backfilling indexes.
+// indexBackfiller is a processor that backfills new indexes.
 type indexBackfiller struct {
-	spec    BackfillerSpec
-	output  RowReceiver
-	flowCtx *FlowCtx
-	fetcher sqlbase.RowFetcher
+	backfiller
 
 	// colIdxMap maps ColumnIDs to indices into desc.Columns and desc.Mutations.
 	colIdxMap map[sqlbase.ColumnID]int
-	numCols   int
 
 	rowVals parser.Datums
 	da      sqlbase.DatumAlloc
 }
 
 var _ processor = &indexBackfiller{}
+var _ chunkBackfiller = &indexBackfiller{}
+
+// IndexMutationFilter is a filter that allows mutations that add indexes.
+func IndexMutationFilter(m sqlbase.DescriptorMutation) bool {
+	return m.GetIndex() != nil && m.Direction == sqlbase.DescriptorMutation_ADD
+}
 
 func newIndexBackfiller(
-	flowCtx *FlowCtx, spec *BackfillerSpec, post *PostProcessSpec, output RowReceiver,
+	flowCtx *FlowCtx, spec BackfillerSpec, post *PostProcessSpec, output RowReceiver,
 ) (*indexBackfiller, error) {
 	ib := &indexBackfiller{
-		flowCtx: flowCtx,
-		output:  output,
-		spec:    *spec,
+		backfiller: backfiller{
+			name:    "Index",
+			filter:  IndexMutationFilter,
+			flowCtx: flowCtx,
+			output:  output,
+			spec:    spec,
+		},
 	}
+	ib.backfiller.chunkBackfiller = ib
 
 	if err := ib.init(); err != nil {
 		return nil, err
@@ -79,60 +80,39 @@ func (ib *indexBackfiller) init() error {
 			}
 		}
 	}
-	ib.numCols = len(cols)
-	// We need all the columns.
-	valNeededForCol := make([]bool, len(cols))
-	for i := range valNeededForCol {
-		valNeededForCol[i] = true
-	}
 
 	ib.colIdxMap = make(map[sqlbase.ColumnID]int, len(cols))
 	for i, c := range cols {
 		ib.colIdxMap[c.ID] = i
 	}
+
+	valNeededForCol := make([]bool, len(cols))
+	mutationID := desc.Mutations[0].MutationID
+	for _, m := range desc.Mutations {
+		if m.MutationID != mutationID {
+			break
+		}
+		if IndexMutationFilter(m) {
+			idx := m.GetIndex()
+			for i, col := range cols {
+				valNeededForCol[i] = valNeededForCol[i] || idx.ContainsColumnID(col.ID)
+			}
+		}
+	}
+
 	return ib.fetcher.Init(
 		&desc, ib.colIdxMap, &desc.PrimaryIndex, false, false, cols, valNeededForCol, false,
 	)
 }
 
-// nextRow processes table rows.
-func (ib *indexBackfiller) nextRow(ctx context.Context) (sqlbase.EncDatumRow, error) {
-	fetcherRow, err := ib.fetcher.NextRow(ctx)
-	if err != nil || fetcherRow == nil {
-		return nil, err
-	}
-	return fetcherRow, nil
-}
-
-// ConvertBackfillError returns a cleaner SQL error for a failed Batch.
-func ConvertBackfillError(tableDesc *sqlbase.TableDescriptor, b *client.Batch) error {
-	// A backfill on a new schema element has failed and the batch contains
-	// information useful in printing a sensible error. However
-	// ConvertBatchError() will only work correctly if the schema elements
-	// are "live" in the tableDesc.
-	desc := protoutil.Clone(tableDesc).(*sqlbase.TableDescriptor)
-	mutationID := desc.Mutations[0].MutationID
-	for _, mutation := range desc.Mutations {
-		if mutation.MutationID != mutationID {
-			// Mutations are applied in a FIFO order. Only apply the first set
-			// of mutations if they have the mutation ID we're looking for.
-			break
-		}
-		desc.MakeMutationComplete(mutation)
-	}
-	return sqlbase.ConvertBatchError(desc, b)
-}
-
-// runChunk returns the next-key and an error. next-key is nil
-// once the backfill is complete.
 func (ib *indexBackfiller) runChunk(
-	ctx context.Context,
-	table sqlbase.TableDescriptor,
-	added []sqlbase.IndexDescriptor,
-	sp roachpb.Span,
-	chunkSize int64,
+	ctx context.Context, mutations []sqlbase.DescriptorMutation, sp roachpb.Span, chunkSize int64,
 ) (roachpb.Key, error) {
-	secondaryIndexEntries := make([]sqlbase.IndexEntry, len(added))
+	added := make([]sqlbase.IndexDescriptor, len(mutations))
+	for i, m := range mutations {
+		added[i] = *m.GetIndex()
+	}
+	secondaryIndexEntries := make([]sqlbase.IndexEntry, len(mutations))
 	err := ib.flowCtx.clientDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		if ib.flowCtx.testingKnobs.RunBeforeBackfillChunk != nil {
 			if err := ib.flowCtx.testingKnobs.RunBeforeBackfillChunk(sp); err != nil {
@@ -158,9 +138,9 @@ func (ib *indexBackfiller) runChunk(
 			return err
 		}
 
-		b := &client.Batch{}
+		b := txn.NewBatch()
 		for i := int64(0); i < chunkSize; i++ {
-			encRow, err := ib.nextRow(ctx)
+			encRow, err := ib.fetcher.NextRow(ctx)
 			if err != nil {
 				return err
 			}
@@ -173,10 +153,6 @@ func (ib *indexBackfiller) runChunk(
 			if err := sqlbase.EncDatumRowToDatums(ib.rowVals, encRow, &ib.da); err != nil {
 				return err
 			}
-			// TODO(vivek): Ideally we should make a version of this that takes EncDatums.
-			// It would not only avoid allocations, but also decode-encode cycles in some
-			// cases (e.g. anything that is part of the PK). Similar to how the joinreader
-			// uses MakeKeyFromEncDatums.
 			if err := sqlbase.EncodeSecondaryIndexes(
 				&ib.spec.Table, added, ib.colIdxMap,
 				ib.rowVals, secondaryIndexEntries); err != nil {
@@ -189,163 +165,10 @@ func (ib *indexBackfiller) runChunk(
 			}
 		}
 		// Write the new index values.
-		if err := txn.Run(ctx, b); err != nil {
+		if err := txn.CommitInBatch(ctx, b); err != nil {
 			return ConvertBackfillError(&ib.spec.Table, b)
 		}
 		return nil
 	})
 	return ib.fetcher.Key(), err
-}
-
-// mainLoop scans chunks of rows and constructs indexes.
-// It does not close the output.
-func (ib *indexBackfiller) mainLoop(ctx context.Context) error {
-	var addedIndexDescs []sqlbase.IndexDescriptor
-	const noNewIndex = -1
-	addedIndexMutationIdx := noNewIndex
-	desc := ib.spec.Table
-	if len(desc.Mutations) == 0 {
-		return errors.Errorf("no schema changes for table ID=%d", desc.ID)
-	}
-	mutationID := desc.Mutations[0].MutationID
-	for i, m := range desc.Mutations {
-		if m.MutationID != mutationID {
-			break
-		}
-		if index := m.GetIndex(); index != nil && m.Direction == sqlbase.DescriptorMutation_ADD {
-			addedIndexDescs = append(addedIndexDescs, *index)
-			if addedIndexMutationIdx == noNewIndex {
-				addedIndexMutationIdx = i
-			}
-		}
-	}
-
-	if addedIndexMutationIdx == noNewIndex ||
-		len(ib.spec.Spans) == 0 {
-		return errors.Errorf("completed processing all spans for index add (%d, %d)", desc.ID, mutationID)
-	}
-	work := ib.spec.Spans[0].Span
-
-	// Backfill the index entries for all the rows.
-	chunkSize := ib.spec.ChunkSize
-	start := timeutil.Now()
-	var resume roachpb.Span
-	sp := work
-	for row := int64(0); sp.Key != nil; row += chunkSize {
-		if log.V(2) {
-			log.Infof(ctx, "index add (%d, %d) at row: %d, span: %s",
-				desc.ID, mutationID, row, sp)
-		}
-		var err error
-		sp.Key, err = ib.runChunk(ctx, desc, addedIndexDescs, sp, chunkSize)
-		if err != nil {
-			return err
-		}
-		if timeutil.Since(start) > ib.spec.Duration && sp.Key != nil {
-			resume = sp
-			break
-		}
-	}
-	return WriteResumeSpan(ctx,
-		ib.flowCtx.clientDB,
-		ib.spec.Table.ID,
-		work,
-		resume,
-		addedIndexMutationIdx)
-}
-
-// Run is part of the processor interface.
-func (ib *indexBackfiller) Run(ctx context.Context, wg *sync.WaitGroup) {
-	if wg != nil {
-		defer wg.Done()
-	}
-
-	ctx = log.WithLogTagInt(ctx, "IndexBackfiller", int(ib.spec.Table.ID))
-	ctx, span := tracing.ChildSpan(ctx, "index backfiller")
-	defer tracing.FinishSpan(span)
-
-	log.VEventf(ctx, 1, "starting")
-	if log.V(1) {
-		defer log.Infof(ctx, "exiting")
-	}
-
-	if err := ib.mainLoop(ctx); err != nil {
-		ib.output.Push(nil /* row */, ProducerMetadata{Err: err})
-	}
-	ib.output.ProducerDone()
-}
-
-// WriteResumeSpan writes a checkpoint for the backfill work on origSpan.
-// origSpan is the span of keys that were assigned to be backfilled,
-// resume is the left over work from origSpan.
-func WriteResumeSpan(
-	ctx context.Context,
-	db *client.DB,
-	id sqlbase.ID,
-	origSpan roachpb.Span,
-	resume roachpb.Span,
-	mutationIdx int,
-) error {
-	ctx, traceSpan := tracing.ChildSpan(ctx, "checkpoint")
-	defer tracing.FinishSpan(traceSpan)
-	if resume.Key != nil && !resume.EndKey.Equal(origSpan.EndKey) {
-		panic("resume must end on the same key as origSpan")
-	}
-	cnt := 0
-	return db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		cnt++
-		tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, id)
-		if err != nil {
-			return err
-		}
-		if cnt > 1 {
-			log.Infof(ctx, "retrying adding checkpoint %s to table %s", resume, tableDesc.Name)
-		}
-
-		// This loop is finding a span in the checkpoint that fits
-		// origSpan. It then carves a spot for origSpan in the
-		// checkpoint, and replaces origSpan in the checkpoint with
-		// resume.
-		mutation := &tableDesc.Mutations[mutationIdx]
-		for i, sp := range mutation.ResumeSpans {
-			if sp.Key.Compare(origSpan.Key) <= 0 &&
-				sp.EndKey.Compare(origSpan.EndKey) >= 0 {
-				// origSpan is in sp; split sp if needed to accommodate
-				// origSpan and replace origSpan with resume.
-				before := mutation.ResumeSpans[:i]
-				after := append([]roachpb.Span{}, mutation.ResumeSpans[i+1:]...)
-
-				// add span to before, but merge it with the last span
-				// if possible.
-				addSpan := func(begin, end roachpb.Key) {
-					if begin.Equal(end) {
-						return
-					}
-					if len(before) > 0 && before[len(before)-1].EndKey.Equal(begin) {
-						before[len(before)-1].EndKey = end
-					} else {
-						before = append(before, roachpb.Span{Key: begin, EndKey: end})
-					}
-				}
-
-				// The work done = [origSpan.Key...resume.Key]
-				addSpan(sp.Key, origSpan.Key)
-				if resume.Key != nil {
-					addSpan(resume.Key, resume.EndKey)
-				} else {
-					log.VEventf(ctx, 2, "completed processing of span: %+v", origSpan)
-				}
-				addSpan(origSpan.EndKey, sp.EndKey)
-				mutation.ResumeSpans = append(before, after...)
-
-				log.VEventf(ctx, 2, "ckpt %+v", mutation.ResumeSpans)
-				txn.SetSystemConfigTrigger()
-				return txn.Put(ctx, sqlbase.MakeDescMetadataKey(tableDesc.GetID()), sqlbase.WrapDescriptor(tableDesc))
-			}
-		}
-		// Unable to find a span containing origSpan?
-		return errors.Errorf(
-			"span %+v not found among %+v", origSpan, mutation.ResumeSpans,
-		)
-	})
 }

@@ -19,10 +19,12 @@ package gossip
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -35,16 +37,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 // TestGossipInfoStore verifies operation of gossip instance infostore.
 func TestGossipInfoStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	rpcContext := newInsecureRPCContext(stopper)
-	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), nil, stopper, metric.NewRegistry())
+	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry())
 	slice := []byte("b")
 	if err := g.AddInfo("s", slice, time.Hour); err != nil {
 		t.Fatal(err)
@@ -62,9 +66,9 @@ func TestGossipInfoStore(t *testing.T) {
 func TestGossipOverwriteNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	rpcContext := newInsecureRPCContext(stopper)
-	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), nil, stopper, metric.NewRegistry())
+	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry())
 	node1 := &roachpb.NodeDescriptor{NodeID: 1, Address: util.MakeUnresolvedAddr("tcp", "1.1.1.1:1")}
 	node2 := &roachpb.NodeDescriptor{NodeID: 2, Address: util.MakeUnresolvedAddr("tcp", "2.2.2.2:2")}
 	if err := g.SetNodeDescriptor(node1); err != nil {
@@ -98,7 +102,7 @@ func TestGossipOverwriteNode(t *testing.T) {
 
 	// Quiesce the stopper now to ensure that the update has propagated before
 	// checking whether node 1 has been removed from the infoStore.
-	stopper.Quiesce()
+	stopper.Quiesce(context.TODO())
 	expectedErr := "unable to look up descriptor for node"
 	if val, err := g.GetNodeDescriptor(node1.NodeID); !testutils.IsError(err, expectedErr) {
 		t.Errorf("expected error %q fetching node %d; got error %v and node %+v",
@@ -106,10 +110,62 @@ func TestGossipOverwriteNode(t *testing.T) {
 	}
 }
 
+// TestGossipMoveNode verifies that if a node is moved to a new address, it
+// gets properly updated in gossip (including that any other node that was
+// previously at that address gets removed from the cluster).
+func TestGossipMoveNode(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+	rpcContext := newInsecureRPCContext(stopper)
+	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry())
+	var nodes []*roachpb.NodeDescriptor
+	for i := 1; i <= 3; i++ {
+		node := &roachpb.NodeDescriptor{
+			NodeID:  roachpb.NodeID(i),
+			Address: util.MakeUnresolvedAddr("tcp", fmt.Sprintf("1.1.1.1:%d", i)),
+		}
+		if err := g.SetNodeDescriptor(node); err != nil {
+			t.Fatalf("failed setting node descriptor %+v: %s", node, err)
+		}
+		nodes = append(nodes, node)
+	}
+	for _, node := range nodes {
+		if val, err := g.GetNodeDescriptor(node.NodeID); err != nil {
+			t.Fatal(err)
+		} else if !proto.Equal(node, val) {
+			t.Fatalf("expected node %+v, got %+v", node, val)
+		}
+	}
+
+	// Move node 2 to the address of node 3, which should cause node 3 to be
+	// removed from the cluster.
+	movedNode := nodes[1]
+	replacedNode := nodes[2]
+	movedNode.Address = replacedNode.Address
+	if err := g.SetNodeDescriptor(movedNode); err != nil {
+		t.Fatal(err)
+	}
+
+	// Quiesce the stopper now to ensure that the update has propagated before
+	// checking on either node descriptor.
+	stopper.Quiesce(context.TODO())
+	if val, err := g.GetNodeDescriptor(movedNode.NodeID); err != nil {
+		t.Error(err)
+	} else if !proto.Equal(movedNode, val) {
+		t.Errorf("expected node %+v, got %+v", movedNode, val)
+	}
+	expectedErr := "unable to look up descriptor for node"
+	if val, err := g.GetNodeDescriptor(replacedNode.NodeID); !testutils.IsError(err, expectedErr) {
+		t.Errorf("expected error %q fetching node %d; got error %v and node %+v",
+			expectedErr, replacedNode.NodeID, err, val)
+	}
+}
+
 func TestGossipGetNextBootstrapAddress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	resolverSpecs := []string{
 		"127.0.0.1:9000",
@@ -128,7 +184,8 @@ func TestGossipGetNextBootstrapAddress(t *testing.T) {
 		t.Errorf("expected 3 resolvers; got %d", len(resolvers))
 	}
 	server := rpc.NewServer(newInsecureRPCContext(stopper))
-	g := NewTest(0, nil, server, resolvers, stop.NewStopper(), metric.NewRegistry())
+	g := NewTest(0, nil, server, stop.NewStopper(), metric.NewRegistry())
+	g.setResolvers(resolvers)
 
 	// Using specified resolvers, fetch bootstrap addresses 3 times
 	// and verify the results match expected addresses.
@@ -152,7 +209,7 @@ func TestGossipRaceLogStatus(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	local := startGossip(1, stopper, t, metric.NewRegistry())
 
 	local.mu.Lock()
@@ -189,7 +246,7 @@ func TestGossipOutgoingLimitEnforced(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// This test has an implicit dependency on the maxPeers logic deciding that
 	// maxPeers is 3 for a 5-node cluster, so let's go ahead and make that
@@ -272,7 +329,7 @@ func TestGossipNoForwardSelf(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	local := startGossip(1, stopper, t, metric.NewRegistry())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -352,7 +409,7 @@ func TestGossipCullNetwork(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	local := startGossip(1, stopper, t, metric.NewRegistry())
 	local.SetCullInterval(5 * time.Millisecond)
 
@@ -391,7 +448,7 @@ func TestGossipOrphanedStallDetection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	local := startGossip(1, stopper, t, metric.NewRegistry())
 	local.SetStallInterval(5 * time.Millisecond)
 
@@ -433,7 +490,7 @@ func TestGossipOrphanedStallDetection(t *testing.T) {
 	local.bootstrap()
 	local.manage()
 
-	peerStopper.Stop()
+	peerStopper.Stop(context.TODO())
 
 	testutils.SucceedsSoon(t, func() error {
 		for _, peerID := range local.Outgoing() {
@@ -445,7 +502,7 @@ func TestGossipOrphanedStallDetection(t *testing.T) {
 	})
 
 	peerStopper = stop.NewStopper()
-	defer peerStopper.Stop()
+	defer peerStopper.Stop(context.TODO())
 	startGossipAtAddr(peerNodeID, peerAddr, peerStopper, t, metric.NewRegistry())
 
 	testutils.SucceedsSoon(t, func() error {
@@ -456,4 +513,101 @@ func TestGossipOrphanedStallDetection(t *testing.T) {
 		}
 		return errors.Errorf("node %d not yet connected", peerNodeID)
 	})
+}
+
+// TestGossipCantJoinTwoClusters verifies that a node can't
+// participate in two separate clusters if two nodes from different
+// clusters are specified as bootstrap hosts. Previously, this would
+// be allowed, because a node verifies the cluster ID only at startup.
+// If after joining the first cluster via that cluster's init node,
+// the init node shuts down, the joining node will reconnect via its
+// second bootstrap host and begin to participate [illegally] in
+// another cluster.
+func TestGossipJoinTwoClusters(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const interval = 10 * time.Millisecond
+	var stoppers []*stop.Stopper
+	var g []*Gossip
+	var clusterIDs []uuid.UUID
+	var addrs []net.Addr
+
+	// Create three gossip nodes, init the first two with no bootstrap
+	// hosts, but unique cluster IDs. The third host has the first two
+	// hosts as bootstrap hosts, but has the same cluster ID as the
+	// first of its bootstrap hosts.
+	for i := 0; i < 3; i++ {
+		stopper := stop.NewStopper()
+		stoppers = append(stoppers, stopper)
+		defer func() {
+			select {
+			case <-stopper.ShouldQuiesce():
+			default:
+				stopper.Stop(context.TODO())
+			}
+		}()
+		rpcCtx := newInsecureRPCContext(stopper)
+		server := rpc.NewServer(rpcCtx)
+		ln, err := netutil.ListenAndServeGRPC(stopper, server, util.IsolatedTestAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addrs = append(addrs, ln.Addr())
+
+		var resolvers []resolver.Resolver
+		// Only third node has resolvers.
+		switch i {
+		case 0, 1:
+			clusterIDs = append(clusterIDs, uuid.MakeV4())
+		case 2:
+			clusterIDs = append(clusterIDs, clusterIDs[0])
+			for j := 0; j < 2; j++ {
+				resolver, err := resolver.NewResolver(addrs[j].String())
+				if err != nil {
+					t.Fatal(err)
+				}
+				resolvers = append(resolvers, resolver)
+			}
+		}
+
+		// node ID must be non-zero
+		gnode := NewTest(
+			roachpb.NodeID(i+1), rpcCtx, server, stopper, metric.NewRegistry(),
+		)
+		g = append(g, gnode)
+		gnode.SetStallInterval(interval)
+		gnode.SetBootstrapInterval(interval)
+		gnode.SetClusterID(clusterIDs[i])
+		gnode.Start(ln.Addr(), resolvers)
+	}
+
+	// Wait for connections.
+	testutils.SucceedsSoon(t, func() error {
+		// The first gossip node should have one gossip client address
+		// in nodeMap if the 2nd gossip node connected. The second gossip
+		// node should have none.
+		g[0].mu.Lock()
+		defer g[0].mu.Unlock()
+		if a, e := len(g[0].mu.nodeMap), 1; a != e {
+			return errors.Errorf("expected %s to contain %d nodes, got %d", g[0].mu.nodeMap, e, a)
+		}
+		g[1].mu.Lock()
+		defer g[1].mu.Unlock()
+		if a, e := len(g[1].mu.nodeMap), 0; a != e {
+			return errors.Errorf("expected %s to contain %d nodes, got %d", g[1].mu.nodeMap, e, a)
+		}
+		return nil
+	})
+
+	// Kill node 0 to force node 2 to bootstrap with node 1.
+	stoppers[0].Stop(context.TODO())
+	// Wait for twice the bootstrap interval, and verify that
+	// node 2 still has not connected to node 1.
+	time.Sleep(2 * interval)
+
+	g[1].mu.Lock()
+	if a, e := len(g[1].mu.nodeMap), 0; a != e {
+		t.Errorf("expected %s to contain %d nodes, got %d", g[1].mu.nodeMap, e, a)
+	}
+	g[1].mu.Unlock()
 }

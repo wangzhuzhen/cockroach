@@ -17,13 +17,13 @@
 package sqlbase
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"golang.org/x/net/context"
 )
 
 // sql CREATE commands and full schema for each system table.
@@ -36,10 +36,10 @@ import (
 const (
 	NamespaceTableSchema = `
 CREATE TABLE system.namespace (
-  parentID INT,
-  name     STRING,
-  id       INT,
-  PRIMARY KEY (parentID, name)
+  "parentID" INT,
+  name       STRING,
+  id         INT,
+  PRIMARY KEY ("parentID", name)
 );`
 
 	DescriptorTableSchema = `
@@ -50,8 +50,8 @@ CREATE TABLE system.descriptor (
 
 	UsersTableSchema = `
 CREATE TABLE system.users (
-  username       STRING PRIMARY KEY,
-  hashedPassword BYTES
+  username         STRING PRIMARY KEY,
+  "hashedPassword" BYTES
 );`
 
 	// Zone settings per DB/Table.
@@ -60,49 +60,58 @@ CREATE TABLE system.zones (
   id     INT PRIMARY KEY,
   config BYTES
 );`
+
+	SettingsTableSchema = `
+CREATE TABLE system.settings (
+	name              STRING    NOT NULL PRIMARY KEY,
+	value             STRING    NOT NULL,
+	"lastUpdated"     TIMESTAMP NOT NULL DEFAULT now(),
+	"valueType"       STRING,
+	FAMILY (name, value, "lastUpdated", "valueType")
+);`
 )
 
 // These system tables are not part of the system config.
 const (
 	LeaseTableSchema = `
 CREATE TABLE system.lease (
-  descID     INT,
+  "descID"   INT,
   version    INT,
-  nodeID     INT,
+  "nodeID"   INT,
   expiration TIMESTAMP,
-  PRIMARY KEY (descID, version, expiration, nodeID)
+  PRIMARY KEY ("descID", version, expiration, "nodeID")
 );`
 
 	EventLogTableSchema = `
 CREATE TABLE system.eventlog (
-  timestamp    TIMESTAMP  NOT NULL,
-  eventType    STRING     NOT NULL,
-  targetID     INT        NOT NULL,
-  reportingID  INT        NOT NULL,
-  info         STRING,
-  uniqueID     BYTES      DEFAULT uuid_v4(),
-  PRIMARY KEY (timestamp, uniqueID)
+  timestamp     TIMESTAMP  NOT NULL,
+  "eventType"   STRING     NOT NULL,
+  "targetID"    INT        NOT NULL,
+  "reportingID" INT        NOT NULL,
+  info          STRING,
+  "uniqueID"    BYTES      DEFAULT uuid_v4(),
+  PRIMARY KEY (timestamp, "uniqueID")
 );`
 
 	// rangelog is currently envisioned as a wide table; many different event
 	// types can be recorded to the table.
 	RangeEventTableSchema = `
 CREATE TABLE system.rangelog (
-  timestamp     TIMESTAMP  NOT NULL,
-  rangeID       INT        NOT NULL,
-  storeID       INT        NOT NULL,
-  eventType     STRING     NOT NULL,
-  otherRangeID  INT,
-  info          STRING,
-  uniqueID      INT        DEFAULT unique_rowid(),
-  PRIMARY KEY (timestamp, uniqueID)
+  timestamp      TIMESTAMP  NOT NULL,
+  "rangeID"      INT        NOT NULL,
+  "storeID"      INT        NOT NULL,
+  "eventType"    STRING     NOT NULL,
+  "otherRangeID" INT,
+  info           STRING,
+  "uniqueID"     INT        DEFAULT unique_rowid(),
+  PRIMARY KEY (timestamp, "uniqueID")
 );`
 
 	UITableSchema = `
 CREATE TABLE system.ui (
-	key         STRING PRIMARY KEY,
-	value       BYTES,
-	lastUpdated TIMESTAMP NOT NULL
+	key           STRING PRIMARY KEY,
+	value         BYTES,
+	"lastUpdated" TIMESTAMP NOT NULL
 );`
 
 	JobsTableSchema = `
@@ -153,6 +162,10 @@ var SystemAllowedPrivileges = map[ID]privilege.Lists{
 	keys.DescriptorTableID: {privilege.ReadData},
 	keys.UsersTableID:      {privilege.ReadWriteData},
 	keys.ZonesTableID:      {privilege.ReadWriteData},
+	// We eventually want to migrate the table to appear read-only to force the
+	// the use of a validating, logging accessor, so we'll go ahead and tolerate
+	// read-only privs to make that migration possible later.
+	keys.SettingsTableID:   {privilege.ReadWriteData, privilege.ReadData},
 	keys.LeaseTableID:      {privilege.ReadWriteData, {privilege.ALL}},
 	keys.EventLogTableID:   {privilege.ReadWriteData, {privilege.ALL}},
 	keys.RangeEventTableID: {privilege.ReadWriteData, {privilege.ALL}},
@@ -293,6 +306,34 @@ var (
 		NextFamilyID:   3,
 		NextIndexID:    2,
 		Privileges:     NewPrivilegeDescriptor(security.RootUser, SystemDesiredPrivileges(keys.ZonesTableID)),
+		FormatVersion:  InterleavedFormatVersion,
+		NextMutationID: 1,
+	}
+	// SettingsTable is the descriptor for the jobs table.
+	SettingsTable = TableDescriptor{
+		Name:     "settings",
+		ID:       keys.SettingsTableID,
+		ParentID: 1,
+		Version:  1,
+		Columns: []ColumnDescriptor{
+			{Name: "name", ID: 1, Type: colTypeString},
+			{Name: "value", ID: 2, Type: colTypeString},
+			{Name: "lastUpdated", ID: 3, Type: colTypeTimestamp, DefaultExpr: &nowString},
+			{Name: "valueType", ID: 4, Type: colTypeString, Nullable: true},
+		},
+		NextColumnID: 5,
+		Families: []ColumnFamilyDescriptor{
+			{
+				Name:        "fam_0_name_value_lastUpdated_valueType",
+				ID:          0,
+				ColumnNames: []string{"name", "value", "lastUpdated", "valueType"},
+				ColumnIDs:   []ColumnID{1, 2, 3, 4},
+			},
+		},
+		NextFamilyID:   1,
+		PrimaryIndex:   pk("name"),
+		NextIndexID:    2,
+		Privileges:     NewPrivilegeDescriptor(security.RootUser, SystemDesiredPrivileges(keys.SettingsTableID)),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
@@ -483,19 +524,17 @@ var (
 	}
 )
 
-// Create the key/value pairs for the default zone config entry.
-func createDefaultZoneConfig() []roachpb.KeyValue {
-	var ret []roachpb.KeyValue
+// Create the key/value pair for the default zone config entry.
+func createDefaultZoneConfig() roachpb.KeyValue {
+	zoneConfig := config.DefaultZoneConfig()
 	value := roachpb.Value{}
-	desc := config.DefaultZoneConfig()
-	if err := value.SetProto(&desc); err != nil {
-		log.Fatalf(context.TODO(), "could not marshal %v", desc)
+	if err := value.SetProto(&zoneConfig); err != nil {
+		panic(fmt.Sprintf("could not marshal DefaultZoneConfig: %s", err))
 	}
-	ret = append(ret, roachpb.KeyValue{
+	return roachpb.KeyValue{
 		Key:   MakeZoneKey(keys.RootNamespaceID),
 		Value: value,
-	})
-	return ret
+	}
 }
 
 // addSystemDatabaseToSchema populates the supplied MetadataSchema with the
@@ -526,7 +565,7 @@ func addSystemDatabaseToSchema(target *MetadataSchema) {
 	// responsible for creating the table. Please follow a similar scheme for any
 	// new system tables you create.
 
-	target.otherKV = append(target.otherKV, createDefaultZoneConfig()...)
+	target.otherKV = append(target.otherKV, createDefaultZoneConfig())
 }
 
 // IsSystemConfigID returns whether this ID is for a system config object.

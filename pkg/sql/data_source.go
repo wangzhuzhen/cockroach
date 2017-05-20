@@ -117,7 +117,7 @@ import (
 type dataSourceInfo struct {
 	// sourceColumns match the plan.Columns() 1-to-1. However the column
 	// names might be different if the statement renames them using AS.
-	sourceColumns ResultColumns
+	sourceColumns sqlbase.ResultColumns
 
 	// sourceAliases indicates to which table alias column ranges
 	// belong.
@@ -166,7 +166,7 @@ func (src *dataSourceInfo) String() string {
 		if i > 0 {
 			buf.WriteByte('\t')
 		}
-		if c.hidden {
+		if c.Hidden {
 			buf.WriteByte('*')
 		}
 		buf.WriteString(c.Name)
@@ -233,7 +233,9 @@ func fillColumnRange(firstIdx, lastIdx int) columnRange {
 
 // newSourceInfoForSingleTable creates a simple dataSourceInfo
 // which maps the same tableAlias to all columns.
-func newSourceInfoForSingleTable(tn parser.TableName, columns ResultColumns) *dataSourceInfo {
+func newSourceInfoForSingleTable(
+	tn parser.TableName, columns sqlbase.ResultColumns,
+) *dataSourceInfo {
 	norm := tn.NormalizedTableName()
 	return &dataSourceInfo{
 		sourceColumns: columns,
@@ -326,7 +328,7 @@ func (p *planner) getDataSource(
 		return p.getGeneratorPlan(ctx, t)
 
 	case *parser.Subquery:
-		return p.getSubqueryPlan(ctx, t.Select, nil)
+		return p.getSubqueryPlan(ctx, anonymousTable, t.Select, nil)
 
 	case *parser.JoinTableExpr:
 		// Joins: two sources.
@@ -340,8 +342,18 @@ func (p *planner) getDataSource(
 		}
 		return p.makeJoin(ctx, t.Join, left, right, t.Cond)
 
+	case *parser.ShowSource:
+		plan, err := p.newPlan(ctx, t.Statement, nil)
+		if err != nil {
+			return planDataSource{}, err
+		}
+		return planDataSource{
+			info: newSourceInfoForSingleTable(anonymousTable, plan.Columns()),
+			plan: plan,
+		}, nil
+
 	case *parser.Explain:
-		plan, err := p.Explain(ctx, t, false)
+		plan, err := p.Explain(ctx, t)
 		if err != nil {
 			return planDataSource{}, err
 		}
@@ -394,7 +406,7 @@ func (p *planner) getDataSource(
 
 		if len(colAlias) > 0 {
 			// Make a copy of the slice since we are about to modify the contents.
-			src.info.sourceColumns = append(ResultColumns(nil), src.info.sourceColumns...)
+			src.info.sourceColumns = append(sqlbase.ResultColumns(nil), src.info.sourceColumns...)
 
 			// The column aliases can only refer to explicit columns.
 			for colIdx, aliasIdx := 0, 0; aliasIdx < len(colAlias); colIdx++ {
@@ -410,7 +422,7 @@ func (p *planner) getDataSource(
 						"source %q has %d columns available but %d columns specified",
 						srcName, aliasIdx, len(colAlias))
 				}
-				if src.info.sourceColumns[colIdx].hidden {
+				if src.info.sourceColumns[colIdx].Hidden {
 					continue
 				}
 				src.info.sourceColumns[colIdx].Name = string(colAlias[aliasIdx])
@@ -445,15 +457,12 @@ func (p *planner) getTableScanByRef(
 	hints *parser.IndexHints,
 	scanVisibility scanVisibility,
 ) (planDataSource, error) {
-	var desc *sqlbase.TableDescriptor
-	var err error
-
 	tableID := sqlbase.ID(tref.TableID)
+	descFunc := p.session.leases.getTableLeaseByID
 	if p.avoidCachedDescriptors {
-		desc, err = sqlbase.GetTableDescFromID(ctx, p.txn, tableID)
-	} else {
-		desc, err = p.getTableLeaseByID(ctx, tableID)
+		descFunc = sqlbase.GetTableDescFromID
 	}
+	desc, err := descFunc(ctx, p.txn, tableID)
 	if err != nil {
 		return planDataSource{}, err
 	}
@@ -483,15 +492,18 @@ func (p *planner) getTableScanOrViewPlan(
 	hints *parser.IndexHints,
 	scanVisibility scanVisibility,
 ) (planDataSource, error) {
-	descFunc := p.getTableLease
+	var desc *sqlbase.TableDescriptor
+	var err error
 	if p.avoidCachedDescriptors {
 		// AS OF SYSTEM TIME queries need to fetch the table descriptor at the
 		// specified time, and never lease anything. The proto transaction already
-		// has its timestamps set correctly so mustGetTableOrViewDesc will fetch
-		// with the correct timestamp.
-		descFunc = p.mustGetTableOrViewDesc
+		// has its timestamps set correctly so getTableOrViewDesc will fetch with
+		// the correct timestamp.
+		desc, err = mustGetTableOrViewDesc(
+			ctx, p.txn, p.getVirtualTabler(), tn, false /*allowAdding*/)
+	} else {
+		desc, err = p.session.leases.getTableLease(ctx, p.txn, p.getVirtualTabler(), tn)
 	}
-	desc, err := descFunc(ctx, tn)
 	if err != nil {
 		return planDataSource{}, err
 	}
@@ -535,9 +547,7 @@ func (p *planner) getPlanForDesc(
 func (p *planner) getViewPlan(
 	ctx context.Context, tn *parser.TableName, desc *sqlbase.TableDescriptor,
 ) (planDataSource, error) {
-	// Parse the query as Traditional syntax because we know the query was
-	// saved in the descriptor by printing it with parser.Format.
-	stmt, err := parser.ParseOneTraditional(desc.ViewQuery)
+	stmt, err := parser.ParseOne(desc.ViewQuery)
 	if err != nil {
 		return planDataSource{}, errors.Wrapf(err, "failed to parse underlying query from view %q", tn)
 	}
@@ -563,7 +573,7 @@ func (p *planner) getViewPlan(
 	// TODO(a-robinson): Support ORDER BY and LIMIT in views. Is it as simple as
 	// just passing the entire select here or will inserting an ORDER BY in the
 	// middle of a query plan break things?
-	plan, err := p.getSubqueryPlan(ctx, sel.Select, makeResultColumns(desc.Columns))
+	plan, err := p.getSubqueryPlan(ctx, *tn, sel.Select, sqlbase.ResultColumnsFromColDescs(desc.Columns))
 	if err != nil {
 		return plan, err
 	}
@@ -574,9 +584,9 @@ func (p *planner) getViewPlan(
 // getSubqueryPlan builds a planDataSource for a select statement, including
 // for simple VALUES statements.
 func (p *planner) getSubqueryPlan(
-	ctx context.Context, sel parser.SelectStatement, cols ResultColumns,
+	ctx context.Context, tn parser.TableName, sel parser.SelectStatement, cols sqlbase.ResultColumns,
 ) (planDataSource, error) {
-	plan, err := p.newPlan(ctx, sel, nil, false)
+	plan, err := p.newPlan(ctx, sel, nil)
 	if err != nil {
 		return planDataSource{}, err
 	}
@@ -584,12 +594,14 @@ func (p *planner) getSubqueryPlan(
 		cols = plan.Columns()
 	}
 	return planDataSource{
-		info: newSourceInfoForSingleTable(anonymousTable, cols),
+		info: newSourceInfoForSingleTable(tn, cols),
 		plan: plan,
 	}, nil
 }
 
-func (p *planner) getGeneratorPlan(ctx context.Context, t *parser.FuncExpr) (planDataSource, error) {
+func (p *planner) getGeneratorPlan(
+	ctx context.Context, t *parser.FuncExpr,
+) (planDataSource, error) {
 	plan, err := p.makeGenerator(ctx, t)
 	if err != nil {
 		return planDataSource{}, err
@@ -604,16 +616,16 @@ func (p *planner) getGeneratorPlan(ctx context.Context, t *parser.FuncExpr) (pla
 // expressions that correspond to the expansion of a star.
 func (src *dataSourceInfo) expandStar(
 	v parser.VarName, ivarHelper parser.IndexedVarHelper,
-) (columns ResultColumns, exprs []parser.TypedExpr, err error) {
+) (columns sqlbase.ResultColumns, exprs []parser.TypedExpr, err error) {
 	if len(src.sourceColumns) == 0 {
 		return nil, nil, fmt.Errorf("cannot use %q without a FROM clause", v)
 	}
 
 	colSel := func(idx int) {
 		col := src.sourceColumns[idx]
-		if !col.hidden {
+		if !col.Hidden {
 			ivar := ivarHelper.IndexedVar(idx)
-			columns = append(columns, ResultColumn{Name: col.Name, Typ: ivar.ResolvedType()})
+			columns = append(columns, sqlbase.ResultColumn{Name: col.Name, Typ: ivar.ResolvedType()})
 			exprs = append(exprs, ivar)
 		}
 	}
@@ -721,7 +733,9 @@ func (src *dataSourceInfo) checkDatabaseName(tn parser.TableName) (parser.TableN
 // array and the column index for the column array of that
 // source. Returns invalid indices and an error if the source is not
 // found or the name is ambiguous.
-func (sources multiSourceInfo) findColumn(c *parser.ColumnItem) (srcIdx int, colIdx int, err error) {
+func (sources multiSourceInfo) findColumn(
+	c *parser.ColumnItem,
+) (srcIdx int, colIdx int, err error) {
 	if len(c.Selector) > 0 {
 		return invalidSrcIdx, invalidColIdx, util.UnimplementedWithIssueErrorf(8318, "compound types not supported yet: %q", c)
 	}

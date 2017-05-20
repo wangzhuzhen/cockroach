@@ -17,46 +17,28 @@
 package engine
 
 import (
-	"bufio"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/termie/go-shutil"
 )
 
 const overhead = 48 // Per key/value overhead (empirically determined)
-
-// readAllFiles reads all of the files matching pattern thus ensuring they are
-// in the OS buffer cache.
-func readAllFiles(pattern string) {
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return
-	}
-	for _, m := range matches {
-		f, err := os.Open(m)
-		if err != nil {
-			continue
-		}
-		_, _ = io.Copy(ioutil.Discard, bufio.NewReader(f))
-		f.Close()
-	}
-}
 
 type engineMaker func(testing.TB, string) Engine
 
@@ -88,7 +70,7 @@ func setupMVCCData(
 	eng := emk(b, loc)
 
 	if exists {
-		readAllFiles(filepath.Join(loc, "*"))
+		testutils.ReadAllFiles(filepath.Join(loc, "*"))
 		return eng, loc
 	}
 
@@ -325,6 +307,50 @@ func runMVCCBlindConditionalPut(emk engineMaker, valueSize int, b *testing.B) {
 	b.StopTimer()
 }
 
+func runMVCCInitPut(emk engineMaker, valueSize int, b *testing.B) {
+	rng, _ := randutil.NewPseudoRand()
+	value := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, valueSize))
+	keyBuf := append(make([]byte, 0, 64), []byte("key-")...)
+
+	eng := emk(b, fmt.Sprintf("iput_%d", valueSize))
+	defer eng.Close()
+
+	b.SetBytes(int64(valueSize))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
+		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+		if err := MVCCInitPut(context.Background(), eng, nil, key, ts, value, nil); err != nil {
+			b.Fatalf("failed put: %s", err)
+		}
+	}
+
+	b.StopTimer()
+}
+
+func runMVCCBlindInitPut(emk engineMaker, valueSize int, b *testing.B) {
+	rng, _ := randutil.NewPseudoRand()
+	value := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, valueSize))
+	keyBuf := append(make([]byte, 0, 64), []byte("key-")...)
+
+	eng := emk(b, fmt.Sprintf("iput_%d", valueSize))
+	defer eng.Close()
+
+	b.SetBytes(int64(valueSize))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
+		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+		if err := MVCCBlindInitPut(context.Background(), eng, nil, key, ts, value, nil); err != nil {
+			b.Fatalf("failed put: %s", err)
+		}
+	}
+
+	b.StopTimer()
+}
+
 func runMVCCBatchPut(emk engineMaker, valueSize, batchSize int, b *testing.B) {
 	rng, _ := randutil.NewPseudoRand()
 	value := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, valueSize))
@@ -468,6 +494,32 @@ func BenchmarkMVCCMergeTimeSeries_RocksDB(b *testing.B) {
 	runMVCCMerge(setupMVCCInMemRocksDB, &value, 1024, b)
 }
 
+func copyDir(from, to string) error {
+	return filepath.Walk(from, func(srcPath string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		destPath := strings.Replace(srcPath, from, to, 1)
+		if info.IsDir() {
+			return os.MkdirAll(destPath, info.Mode())
+		}
+		src, err := os.Open(srcPath)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		dest, err := os.Create(destPath)
+		if err != nil {
+			return err
+		}
+		defer dest.Close()
+		if _, err := io.Copy(dest, src); err != nil {
+			return err
+		}
+		return dest.Sync()
+	})
+}
+
 func runMVCCDeleteRange(emk engineMaker, valueBytes int, b *testing.B) {
 	// 512 KB ranges so the benchmark doesn't take forever
 	const rangeBytes = 512 * 1024
@@ -484,7 +536,7 @@ func runMVCCDeleteRange(emk engineMaker, valueBytes int, b *testing.B) {
 		if err := os.RemoveAll(locDirty); err != nil {
 			b.Fatal(err)
 		}
-		if err := shutil.CopyTree(dir, locDirty, nil); err != nil {
+		if err := copyDir(dir, locDirty); err != nil {
 			b.Fatal(err)
 		}
 		dupEng := emk(b, locDirty)

@@ -4,11 +4,13 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/ccl/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
 
 package storageccl
 
 import (
+	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -24,14 +26,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func TestExport(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
 	ctx := context.Background()
-	dir, dirCleanupFn := testutils.TempDir(t, 0)
+	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(t, tc.Conns[0])
 	kvDB := tc.Server(0).KVClient().(*client.DB)
 
@@ -59,7 +64,17 @@ func TestExport(t *testing.T) {
 		for _, file := range res.(*roachpb.ExportResponse).Files {
 			paths = append(paths, file.Path)
 
-			sst, err := engine.MakeRocksDBSstFileReader()
+			readerTempDir, err := ioutil.TempDir(dir, "RocksDBSstFileReader")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := os.RemoveAll(readerTempDir); err != nil {
+					t.Fatal(err)
+				}
+			}()
+
+			sst, err := engine.MakeRocksDBSstFileReader(readerTempDir)
 			if err != nil {
 				t.Fatalf("%+v", err)
 			}
@@ -109,7 +124,7 @@ func TestExport(t *testing.T) {
 		t.Fatalf("expected a deletion tombstone got %s", v.PrettyPrint())
 	}
 
-	sqlDB.Exec(`ALTER TABLE export.export SPLIT AT (2)`)
+	sqlDB.Exec(`ALTER TABLE export.export SPLIT AT VALUES (2)`)
 	_, paths5, kvs5 := exportAndSlurp(hlc.Timestamp{})
 	if expected := 2; len(paths5) != expected {
 		t.Fatalf("expected %d files in export got %d", expected, len(paths5))
@@ -120,9 +135,11 @@ func TestExport(t *testing.T) {
 }
 
 func TestExportGCThreshold(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(ctx)
 	kvDB := tc.Server(0).KVClient().(*client.DB)
 
 	req := &roachpb.ExportRequest{

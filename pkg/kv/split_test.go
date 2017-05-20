@@ -31,8 +31,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -103,20 +105,22 @@ func TestRangeSplitMeta(t *testing.T) {
 	s, _ := createTestDB(t)
 	defer s.Stop()
 
+	ctx := context.TODO()
+
 	splitKeys := []roachpb.RKey{roachpb.RKey("G"), mustMeta(roachpb.RKey("F")),
 		mustMeta(roachpb.RKey("K")), mustMeta(roachpb.RKey("H"))}
 
 	// Execute the consecutive splits.
 	for _, splitKey := range splitKeys {
-		log.Infof(context.Background(), "starting split at key %q...", splitKey)
-		if err := s.DB.AdminSplit(context.TODO(), roachpb.Key(splitKey)); err != nil {
+		log.Infof(ctx, "starting split at key %q...", splitKey)
+		if err := s.DB.AdminSplit(ctx, roachpb.Key(splitKey)); err != nil {
 			t.Fatal(err)
 		}
-		log.Infof(context.Background(), "split at key %q complete", splitKey)
+		log.Infof(ctx, "split at key %q complete", splitKey)
 	}
 
 	testutils.SucceedsSoon(t, func() error {
-		if _, _, _, err := engine.MVCCScan(context.Background(), s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, true, nil); err != nil {
+		if _, _, _, err := engine.MVCCScan(ctx, s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, true, nil); err != nil {
 			return errors.Errorf("failed to verify no dangling intents: %s", err)
 		}
 		return nil
@@ -147,17 +151,18 @@ func TestRangeSplitsWithConcurrentTxns(t *testing.T) {
 		go startTestWriter(s.DB, int64(i), 1<<7, &wg, &retries, txnChannel, done, t)
 	}
 
+	ctx := context.TODO()
 	// Execute the consecutive splits.
 	for _, splitKey := range splitKeys {
 		// Allow txns to start before initiating split.
 		for i := 0; i < concurrency; i++ {
 			<-txnChannel
 		}
-		log.Infof(context.Background(), "starting split at key %q...", splitKey)
+		log.Infof(ctx, "starting split at key %q...", splitKey)
 		if pErr := s.DB.AdminSplit(context.TODO(), splitKey); pErr != nil {
 			t.Error(pErr)
 		}
-		log.Infof(context.Background(), "split at key %q complete", splitKey)
+		log.Infof(ctx, "split at key %q complete", splitKey)
 	}
 
 	close(done)
@@ -173,27 +178,37 @@ func TestRangeSplitsWithConcurrentTxns(t *testing.T) {
 // a range to 256K and writes data until there are five ranges.
 func TestRangeSplitsWithWritePressure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("#12373")
 	// Override default zone config.
 	cfg := config.DefaultZoneConfig()
 	cfg.RangeMaxBytes = 1 << 18
 	defer config.TestingSetDefaultZoneConfig(cfg)()
 
-	s, _ := createTestDB(t)
+	// Manually create the local test cluster so that the split queue
+	// is not disabled (LocalTestCluster disables it by default).
+	s := &localtestcluster.LocalTestCluster{
+		StoreTestingKnobs: &storage.StoreTestingKnobs{
+			DisableScanner: true,
+		},
+	}
+	s.Start(t, testutils.NewNodeTestBaseContext(), InitSenderForLocalTestCluster)
+
 	// This is purely to silence log spam.
 	config.TestingSetupZoneConfigHook(s.Stopper)
 	defer s.Stop()
 
-	// Start test writer write about a 32K/key so there aren't too many writes necessary to split 64K range.
+	// Start test writer write about a 32K/key so there aren't too many
+	// writes necessary to split 5 ranges.
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go startTestWriter(s.DB, int64(0), 1<<15, &wg, nil, nil, done, t)
 
+	ctx := context.TODO()
+
 	// Check that we split 5 times in allotted time.
 	testutils.SucceedsSoon(t, func() error {
 		// Scan the txn records.
-		rows, err := s.DB.Scan(context.TODO(), keys.Meta2Prefix, keys.MetaMax, 0)
+		rows, err := s.DB.Scan(ctx, keys.Meta2Prefix, keys.MetaMax, 0)
 		if err != nil {
 			return errors.Errorf("failed to scan meta2 keys: %s", err)
 		}
@@ -213,7 +228,7 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 	// for timing of finishing the test writer and a possibly-ongoing
 	// asynchronous split.
 	testutils.SucceedsSoon(t, func() error {
-		if _, _, _, err := engine.MVCCScan(context.Background(), s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, true, nil); err != nil {
+		if _, _, _, err := engine.MVCCScan(ctx, s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, true, nil); err != nil {
 			return errors.Errorf("failed to verify no dangling intents: %s", err)
 		}
 		return nil
@@ -221,25 +236,21 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 }
 
 // TestRangeSplitsWithSameKeyTwice check that second range split
-// on the same splitKey should not cause infinite retry loop.
+// on the same splitKey succeeds.
 func TestRangeSplitsWithSameKeyTwice(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _ := createTestDB(t)
 	defer s.Stop()
 
+	ctx := context.TODO()
+
 	splitKey := roachpb.Key("aa")
-	log.Infof(context.Background(), "starting split at key %q...", splitKey)
-	if err := s.DB.AdminSplit(context.TODO(), splitKey); err != nil {
+	log.Infof(ctx, "starting split at key %q...", splitKey)
+	if err := s.DB.AdminSplit(ctx, splitKey); err != nil {
 		t.Fatal(err)
 	}
-	log.Infof(context.Background(), "split at key %q first time complete", splitKey)
-	ch := make(chan error)
-	go func() {
-		// should return error other than infinite loop
-		ch <- s.DB.AdminSplit(context.TODO(), splitKey)
-	}()
-
-	if err := <-ch; err == nil {
-		t.Error("range split on same splitKey should fail")
+	log.Infof(ctx, "split at key %q first time complete", splitKey)
+	if err := s.DB.AdminSplit(ctx, splitKey); err != nil {
+		t.Fatal(err)
 	}
 }

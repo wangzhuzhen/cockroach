@@ -60,7 +60,7 @@ var (
 // invokes the supplied test func with each instance.
 func runWithAllEngines(test func(e Engine, t *testing.T), t *testing.T) {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	inMem := NewInMem(inMemAttrs, testCacheSize)
 	stopper.AddCloser(inMem)
 	test(inMem, t)
@@ -152,7 +152,9 @@ func TestEngineBatchStaleCachedIterator(t *testing.T) {
 			// Iterator should not reuse its cached result.
 			iter.Seek(key)
 
-			if iter.Valid() {
+			if ok, err := iter.Valid(); err != nil {
+				t.Fatal(err)
+			} else if ok {
 				t.Fatalf("iterator unexpectedly valid: %v -> %v",
 					iter.UnsafeKey(), iter.UnsafeValue())
 			}
@@ -299,9 +301,9 @@ func TestEngineBatch(t *testing.T) {
 			// Try using an iterator to get the value from the batch.
 			iter := b.NewIterator(false)
 			iter.Seek(key)
-			if !iter.Valid() {
+			if ok, err := iter.Valid(); !ok {
 				if currentBatch[len(currentBatch)-1].value != nil {
-					t.Errorf("%d: batch seek invalid", i)
+					t.Errorf("%d: batch seek invalid, err=%v", i, err)
 				}
 			} else if !iter.Key().Equal(key) {
 				t.Errorf("%d: batch seek expected key %s, but got %s", i, key, iter.Key())
@@ -594,7 +596,7 @@ func testEngineDeleteRange(t *testing.T, clearRange func(engine Engine, start, e
 
 		// Delete a range of keys
 		if err := clearRange(engine, mvccKey("aa"), mvccKey("abc")); err != nil {
-			t.Error("Not expecting an error")
+			t.Fatal(err)
 		}
 		// Verify what's left
 		verifyScan(mvccKey(roachpb.RKeyMin), mvccKey(roachpb.RKeyMax), 10,
@@ -607,6 +609,23 @@ func TestEngineDeleteRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	testEngineDeleteRange(t, func(engine Engine, start, end MVCCKey) error {
 		return engine.ClearRange(start, end)
+	})
+}
+
+func TestEngineDeleteRangeBatch(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testEngineDeleteRange(t, func(engine Engine, start, end MVCCKey) error {
+		batch := engine.NewWriteOnlyBatch()
+		defer batch.Close()
+		if err := batch.ClearRange(start, end); err != nil {
+			return err
+		}
+		batch2 := engine.NewWriteOnlyBatch()
+		defer batch2.Close()
+		if err := batch2.ApplyBatchRepr(batch.Repr(), false); err != nil {
+			return err
+		}
+		return batch2.Commit(false)
 	})
 }
 
@@ -746,7 +765,9 @@ func TestSnapshotMethods(t *testing.T) {
 		// Verify NewIterator still iterates over original snapshot.
 		iter := snap.NewIterator(false)
 		iter.Seek(newKey)
-		if iter.Valid() {
+		if ok, err := iter.Valid(); err != nil {
+			t.Fatal(err)
+		} else if ok {
 			t.Error("expected invalid iterator when seeking to element which shouldn't be visible to snapshot")
 		}
 		iter.Close()

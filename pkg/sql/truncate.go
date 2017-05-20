@@ -52,7 +52,7 @@ func (p *planner) Truncate(ctx context.Context, n *parser.Truncate) (planNode, e
 			return nil, err
 		}
 
-		tableDesc, err := p.getTableLease(ctx, tn)
+		tableDesc, err := p.session.leases.getTableLease(ctx, p.txn, p.getVirtualTabler(), tn)
 		if err != nil {
 			return nil, err
 		}
@@ -77,7 +77,7 @@ func (p *planner) Truncate(ctx context.Context, n *parser.Truncate) (planNode, e
 					continue
 				}
 
-				other, err := p.getTableLeaseByID(ctx, ref.Table)
+				other, err := p.session.leases.getTableLeaseByID(ctx, p.txn, ref.Table)
 				if err != nil {
 					return nil, err
 				}
@@ -106,7 +106,7 @@ func (p *planner) Truncate(ctx context.Context, n *parser.Truncate) (planNode, e
 // deletes a range of data for the table, which includes the PK and all
 // indexes.
 func truncateTable(tableDesc *sqlbase.TableDescriptor, txn *client.Txn) error {
-	rd, err := makeRowDeleter(txn, tableDesc, nil, nil, false)
+	rd, err := sqlbase.MakeRowDeleter(txn, tableDesc, nil, nil, false)
 	if err != nil {
 		return err
 	}
@@ -131,7 +131,7 @@ func truncateTableInChunks(
 			log.Infof(ctx, "table %s truncate at row: %d, span: %s", tableDesc.Name, row, resume)
 		}
 		if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-			rd, err := makeRowDeleter(txn, tableDesc, nil, nil, false)
+			rd, err := sqlbase.MakeRowDeleter(txn, tableDesc, nil, nil, false)
 			if err != nil {
 				return err
 			}

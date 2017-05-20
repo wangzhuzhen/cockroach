@@ -43,11 +43,6 @@ resource "null_resource" "cockroach-runner" {
     instance_ids = "${element(aws_instance.cockroach.*.id, count.index)}"
   }
 
-  provisioner "file" {
-    source = "download_binary.sh"
-    destination = "/home/ubuntu/download_binary.sh"
-  }
-
   # This writes the filled-in supervisor template. It would be nice if we could
   # use rendered templates in the file provisioner.
   provisioner "remote-exec" {
@@ -56,13 +51,16 @@ echo '${element(data.template_file.supervisor.*.rendered, count.index)}' > super
 FILE
   }
 
+  # Launch CockroachDB.
   provisioner "remote-exec" {
     inline = [
       "sudo apt-get -y update",
       "sudo apt-get -y install supervisor",
       "sudo service supervisor stop",
-      "bash download_binary.sh cockroach/cockroach ${var.cockroach_sha}",
       "mkdir -p logs",
+      "chmod 755 cockroach",
+      "[ $(stat --format=%s cockroach) -ne 0 ] || curl -sfSL https://edge-binaries.cockroachdb.com/cockroach/cockroach.linux-gnu-amd64.${var.cockroach_sha} -o cockroach",
+      "chmod +x cockroach",
       "if [ ! -e supervisor.pid ]; then supervisord -c supervisor.conf; fi",
       "supervisorctl -c supervisor.conf start cockroach",
     ]

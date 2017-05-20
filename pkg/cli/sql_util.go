@@ -63,6 +63,60 @@ func (c *sqlConn) ensureConn() error {
 	return nil
 }
 
+// ExecTxn runs fn inside a transaction and retries it as needed.
+// On non-retryable failures, the transaction is aborted and rolled
+// back; on success, the transaction is committed.
+//
+// NOTE: the supplied closure should not have external side
+// effects beyond changes to the database.
+//
+// NB: this code is cribbed from cockroach-go/crdb and has been copied
+// because this code, pre-dating go1.8, deals with multiple result sets
+// direct with the driver. See #14964.
+func (c *sqlConn) ExecTxn(fn func(*sqlConn) error) (err error) {
+	// Start a transaction.
+	if err = c.Exec(`BEGIN`, nil); err != nil {
+		return err
+	}
+	defer func() {
+		if err == nil {
+			// Ignore commit errors. The tx has already been committed by RELEASE.
+			_ = c.Exec(`COMMIT`, nil)
+		} else {
+			// We always need to execute a Rollback() so sql.DB releases the
+			// connection.
+			_ = c.Exec(`ROLLBACK`, nil)
+		}
+	}()
+	// Specify that we intend to retry this txn in case of CockroachDB retryable
+	// errors.
+	if err = c.Exec(`SAVEPOINT cockroach_restart`, nil); err != nil {
+		return err
+	}
+
+	for {
+		err = fn(c)
+		if err == nil {
+			// RELEASE acts like COMMIT in CockroachDB. We use it since it gives us an
+			// opportunity to react to retryable errors, whereas tx.Commit() doesn't.
+			if err = c.Exec(`RELEASE SAVEPOINT cockroach_restart`, nil); err == nil {
+				return nil
+			}
+		}
+		// We got an error; let's see if it's a retryable one and, if so, restart. We look
+		// for either the standard PG errcode SerializationFailureError:40001 or the Cockroach extension
+		// errcode RetriableError:CR000. The Cockroach extension has been removed server-side, but support
+		// for it has been left here for now to maintain backwards compatibility.
+		pqErr, ok := err.(*pq.Error)
+		if retryable := ok && (pqErr.Code == "CR000" || pqErr.Code == "40001"); !retryable {
+			return err
+		}
+		if err = c.Exec(`ROLLBACK TO SAVEPOINT cockroach_restart`, nil); err != nil {
+			return err
+		}
+	}
+}
+
 func (c *sqlConn) Exec(query string, args []driver.Value) error {
 	if err := c.ensureConn(); err != nil {
 		return err
@@ -180,30 +234,31 @@ func makeSQLConn(url string) *sqlConn {
 // for a password as the only authentication method available for this user is
 // certificate authentication.
 func getPasswordAndMakeSQLClient() (*sqlConn, error) {
-	if len(connURL) != 0 {
-		return makeSQLConn(connURL), nil
+	if len(sqlConnURL) != 0 {
+		return makeSQLConn(sqlConnURL), nil
 	}
 	var user *url.Userinfo
-	if !baseCfg.Insecure && connUser != security.RootUser && baseCfg.SSLCert == "" && baseCfg.SSLCertKey == "" {
+	if !baseCfg.Insecure && sqlConnUser != security.RootUser &&
+		!baseCfg.ClientHasValidCerts(sqlConnUser) {
 		pwd, err := security.PromptForPassword()
 		if err != nil {
 			return nil, err
 		}
-		user = url.UserPassword(connUser, pwd)
+		user = url.UserPassword(sqlConnUser, pwd)
 	} else {
-		user = url.User(connUser)
+		user = url.User(sqlConnUser)
 	}
 	return makeSQLClient(user)
 }
 
 func makeSQLClient(user *url.Userinfo) (*sqlConn, error) {
-	sqlURL := connURL
-	if len(connURL) == 0 {
+	sqlURL := sqlConnURL
+	if len(sqlConnURL) == 0 {
 		u, err := sqlCtx.PGURL(user)
 		if err != nil {
 			return nil, err
 		}
-		u.Path = connDBName
+		u.Path = sqlConnDBName
 		sqlURL = u.String()
 	}
 	return makeSQLConn(sqlURL), nil
@@ -253,18 +308,45 @@ func runQueryAndFormatResults(
 	if err != nil {
 		return err
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		_ = rows.Close()
+	}()
 	for {
-		cols, allRows, result, err := sqlRowsToStrings(rows, true)
-		if err != nil {
+		cols := getColumnStrings(rows)
+		if len(cols) == 0 {
+			// When no columns are returned, we want to render a summary of the
+			// number of rows that were returned or affected. To do this this, the
+			// driver needs to "consume" all the rows so that the RowsAffected()
+			// method returns the correct number of rows (it only reports the number
+			// of rows that the driver consumes).
+			if err := consumeAllRows(rows); err != nil {
+				return err
+			}
+		}
+		formattedTag := getFormattedTag(rows.Tag(), rows.Result())
+		if err := printQueryOutput(w, cols, newRowIter(rows, true), formattedTag, displayFormat); err != nil {
 			return err
 		}
-		printQueryOutput(w, cols, allRows, result, displayFormat)
 
 		if more, err := rows.NextResultSet(); err != nil {
 			return err
 		} else if !more {
 			return nil
+		}
+	}
+}
+
+// consumeAllRows consumes all of the rows from the network. Used this method
+// when the driver needs to consume all the rows, but you don't care about the
+// rows themselves.
+func consumeAllRows(rows *sqlRows) error {
+	for {
+		err := rows.Next(nil)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
 		}
 	}
 }
@@ -277,45 +359,74 @@ func runQueryAndFormatResults(
 // information was returned (eg: statement was not a query).
 // If showMoreChars is true, then more characters are not escaped.
 func sqlRowsToStrings(rows *sqlRows, showMoreChars bool) ([]string, [][]string, string, error) {
+	cols := getColumnStrings(rows)
+	allRows, err := getAllRowStrings(rows, showMoreChars)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	tag := getFormattedTag(rows.Tag(), rows.Result())
+
+	return cols, allRows, tag, nil
+}
+
+func getColumnStrings(rows *sqlRows) []string {
 	srcCols := rows.Columns()
 	cols := make([]string, len(srcCols))
 	for i, c := range srcCols {
-		cols[i] = formatVal(c, showMoreChars, false)
+		cols[i] = formatVal(c, true, false)
+	}
+	return cols
+}
+
+func getAllRowStrings(rows *sqlRows, showMoreChars bool) ([][]string, error) {
+	var allRows [][]string
+
+	for {
+		rowStrings, err := getNextRowStrings(rows, showMoreChars)
+		if err != nil {
+			return nil, err
+		}
+		if rowStrings == nil {
+			break
+		}
+		allRows = append(allRows, rowStrings)
 	}
 
-	var allRows [][]string
+	return allRows, nil
+}
+
+func getNextRowStrings(rows *sqlRows, showMoreChars bool) ([]string, error) {
+	cols := rows.Columns()
 	var vals []driver.Value
 	if len(cols) > 0 {
 		vals = make([]driver.Value, len(cols))
 	}
 
-	for {
-		err := rows.Next(vals)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, nil, "", err
-		}
-		rowStrings := make([]string, len(cols))
-		for i, v := range vals {
-			rowStrings[i] = formatVal(v, showMoreChars, showMoreChars)
-		}
-		allRows = append(allRows, rowStrings)
+	err := rows.Next(vals)
+	if err == io.EOF {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	result := rows.Result()
-	tag := rows.Tag()
+	rowStrings := make([]string, len(cols))
+	for i, v := range vals {
+		rowStrings[i] = formatVal(v, showMoreChars, showMoreChars)
+	}
+	return rowStrings, nil
+}
+
+func getFormattedTag(tag string, result driver.Result) string {
 	switch tag {
 	case "":
 		tag = "OK"
-	case "DELETE", "INSERT", "UPDATE":
+	case "SELECT", "DELETE", "INSERT", "UPDATE":
 		if n, err := result.RowsAffected(); err == nil {
 			tag = fmt.Sprintf("%s %d", tag, n)
 		}
 	}
-
-	return cols, allRows, tag, nil
+	return tag
 }
 
 // expandTabsAndNewLines ensures that multi-line row strings that may

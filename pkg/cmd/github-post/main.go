@@ -24,6 +24,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 
 	"golang.org/x/oauth2"
@@ -41,7 +42,6 @@ const githubUser = "cockroachdb"
 const githubRepo = "cockroach"
 
 const pkgEnv = "PKG"
-const propEvalKVEnv = "COCKROACH_PROPOSER_EVALUATED_KV"
 const tagsEnv = "TAGS"
 const goFlagsEnv = "GOFLAGS"
 const cockroachPkgPrefix = "github.com/cockroachdb/cockroach/pkg/"
@@ -70,16 +70,40 @@ func main() {
 	}
 }
 
+var stacktraceRE = regexp.MustCompile(`(?m:^goroutine\s\d+)`)
+
 func trimIssueRequestBody(message string, usedCharacters int) string {
 	maxLength := githubIssueBodyMaximumLength - usedCharacters
 
-	for len(message) > maxLength {
-		if idx := strings.IndexByte(message, '\n'); idx != -1 {
-			message = message[idx+1:]
-		} else {
-			message = message[len(message)-maxLength:]
+	if m := stacktraceRE.FindStringIndex(message); m != nil {
+		// We want the top stack traces plus a few lines before.
+		{
+			startIdx := m[0]
+			for i := 0; i < 10; i++ {
+				if idx := strings.LastIndexByte(message[:startIdx], '\n'); idx != -1 {
+					startIdx = idx
+				}
+			}
+			message = message[startIdx:]
+		}
+		for len(message) > maxLength {
+			if idx := strings.LastIndexByte(message, '\n'); idx != -1 {
+				message = message[:idx]
+			} else {
+				message = message[:maxLength]
+			}
+		}
+	} else {
+		// We want the FAIL line.
+		for len(message) > maxLength {
+			if idx := strings.IndexByte(message, '\n'); idx != -1 {
+				message = message[idx+1:]
+			} else {
+				message = message[len(message)-maxLength:]
+			}
 		}
 	}
+
 	return message
 }
 
@@ -122,7 +146,6 @@ func runGH(
 
 	var parameters []string
 	for _, parameter := range []string{
-		propEvalKVEnv,
 		tagsEnv,
 		goFlagsEnv,
 	} {

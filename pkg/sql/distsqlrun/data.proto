@@ -25,9 +25,22 @@ option go_package = "distsqlrun";
 import "cockroach/pkg/roachpb/api.proto";
 import "cockroach/pkg/roachpb/data.proto";
 import "cockroach/pkg/roachpb/errors.proto";
+import "cockroach/pkg/sql/pgwire/pgerror/errors.proto";
 import "cockroach/pkg/sql/sqlbase/structured.proto";
 import "cockroach/pkg/sql/sqlbase/encoded_datum.proto";
 import "gogoproto/gogo.proto";
+
+// Error is a generic representation including a string message.
+message Error {
+  option (gogoproto.goproto_stringer) = false;
+
+  oneof detail {
+    pgerror.Error pg_error = 1 [(gogoproto.customname) = "PGError"];
+    roachpb.UnhandledRetryableError retryableTxnError = 2;
+    // TODO(andrei): Add AmbiguousResultError here once DistSQL starts executing
+    // writes.
+  }
+}
 
 message Expression {
   // TODO(radu): TBD how this will be used
@@ -147,13 +160,17 @@ message ProducerHeader {
 }
 
 // ProducerData is a message that can be sent multiple times as part of a stream
-// from a producer to a consumer.
+// from a producer to a consumer. It contains 0 or more rows and/or 0 or more
+// metadata messages.
 message ProducerData {
-  // ProducerData contains 0 or more rows and/or 0 or more metadata messages.
-  
   // A bunch of rows, encoded. Each datum is encoded according to the
   // corresponding DatumInfo.
   optional bytes raw_bytes = 1;
+
+  // In the special case when the stream contains empty rows, the count is
+  // passed instead.
+  optional int32 num_empty_rows = 3 [(gogoproto.nullable) = false];
+
   // A bunch of metadata messages.
   repeated RemoteProducerMetadata metadata = 2 [(gogoproto.nullable) = false];
 }
@@ -182,13 +199,6 @@ message RemoteProducerMetadata {
   }
   oneof value {
     RangeInfos range_info = 1;
-    // TODO(radu): we should be using our own error instead of roachpb.Error.
-    // One important error field for distsql is whether the error is
-    // "authoritative": if a query is distributed on multiple nodes and one node
-    // hits an error, the other nodes may hit errors as well as a consequence
-    // (e.g. streams can't connect to the failed flow). The node that started the
-    // flow needs to distinguish which errors are caused by non-availability of
-    // other nodes so they don't obscure the real error.
-    roachpb.Error error = 2;
+    Error error = 2;
   }
 }

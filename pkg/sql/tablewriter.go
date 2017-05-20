@@ -66,6 +66,16 @@ type tableWriter interface {
 	// finalize flushes out any remaining writes. It is called after all calls to
 	// row.
 	finalize(ctx context.Context) error
+
+	// spans collects the upper bound set of read and write spans that the
+	// tableWriter will touch when executed. This is contractual, and the
+	// tableWriter will not touch any keys outside of the spans reported here.
+	//
+	// TODO(nvanbenschoten): we are currently pretty pessimistic here, assuming
+	// that table operations will touch the entire table. In cases where we
+	// can determine ahead of time that this isn't true, we should true to
+	// constrain these spans.
+	spans() (reads, writes roachpb.Spans, err error)
 }
 
 var _ tableWriter = (*tableInserter)(nil)
@@ -75,7 +85,7 @@ var _ tableWriter = (*tableDeleter)(nil)
 
 // tableInserter handles writing kvs and forming table rows for inserts.
 type tableInserter struct {
-	ri         RowInserter
+	ri         sqlbase.RowInserter
 	autoCommit bool
 
 	// Set by init.
@@ -107,14 +117,18 @@ func (ti *tableInserter) finalize(ctx context.Context) error {
 	}
 
 	if err != nil {
-		return sqlbase.ConvertBatchError(ti.ri.helper.tableDesc, ti.b)
+		return sqlbase.ConvertBatchError(ti.ri.Helper.TableDesc, ti.b)
 	}
 	return nil
 }
 
+func (ti *tableInserter) spans() (reads, writes roachpb.Spans, err error) {
+	return collectTableWriterSpans(ti.ri.Helper.TableDesc, ti.ri.Fks)
+}
+
 // tableUpdater handles writing kvs and forming table rows for updates.
 type tableUpdater struct {
-	ru         rowUpdater
+	ru         sqlbase.RowUpdater
 	autoCommit bool
 
 	// Set by init.
@@ -131,9 +145,9 @@ func (tu *tableUpdater) init(txn *client.Txn) error {
 }
 
 func (tu *tableUpdater) row(ctx context.Context, values parser.Datums) (parser.Datums, error) {
-	oldValues := values[:len(tu.ru.fetchCols)]
-	updateValues := values[len(tu.ru.fetchCols):]
-	return tu.ru.updateRow(ctx, tu.b, oldValues, updateValues)
+	oldValues := values[:len(tu.ru.FetchCols)]
+	updateValues := values[len(tu.ru.FetchCols):]
+	return tu.ru.UpdateRow(ctx, tu.b, oldValues, updateValues)
 }
 
 func (tu *tableUpdater) finalize(ctx context.Context) error {
@@ -148,9 +162,13 @@ func (tu *tableUpdater) finalize(ctx context.Context) error {
 	}
 
 	if err != nil {
-		return sqlbase.ConvertBatchError(tu.ru.helper.tableDesc, tu.b)
+		return sqlbase.ConvertBatchError(tu.ru.Helper.TableDesc, tu.b)
 	}
 	return nil
+}
+
+func (tu *tableUpdater) spans() (reads, writes roachpb.Spans, err error) {
+	return collectTableWriterSpans(tu.ru.Helper.TableDesc, tu.ru.Fks)
 }
 
 type tableUpsertEvaler interface {
@@ -165,8 +183,6 @@ type tableUpsertEvaler interface {
 	// eval returns the values for the update case of an upsert, given the row
 	// that would have been inserted and the existing (conflicting) values.
 	eval(insertRow parser.Datums, existingRow parser.Datums) (parser.Datums, error)
-
-	isIdentityEvaler() bool
 }
 
 // tableUpserter handles writing kvs and forming table rows for upserts.
@@ -186,9 +202,10 @@ type tableUpsertEvaler interface {
 // operated on during `row`, and run during `finalize`. This is the same model
 // as the other `tableFoo`s, which are more simple than upsert.
 type tableUpserter struct {
-	ri            RowInserter
+	ri            sqlbase.RowInserter
 	autoCommit    bool
 	conflictIndex sqlbase.IndexDescriptor
+	isUpsertAlias bool
 
 	// These are set for ON CONFLICT DO UPDATE, but not for DO NOTHING
 	updateCols []sqlbase.ColumnDescriptor
@@ -197,8 +214,8 @@ type tableUpserter struct {
 	// Set by init.
 	txn                   *client.Txn
 	tableDesc             *sqlbase.TableDescriptor
-	fkTables              tableLookupsByID // for fk checks in update case
-	ru                    rowUpdater
+	fkTables              sqlbase.TableLookupsByID // for fk checks in update case
+	ru                    sqlbase.RowUpdater
 	updateColIDtoRowIndex map[sqlbase.ColumnID]int
 	a                     sqlbase.DatumAlloc
 	fetchCols             []sqlbase.ColumnDescriptor
@@ -224,20 +241,28 @@ func (tu *tableUpserter) walkExprs(walk func(desc string, index int, expr parser
 
 func (tu *tableUpserter) init(txn *client.Txn) error {
 	tu.txn = txn
-	tu.tableDesc = tu.ri.helper.tableDesc
+	tu.tableDesc = tu.ri.Helper.TableDesc
 	tu.indexKeyPrefix = sqlbase.MakeIndexKeyPrefix(tu.tableDesc, tu.tableDesc.PrimaryIndex.ID)
 
-	// For the fast path, all columns must be specified in the insert.
-	allColsIdentityExpr := len(tu.ri.insertCols) == len(tu.tableDesc.Columns) &&
-		// Plus, all columns not in the conflict index must be specified in the
-		// DO UPDATE clause and be of the form `x = excluded.x`.
-		len(tu.updateCols) == len(tu.tableDesc.Columns)-len(tu.conflictIndex.ColumnIDs) &&
-		tu.evaler != nil && tu.evaler.isIdentityEvaler()
-	// When adding or removing a column in a schema change (mutation), the user
-	// can't specify it, which means we need to do a lookup and so we can't use
-	// the fast path. When adding or removing an index, same result, so the fast
-	// path is disabled during all mutations.
-	if len(tu.tableDesc.Indexes) == 0 && len(tu.tableDesc.Mutations) == 0 && allColsIdentityExpr {
+	// TODO(dan): The fast path is currently only enabled when the UPSERT alias
+	// is explicitly selected by the user. It's possible to fast path some
+	// queries of the form INSERT ... ON CONFLICT, but the utility is low and
+	// there are lots of edge cases (that caused real correctness bugs #13437
+	// #13962). As a result, we've decided to remove this until after 1.0 and
+	// re-enable it then. See #14482.
+	enableFastPath := tu.isUpsertAlias &&
+		// Tables with secondary indexes are not eligible for fast path (it
+		// would be easy to add the new secondary index entry but we can't clean
+		// up the old one without the previous values).
+		len(tu.tableDesc.Indexes) == 0 &&
+		// When adding or removing a column in a schema change (mutation), the user
+		// can't specify it, which means we need to do a lookup and so we can't use
+		// the fast path. When adding or removing an index, same result, so the fast
+		// path is disabled during all mutations.
+		len(tu.tableDesc.Mutations) == 0 &&
+		// For the fast path, all columns must be specified in the insert.
+		len(tu.ri.InsertCols) == len(tu.tableDesc.Columns)
+	if enableFastPath {
 		tu.fastPathBatch = tu.txn.NewBatch()
 		tu.fastPathKeys = make(map[string]struct{})
 		return nil
@@ -249,21 +274,21 @@ func (tu *tableUpserter) init(txn *client.Txn) error {
 
 	if len(tu.updateCols) == 0 {
 		tu.fetchCols = requestedCols
-		tu.fetchColIDtoRowIndex = colIDtoRowIndexFromCols(requestedCols)
+		tu.fetchColIDtoRowIndex = sqlbase.ColIDtoRowIndexFromCols(requestedCols)
 	} else {
 		var err error
-		tu.ru, err = makeRowUpdater(
-			txn, tu.tableDesc, tu.fkTables, tu.updateCols, requestedCols, rowUpdaterDefault,
+		tu.ru, err = sqlbase.MakeRowUpdater(
+			txn, tu.tableDesc, tu.fkTables, tu.updateCols, requestedCols, sqlbase.RowUpdaterDefault,
 		)
 		if err != nil {
 			return err
 		}
 		// t.ru.fetchCols can also contain columns undergoing mutation.
-		tu.fetchCols = tu.ru.fetchCols
-		tu.fetchColIDtoRowIndex = tu.ru.fetchColIDtoRowIndex
+		tu.fetchCols = tu.ru.FetchCols
+		tu.fetchColIDtoRowIndex = tu.ru.FetchColIDtoRowIndex
 
 		tu.updateColIDtoRowIndex = make(map[sqlbase.ColumnID]int)
-		for i, updateCol := range tu.ru.updateCols {
+		for i, updateCol := range tu.ru.UpdateCols {
 			tu.updateColIDtoRowIndex[updateCol.ID] = i
 		}
 	}
@@ -326,12 +351,12 @@ func (tu *tableUpserter) flush(ctx context.Context, finalize bool) error {
 		} else {
 			// If len(tu.updateCols) == 0, then we're in the DO NOTHING case.
 			if len(tu.updateCols) > 0 {
-				existingValues := existingRow[:len(tu.ru.fetchCols)]
+				existingValues := existingRow[:len(tu.ru.FetchCols)]
 				updateValues, err := tu.evaler.eval(insertRow, existingValues)
 				if err != nil {
 					return err
 				}
-				_, err = tu.ru.updateRow(ctx, b, existingValues, updateValues)
+				_, err = tu.ru.UpdateRow(ctx, b, existingValues, updateValues)
 				if err != nil {
 					return err
 				}
@@ -483,9 +508,13 @@ func (tu *tableUpserter) finalize(ctx context.Context) error {
 	return tu.flush(ctx, true /* finalize */)
 }
 
+func (tu *tableUpserter) spans() (reads, writes roachpb.Spans, err error) {
+	return collectTableWriterSpans(tu.ri.Helper.TableDesc, tu.ri.Fks)
+}
+
 // tableDeleter handles writing kvs and forming table rows for deletes.
 type tableDeleter struct {
-	rd         rowDeleter
+	rd         sqlbase.RowDeleter
 	autoCommit bool
 
 	// Set by init.
@@ -502,7 +531,7 @@ func (td *tableDeleter) init(txn *client.Txn) error {
 }
 
 func (td *tableDeleter) row(ctx context.Context, values parser.Datums) (parser.Datums, error) {
-	return nil, td.rd.deleteRow(ctx, td.b, values)
+	return nil, td.rd.DeleteRow(ctx, td.b, values)
 }
 
 func (td *tableDeleter) finalize(ctx context.Context) error {
@@ -517,19 +546,19 @@ func (td *tableDeleter) finalize(ctx context.Context) error {
 
 // fastPathAvailable returns true if the fastDelete optimization can be used.
 func (td *tableDeleter) fastPathAvailable(ctx context.Context) bool {
-	if len(td.rd.helper.indexes) != 0 {
+	if len(td.rd.Helper.Indexes) != 0 {
 		if log.V(2) {
-			log.Infof(ctx, "delete forced to scan: values required to update %d secondary indexes", len(td.rd.helper.indexes))
+			log.Infof(ctx, "delete forced to scan: values required to update %d secondary indexes", len(td.rd.Helper.Indexes))
 		}
 		return false
 	}
-	if td.rd.helper.tableDesc.IsInterleaved() {
+	if td.rd.Helper.TableDesc.IsInterleaved() {
 		if log.V(2) {
 			log.Info(ctx, "delete forced to scan: table is interleaved")
 		}
 		return false
 	}
-	if len(td.rd.helper.tableDesc.PrimaryIndex.ReferencedBy) > 0 {
+	if len(td.rd.Helper.TableDesc.PrimaryIndex.ReferencedBy) > 0 {
 		if log.V(2) {
 			log.Info(ctx, "delete forced to scan: table is referenced by foreign keys")
 		}
@@ -593,7 +622,7 @@ func (td *tableDeleter) fastDelete(ctx context.Context, scan *scanNode) (rowCoun
 func (td *tableDeleter) deleteAllRows(
 	ctx context.Context, resume roachpb.Span, limit int64,
 ) (roachpb.Span, error) {
-	if td.rd.helper.tableDesc.IsInterleaved() {
+	if td.rd.Helper.TableDesc.IsInterleaved() {
 		if log.V(2) {
 			log.Info(ctx, "delete forced to scan: table is interleaved")
 		}
@@ -607,7 +636,7 @@ func (td *tableDeleter) deleteAllRowsFast(
 ) (roachpb.Span, error) {
 	if resume.Key == nil {
 		tablePrefix := roachpb.Key(
-			encoding.EncodeUvarintAscending(nil, uint64(td.rd.helper.tableDesc.ID)),
+			encoding.EncodeUvarintAscending(nil, uint64(td.rd.Helper.TableDesc.ID)),
 		)
 		// Delete rows and indexes starting with the table's prefix.
 		resume = roachpb.Span{
@@ -633,20 +662,18 @@ func (td *tableDeleter) deleteAllRowsScan(
 	ctx context.Context, resume roachpb.Span, limit int64,
 ) (roachpb.Span, error) {
 	if resume.Key == nil {
-		tablePrefix := sqlbase.MakeIndexKeyPrefix(
-			td.rd.helper.tableDesc, td.rd.helper.tableDesc.PrimaryIndex.ID)
-		resume = roachpb.Span{Key: roachpb.Key(tablePrefix), EndKey: roachpb.Key(tablePrefix).PrefixEnd()}
+		resume = td.rd.Helper.TableDesc.PrimaryIndexSpan()
 	}
-	valNeededForCol := make([]bool, len(td.rd.helper.tableDesc.Columns))
-	for _, idx := range td.rd.fetchColIDtoRowIndex {
+	valNeededForCol := make([]bool, len(td.rd.Helper.TableDesc.Columns))
+	for _, idx := range td.rd.FetchColIDtoRowIndex {
 		valNeededForCol[idx] = true
 	}
 
 	var rf sqlbase.RowFetcher
 	err := rf.Init(
-		td.rd.helper.tableDesc, td.rd.fetchColIDtoRowIndex, &td.rd.helper.tableDesc.PrimaryIndex,
+		td.rd.Helper.TableDesc, td.rd.FetchColIDtoRowIndex, &td.rd.Helper.TableDesc.PrimaryIndex,
 		false /*reverse*/, false, /*isSecondaryIndex*/
-		td.rd.fetchCols, valNeededForCol, false /* returnRangeInfo */)
+		td.rd.FetchCols, valNeededForCol, false /* returnRangeInfo */)
 	if err != nil {
 		return resume, err
 	}
@@ -701,11 +728,7 @@ func (td *tableDeleter) deleteIndexFast(
 	ctx context.Context, idx *sqlbase.IndexDescriptor, resume roachpb.Span, limit int64,
 ) (roachpb.Span, error) {
 	if resume.Key == nil {
-		indexPrefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(td.rd.helper.tableDesc, idx.ID))
-		resume = roachpb.Span{
-			Key:    indexPrefix,
-			EndKey: indexPrefix.PrefixEnd(),
-		}
+		resume = td.rd.Helper.TableDesc.IndexSpan(idx.ID)
 	}
 
 	if log.V(2) {
@@ -726,20 +749,18 @@ func (td *tableDeleter) deleteIndexScan(
 	ctx context.Context, idx *sqlbase.IndexDescriptor, resume roachpb.Span, limit int64,
 ) (roachpb.Span, error) {
 	if resume.Key == nil {
-		tablePrefix := sqlbase.MakeIndexKeyPrefix(
-			td.rd.helper.tableDesc, td.rd.helper.tableDesc.PrimaryIndex.ID)
-		resume = roachpb.Span{Key: roachpb.Key(tablePrefix), EndKey: roachpb.Key(tablePrefix).PrefixEnd()}
+		resume = td.rd.Helper.TableDesc.PrimaryIndexSpan()
 	}
-	valNeededForCol := make([]bool, len(td.rd.helper.tableDesc.Columns))
-	for _, idx := range td.rd.fetchColIDtoRowIndex {
+	valNeededForCol := make([]bool, len(td.rd.Helper.TableDesc.Columns))
+	for _, idx := range td.rd.FetchColIDtoRowIndex {
 		valNeededForCol[idx] = true
 	}
 
 	var rf sqlbase.RowFetcher
 	err := rf.Init(
-		td.rd.helper.tableDesc, td.rd.fetchColIDtoRowIndex, &td.rd.helper.tableDesc.PrimaryIndex,
+		td.rd.Helper.TableDesc, td.rd.FetchColIDtoRowIndex, &td.rd.Helper.TableDesc.PrimaryIndex,
 		false /* reverse */, false, /*isSecondaryIndex */
-		td.rd.fetchCols, valNeededForCol, false /* returnRangeInfo */)
+		td.rd.FetchCols, valNeededForCol, false /* returnRangeInfo */)
 	if err != nil {
 		return resume, err
 	}
@@ -757,7 +778,7 @@ func (td *tableDeleter) deleteIndexScan(
 			resume = roachpb.Span{}
 			break
 		}
-		if err := td.rd.deleteIndexRow(ctx, td.b, idx, row); err != nil {
+		if err := td.rd.DeleteIndexRow(ctx, td.b, idx, row); err != nil {
 			return resume, err
 		}
 	}
@@ -766,4 +787,22 @@ func (td *tableDeleter) deleteIndexScan(
 		resume.Key = rf.Key()
 	}
 	return resume, td.finalize(ctx)
+}
+
+func (td *tableDeleter) spans() (reads, writes roachpb.Spans, err error) {
+	return collectTableWriterSpans(td.rd.Helper.TableDesc, td.rd.Fks)
+}
+
+func collectTableWriterSpans(
+	desc *sqlbase.TableDescriptor, fks sqlbase.FkSpanCollector,
+) (reads, writes roachpb.Spans, err error) {
+	// We don't generally know which spans we will be modifying so we must be
+	// conservative and assume anything in the table might change. See TODO on
+	// tableWriter.spans for discussion on constraining spans wherever possible.
+	tableSpans := desc.AllIndexSpans()
+	fkReads, fkWrites := fks.CollectSpans()
+	if len(fkWrites) > 0 {
+		return nil, nil, errors.Errorf("unexpected foreign key span writes: %v", fkWrites)
+	}
+	return fkReads, tableSpans, nil
 }

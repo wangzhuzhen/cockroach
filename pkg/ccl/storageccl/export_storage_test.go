@@ -4,7 +4,7 @@
 // License (the "License"); you may not use this file except in compliance with
 // the License. You may obtain a copy of the License at
 //
-//     https://github.com/cockroachdb/cockroach/blob/master/ccl/LICENSE
+//     https://github.com/cockroachdb/cockroach/blob/master/LICENSE
 
 package storageccl
 
@@ -27,18 +27,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
-// TODO(dt): remove when calling code lands and these have real users.
-var _, _ = S3AccessKeyParam, S3SecretParam
-var _, _ = ExportStorageFromURI, ExportStorageConfFromURI
-
 func testExportToTarget(t *testing.T, args roachpb.ExportStorage) {
-	const size = 1024 * 1024 * 8 // 8MiB
-	testingContent := make([]byte, size)
-	if _, err := rand.Read(testingContent); err != nil {
-		t.Fatal(err)
-	}
-	testingFilename := "testing-123"
 	ctx := context.TODO()
+	dir, dirCleanup := testutils.TempDir(t)
+	defer dirCleanup()
+
 	// Setup a sink for the given args.
 	s, err := MakeExportStorage(ctx, args)
 	if err != nil {
@@ -50,52 +43,85 @@ func testExportToTarget(t *testing.T, args roachpb.ExportStorage) {
 		t.Fatalf("got %+v expected %+v", conf, args)
 	}
 
-	w, err := s.PutFile(ctx, testingFilename)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer w.Cleanup()
+	t.Run("simple round trip", func(t *testing.T) {
+		name := "somebytes"
+		sampleBytes := []byte("hello world")
 
-	// Write something to the local file specified by our sink.
-	t.Logf("writing %d bytes to %s", len(testingContent), w.LocalFile())
-	tmp, err := os.Create(w.LocalFile())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tmp.Close()
-	if _, err := tmp.Write(testingContent); err != nil {
-		t.Fatal(err)
-	}
+		if err := s.WriteFile(ctx, name, bytes.NewReader(sampleBytes)); err != nil {
+			t.Fatal(err)
+		}
 
-	// Let the sink finish its work (e.g. upload to storage).
-	if err := w.Finish(); err != nil {
-		t.Fatal(err)
-	}
+		r, err := s.ReadFile(ctx, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
 
-	t.Logf("verifying content of %s", testingFilename)
-	// Attempt to read (or fetch) the result.
-	res, err := s.ReadFile(ctx, testingFilename)
-	if err != nil {
-		t.Fatalf("Could not get reader for %s: %+v", testingFilename, err)
-	}
-	defer res.Close()
-	content, err := ioutil.ReadAll(res)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Verify the result contains what we wrote.
-	if !bytes.Equal(content, testingContent) {
-		t.Fatalf("wrong content")
-	}
-	if err := s.Delete(ctx, testingFilename); err != nil {
-		t.Fatal(err)
-	}
+		res, err := ioutil.ReadAll(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(res, sampleBytes) {
+			t.Fatalf("got %v expected %v", res, sampleBytes)
+		}
+		if err := s.Delete(ctx, name); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("8mb-tempfile", func(t *testing.T) {
+		const size = 1024 * 1024 * 8 // 8MiB
+		testingContent := make([]byte, size)
+		if _, err := rand.Read(testingContent); err != nil {
+			t.Fatal(err)
+		}
+		testingFilename := "testing-123"
+
+		temp, err := MakeExportFileTmpWriter(ctx, dir, s, testingFilename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Write something to the local file specified by our sink.
+		t.Logf("writing %d bytes to %s", len(testingContent), temp.LocalFile())
+		reopened, err := os.Create(temp.LocalFile())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		if _, err := reopened.Write(testingContent); err != nil {
+			t.Fatal(err)
+		}
+		reopened.Close()
+
+		if err := temp.Finish(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Logf("verifying content of %s", testingFilename)
+		// Attempt to read (or fetch) the result.
+		res, err := s.ReadFile(ctx, testingFilename)
+		if err != nil {
+			t.Fatalf("Could not get reader for %s: %+v", testingFilename, err)
+		}
+		defer res.Close()
+		content, err := ioutil.ReadAll(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Verify the result contains what we wrote.
+		if !bytes.Equal(content, testingContent) {
+			t.Fatalf("wrong content")
+		}
+		if err := s.Delete(ctx, testingFilename); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestPutLocal(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	p, cleanupFn := testutils.TempDir(t, 0)
+	p, cleanupFn := testutils.TempDir(t)
 	defer cleanupFn()
 
 	testExportToTarget(t, roachpb.ExportStorage{
@@ -105,7 +131,9 @@ func TestPutLocal(t *testing.T) {
 }
 
 func TestPutHttp(t *testing.T) {
-	tmp, dirCleanup := testutils.TempDir(t, 0)
+	defer leaktest.AfterTest(t)()
+
+	tmp, dirCleanup := testutils.TempDir(t)
 	defer dirCleanup()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -18,51 +18,102 @@ package distsqlrun
 
 import (
 	"io"
+	"time"
 
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
+
+// Version identifies the distsqlrun protocol version.
+//
+// This version is separate from the main CockroachDB version numbering; it is
+// only changed when the distsqlrun API changes.
+//
+// The planner populates the version in SetupFlowRequest.
+// A server only accepts requests with versions in the range MinAcceptedVersion
+// to Version.
+//
+// Is is possible used to provide a "window" of compatibility when new features are
+// added. Example:
+//  - we start with Version=1; distsqlrun servers with version 1 only accept
+//    requests with version 1.
+//  - a new distsqlrun feature is added; Version is bumped to 2. The
+//    planner does not yet use this feature by default; it still issues
+//    requests with version 1.
+//  - MinAcceptedVersion is still 1, i.e. servers with version 2
+//    accept both versions 1 and 2.
+//  - after an upgrade cycle, we can enable the feature in the planner,
+//    requiring version 2.
+//  - at some later point, we can choose to deprecate version 1 and have
+//    servers only accept versions >= 2 (by setting
+//    MinAcceptedVersion to 2).
+const Version = 3
+
+// MinAcceptedVersion is the oldest version that the server is
+// compatible with; see above.
+const MinAcceptedVersion = 3
+
+var noteworthyMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEWORTHY_DISTSQL_MEMORY_USAGE", 10*1024)
 
 // ServerConfig encompasses the configuration required to create a
 // DistSQLServer.
 type ServerConfig struct {
 	log.AmbientContext
 
-	DB           *client.DB
+	// DB is a handle to the cluster.
+	DB *client.DB
+	// FlowDB is the DB that flows should use for interacting with the database.
+	// This DB has to be set such that it bypasses the local TxnCoordSender. We
+	// want only the TxnCoordSender on the gateway to be involved with requests
+	// performed by DistSQL.
+	FlowDB       *client.DB
 	RPCContext   *rpc.Context
 	Stopper      *stop.Stopper
 	TestingKnobs TestingKnobs
+
+	ParentMemoryMonitor *mon.MemoryMonitor
+	Counter             *metric.Counter
+	Hist                *metric.Histogram
+	// NodeID is the id of the node on which this Server is running.
+	NodeID *base.NodeIDContainer
 }
 
 // ServerImpl implements the server for the distributed SQL APIs.
 type ServerImpl struct {
 	ServerConfig
-	evalCtx       parser.EvalContext
 	flowRegistry  *flowRegistry
 	flowScheduler *flowScheduler
+	memMonitor    mon.MemoryMonitor
+	regexpCache   *parser.RegexpCache
 }
 
 var _ DistSQLServer = &ServerImpl{}
 
 // NewServer instantiates a DistSQLServer.
-func NewServer(cfg ServerConfig) *ServerImpl {
+func NewServer(ctx context.Context, cfg ServerConfig) *ServerImpl {
 	ds := &ServerImpl{
-		ServerConfig: cfg,
-		evalCtx: parser.EvalContext{
-			ReCache: parser.NewRegexpCache(512),
-		},
+		ServerConfig:  cfg,
+		regexpCache:   parser.NewRegexpCache(512),
 		flowRegistry:  makeFlowRegistry(),
 		flowScheduler: newFlowScheduler(cfg.AmbientContext, cfg.Stopper),
+		memMonitor: mon.MakeMonitor("distsql",
+			cfg.Counter, cfg.Hist, -1 /* increment: use default block size */, noteworthyMemoryUsageBytes),
 	}
+	ds.memMonitor.Start(ctx, cfg.ParentMemoryMonitor, mon.BoundAccount{})
 	return ds
 }
 
@@ -76,6 +127,16 @@ func (ds *ServerImpl) Start() {
 func (ds *ServerImpl) setupFlow(
 	ctx context.Context, req *SetupFlowRequest, syncFlowConsumer RowReceiver,
 ) (context.Context, *Flow, error) {
+	if req.Version < MinAcceptedVersion ||
+		req.Version > Version {
+		err := errors.Errorf(
+			"version mismatch in flow request: %d; this node accepts %d through %d",
+			req.Version, MinAcceptedVersion, Version,
+		)
+		log.Warning(ctx, err)
+		return ctx, nil, err
+	}
+
 	const opName = "flow"
 	var sp opentracing.Span
 	if req.TraceContext == nil {
@@ -94,24 +155,52 @@ func (ds *ServerImpl) setupFlow(
 		}
 	}
 
+	nodeID := ds.ServerConfig.NodeID.Get()
+	if nodeID == 0 {
+		return nil, nil, errors.Errorf("setupFlow called before the NodeID was resolved")
+	}
+
+	monitor := mon.MakeMonitor("flow",
+		ds.Counter, ds.Hist, -1 /* use default block size */, noteworthyMemoryUsageBytes)
+	monitor.Start(ctx, &ds.memMonitor, mon.BoundAccount{})
+
+	location, err := sqlbase.TimeZoneStringToLocation(req.EvalContext.Location)
+	if err != nil {
+		tracing.FinishSpan(sp)
+		return ctx, nil, err
+	}
+	evalCtx := parser.EvalContext{
+		Location:   &location,
+		Database:   req.EvalContext.Database,
+		SearchPath: parser.SearchPath(req.EvalContext.SearchPath),
+		NodeID:     nodeID,
+		ReCache:    ds.regexpCache,
+		Mon:        &monitor,
+		Ctx: func() context.Context {
+			// TODO(andrei): This is wrong. Each processor should override Ctx with its
+			// own context.
+			return ctx
+		},
+	}
+	evalCtx.SetStmtTimestamp(time.Unix(0 /* sec */, req.EvalContext.StmtTimestampNanos))
+	evalCtx.SetTxnTimestamp(time.Unix(0 /* sec */, req.EvalContext.TxnTimestampNanos))
+	evalCtx.SetClusterTimestamp(req.EvalContext.ClusterTimestamp)
+
 	// TODO(radu): we should sanity check some of these fields (especially
 	// txnProto).
 	flowCtx := FlowCtx{
 		AmbientContext: ds.AmbientContext,
 		id:             req.Flow.FlowID,
-		// TODO(andrei): more fields from evalCtx need to be initialized (#13821).
-		evalCtx:      ds.evalCtx,
-		rpcCtx:       ds.RPCContext,
-		txnProto:     &req.Txn,
-		clientDB:     ds.DB,
-		testingKnobs: ds.TestingKnobs,
+		evalCtx:        evalCtx,
+		rpcCtx:         ds.RPCContext,
+		txnProto:       &req.Txn,
+		clientDB:       ds.DB,
+		remoteTxnDB:    ds.FlowDB,
+		testingKnobs:   ds.TestingKnobs,
+		nodeID:         nodeID,
 	}
+
 	ctx = flowCtx.AnnotateCtx(ctx)
-	flowCtx.evalCtx.Ctx = func() context.Context {
-		// TODO(andrei): This is wrong. Each processor should override Ctx with its
-		// own context.
-		return ctx
-	}
 
 	f := newFlow(flowCtx, ds.flowRegistry, syncFlowConsumer)
 	flowCtx.AddLogTagStr("f", f.id.Short())
@@ -154,7 +243,7 @@ func (ds *ServerImpl) RunSyncFlow(stream DistSQL_RunSyncFlowServer) error {
 	}
 	mbox.setFlowCtx(&f.FlowCtx)
 
-	if err := ds.Stopper.RunTask(func() {
+	if err := ds.Stopper.RunTask(ctx, func(ctx context.Context) {
 		f.waitGroup.Add(1)
 		mbox.start(ctx, &f.waitGroup)
 		f.Start(ctx, func() {})
@@ -172,11 +261,14 @@ func (ds *ServerImpl) SetupFlow(_ context.Context, req *SetupFlowRequest) (*Simp
 	// can't associate it with the flow.
 	ctx := ds.AnnotateCtx(context.TODO())
 	ctx, f, err := ds.setupFlow(ctx, req, nil)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		err = ds.flowScheduler.ScheduleFlow(ctx, f)
 	}
-	if err := ds.flowScheduler.ScheduleFlow(ctx, f); err != nil {
-		return nil, err
+	if err != nil {
+		// We return flow deployment errors in the response so that they are
+		// packaged correctly over the wire. If we return them directly to this
+		// function, they become part of an rpc error.
+		return &SimpleResponse{Error: NewError(err)}, nil
 	}
 	return &SimpleResponse{}, nil
 }
@@ -199,7 +291,7 @@ func (ds *ServerImpl) flowStreamInt(ctx context.Context, stream DistSQL_FlowStre
 		log.Infof(ctx, "connecting inbound stream %s/%d", flowID.Short(), streamID)
 	}
 	f, receiver, cleanup, err := ds.flowRegistry.ConnectInboundStream(
-		flowID, streamID, flowStreamDefaultTimeout)
+		ctx, flowID, streamID, flowStreamDefaultTimeout)
 	if err != nil {
 		return err
 	}

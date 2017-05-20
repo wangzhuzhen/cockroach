@@ -109,6 +109,7 @@ var (
 	// after it's been aborted.
 	LocalAbortCacheSuffix = []byte("abc-")
 	// LocalRangeFrozenStatusSuffix is the suffix for a frozen status.
+	// No longer used; exists only to reserve the key so we don't use it.
 	LocalRangeFrozenStatusSuffix = []byte("fzn-")
 	// LocalRangeLastGCSuffix is the suffix for the last GC.
 	LocalRangeLastGCSuffix = []byte("lgc-")
@@ -236,9 +237,6 @@ var (
 	// TimeseriesPrefix is the key prefix for all timeseries data.
 	TimeseriesPrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("tsd")))
 
-	// ReportUsagePrefix is the key prefix for node usage report times.
-	ReportUsagePrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("update-")))
-
 	// TableDataMin is the start of the range of table data keys.
 	TableDataMin = roachpb.Key(encoding.EncodeVarintAscending(nil, 0))
 	// TableDataMin is the end of the range of table data keys.
@@ -286,6 +284,7 @@ const (
 	DescriptorTableID = 3
 	UsersTableID      = 4
 	ZonesTableID      = 5
+	SettingsTableID   = 6
 
 	// Reserved IDs for other system tables. If you're adding a new system table,
 	// it probably belongs here.
@@ -295,4 +294,11 @@ const (
 	RangeEventTableID = 13
 	UITableID         = 14
 	JobsTableID       = 15
+
+	// Reserved IDs used to refer to certain parts of the system ranges that
+	// come before the system config span and user table ranges.
+	// NOTE: IDs must be <= MaxReservedDescID.
+	MetaRangesID       = 16
+	SystemRangesID     = 17
+	TimeseriesRangesID = 18
 )

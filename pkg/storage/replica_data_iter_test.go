@@ -38,7 +38,7 @@ func fakePrevKey(k []byte) roachpb.Key {
 
 	// When the byte array is empty.
 	if length == 0 {
-		panic(fmt.Sprint("cannot get the prev key of an empty key"))
+		panic("cannot get the prev key of an empty key")
 	}
 	if length > maxLen {
 		panic(fmt.Sprintf("test does not support key longer than %d characters: %q", maxLen, k))
@@ -117,7 +117,7 @@ func TestReplicaDataIteratorEmptyRange(t *testing.T) {
 		bootstrapMode: bootstrapRangeOnly,
 	}
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	tc.Start(t, stopper)
 
 	// Adjust the range descriptor to avoid existing data such as meta
@@ -128,7 +128,12 @@ func TestReplicaDataIteratorEmptyRange(t *testing.T) {
 
 	iter := NewReplicaDataIterator(&newDesc, tc.repl.store.Engine(), false /* !replicatedOnly */)
 	defer iter.Close()
-	for ; iter.Valid(); iter.Next() {
+	for ; ; iter.Next() {
+		if ok, err := iter.Valid(); err != nil {
+			t.Fatal(err)
+		} else if !ok {
+			break
+		}
 		t.Errorf("unexpected: %s", iter.Key())
 	}
 }
@@ -149,7 +154,7 @@ func TestReplicaDataIterator(t *testing.T) {
 		bootstrapMode: bootstrapRangeOnly,
 	}
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	tc.StartWithStoreConfig(t, stopper, cfg)
 
 	// See notes in EmptyRange test method for adjustment to descriptor.
@@ -178,9 +183,11 @@ func TestReplicaDataIterator(t *testing.T) {
 	iter := NewReplicaDataIterator(tc.repl.Desc(), tc.repl.store.Engine(), false /* !replicatedOnly */)
 	defer iter.Close()
 	i := 0
-	for ; iter.Valid(); iter.Next() {
-		if err := iter.Error(); err != nil {
+	for ; ; iter.Next() {
+		if ok, err := iter.Valid(); err != nil {
 			t.Fatal(err)
+		} else if !ok {
+			break
 		}
 		if i >= len(curKeys) {
 			t.Fatal("there are more keys in the iteration than expected")
@@ -200,9 +207,11 @@ func TestReplicaDataIterator(t *testing.T) {
 	unreplicatedPrefix := keys.MakeRangeIDUnreplicatedPrefix(tc.repl.RangeID)
 	iter = NewReplicaDataIterator(tc.repl.Desc(), tc.repl.store.Engine(), true /* replicatedOnly */)
 	defer iter.Close()
-	for ; iter.Valid(); iter.Next() {
-		if err := iter.Error(); err != nil {
+	for ; ; iter.Next() {
+		if ok, err := iter.Valid(); err != nil {
 			t.Fatal(err)
+		} else if !ok {
+			break
 		}
 		if bytes.HasPrefix(iter.Key().Key, unreplicatedPrefix) {
 			t.Fatalf("unexpected unreplicated key: %s", iter.Key().Key)
@@ -215,14 +224,19 @@ func TestReplicaDataIterator(t *testing.T) {
 	}
 	iter = NewReplicaDataIterator(tc.repl.Desc(), tc.repl.store.Engine(), false /* !replicatedOnly */)
 	defer iter.Close()
-	if iter.Valid() {
+	if ok, err := iter.Valid(); err != nil {
+		t.Fatal(err)
+	} else if ok {
 		// If the range is destroyed, only a tombstone key should be there.
 		k1 := iter.Key().Key
 		if tombstoneKey := keys.RaftTombstoneKey(tc.repl.RangeID); !bytes.Equal(k1, tombstoneKey) {
 			t.Errorf("expected a tombstone key %q, but found %q", tombstoneKey, k1)
 		}
 
-		if iter.Next(); iter.Valid() {
+		iter.Next()
+		if ok, err := iter.Valid(); err != nil {
+			t.Fatal(err)
+		} else if ok {
 			t.Errorf("expected a destroyed replica to have only a tombstone key, but found more")
 		}
 	} else {
@@ -240,7 +254,13 @@ func TestReplicaDataIterator(t *testing.T) {
 		iter = NewReplicaDataIterator(test.r.Desc(), test.r.store.Engine(), false /* !replicatedOnly */)
 		defer iter.Close()
 		i = 0
-		for ; iter.Valid(); iter.Next() {
+		for ; ; iter.Next() {
+			if ok, err := iter.Valid(); err != nil {
+				t.Fatal(err)
+			} else if !ok {
+				break
+			}
+
 			k1, ts1 := iter.Key().Key, iter.Key().Timestamp
 			if bytes.HasPrefix(k1, keys.StatusPrefix) {
 				// Some data is written into the system prefix by Store.BootstrapRange,

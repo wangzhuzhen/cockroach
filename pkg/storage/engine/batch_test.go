@@ -18,7 +18,6 @@ package engine
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"reflect"
 	"sync/atomic"
@@ -26,6 +25,7 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
@@ -54,7 +54,7 @@ func mvccKey(k interface{}) MVCCKey {
 
 func testBatchBasics(t *testing.T, writeOnly bool, commit func(e Engine, b Batch) error) {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -141,90 +141,34 @@ func TestBatchRepr(t *testing.T) {
 	testBatchBasics(t, false /* writeOnly */, func(e Engine, b Batch) error {
 		repr := b.Repr()
 
-		// Simple sanity checks about the format of the batch representation. This
-		// is inefficient decoding code. Do not move outside of test code.
-		buf := bytes.NewReader(repr)
-		var seq uint64
-		var count uint32
-		if err := binary.Read(buf, binary.LittleEndian, &seq); err != nil {
-			t.Fatal(err)
+		r, err := NewRocksDBBatchReader(repr)
+		if err != nil {
+			t.Fatalf("%+v", err)
 		}
-		if seq != 0 {
-			// The sequence number is set when the batch is written.
-			t.Fatalf("bad sequence: expected 0, but found %d", seq)
-		}
-		if err := binary.Read(buf, binary.LittleEndian, &count); err != nil {
-			t.Fatal(err)
-		}
-		if expected := uint32(3); expected != count {
+		if count, expected := r.Count(), 3; count != expected {
 			t.Fatalf("bad count: expected %d, but found %d", expected, count)
 		}
 
-		const (
-			// These constants come from rocksdb/db/dbformat.h.
-			TypeDeletion = 0x0
-			TypeValue    = 0x1
-			TypeMerge    = 0x2
-			// TypeLogData                    = 0x3
-			// TypeColumnFamilyDeletion       = 0x4
-			// TypeColumnFamilyValue          = 0x5
-			// TypeColumnFamilyMerge          = 0x6
-			// TypeSingleDeletion             = 0x7
-			// TypeColumnFamilySingleDeletion = 0x8
-		)
-
-		varstring := func(buf *bytes.Reader) (string, error) {
-			n, err := binary.ReadUvarint(buf)
-			if err != nil {
-				return "", err
-			}
-			s := make([]byte, n)
-			c, err := buf.Read(s)
-			if err != nil {
-				return "", err
-			}
-			if c != int(n) {
-				return "", fmt.Errorf("expected %d, but found %d", n, c)
-			}
-			return string(s), nil
-		}
-
 		var ops []string
-		for i := uint32(0); i < count; i++ {
-			typ, err := buf.ReadByte()
-			if err != nil {
-				t.Fatal(err)
+		for i := 0; i < r.Count(); i++ {
+			if ok := r.Next(); !ok {
+				t.Fatalf("%d: unexpected end of batch", i)
 			}
-			switch typ {
-			case TypeDeletion:
-				k, err := varstring(buf)
-				if err != nil {
-					t.Fatal(err)
-				}
-				ops = append(ops, fmt.Sprintf("delete(%s)", k))
-			case TypeValue:
-				k, err := varstring(buf)
-				if err != nil {
-					t.Fatal(err)
-				}
-				v, err := varstring(buf)
-				if err != nil {
-					t.Fatal(err)
-				}
-				ops = append(ops, fmt.Sprintf("put(%s,%s)", k, v))
-			case TypeMerge:
-				k, err := varstring(buf)
-				if err != nil {
-					t.Fatal(err)
-				}
+			switch r.BatchType() {
+			case BatchTypeDeletion:
+				ops = append(ops, fmt.Sprintf("delete(%s)", string(r.UnsafeKey())))
+			case BatchTypeValue:
+				ops = append(ops, fmt.Sprintf("put(%s,%s)", string(r.UnsafeKey()), string(r.UnsafeValue())))
+			case BatchTypeMerge:
 				// The merge value is a protobuf and not easily displayable.
-				if _, err = varstring(buf); err != nil {
-					t.Fatal(err)
-				}
-				ops = append(ops, fmt.Sprintf("merge(%s)", k))
-			default:
-				t.Fatalf("%d: unexpected type %d", i, typ)
+				ops = append(ops, fmt.Sprintf("merge(%s)", string(r.UnsafeKey())))
 			}
+		}
+		if err != nil {
+			t.Fatalf("unexpected err during iteration: %+v", err)
+		}
+		if ok := r.Next(); ok {
+			t.Errorf("expected end of batch")
 		}
 
 		// The keys in the batch have the internal MVCC encoding applied which for
@@ -250,7 +194,7 @@ func TestWriteBatchBasics(t *testing.T) {
 func TestApplyBatchRepr(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -312,7 +256,7 @@ func TestApplyBatchRepr(t *testing.T) {
 func TestBatchGet(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -367,7 +311,7 @@ func compareMergedValues(t *testing.T, result, expected []byte) bool {
 func TestBatchMerge(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -425,7 +369,7 @@ func TestBatchMerge(t *testing.T) {
 func TestBatchProto(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -473,7 +417,7 @@ func TestBatchProto(t *testing.T) {
 func TestBatchScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -567,7 +511,7 @@ func TestBatchScan(t *testing.T) {
 func TestBatchScanWithDelete(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -596,7 +540,7 @@ func TestBatchScanWithDelete(t *testing.T) {
 func TestBatchScanMaxWithDeleted(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -631,7 +575,7 @@ func TestBatchScanMaxWithDeleted(t *testing.T) {
 func TestBatchConcurrency(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -667,7 +611,7 @@ func TestBatchBuilder(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -716,7 +660,7 @@ func TestBatchBuilderStress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -782,7 +726,7 @@ func TestBatchDistinct(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -824,8 +768,8 @@ func TestBatchDistinct(t *testing.T) {
 	// batch.
 	iter := distinct.NewIterator(false)
 	iter.Seek(mvccKey("a"))
-	if !iter.Valid() {
-		t.Fatalf("expected iterator to be valid")
+	if ok, err := iter.Valid(); !ok {
+		t.Fatalf("expected iterator to be valid; err=%v", err)
 	}
 	if string(iter.Key().Key) != "a" {
 		t.Fatalf("expected a, but got %s", iter.Key())
@@ -854,7 +798,7 @@ func TestWriteOnlyBatchDistinct(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -875,8 +819,8 @@ func TestWriteOnlyBatchDistinct(t *testing.T) {
 	// to the write-only batch.
 	iter := distinct.NewIterator(false)
 	iter.Seek(mvccKey("a"))
-	if !iter.Valid() {
-		t.Fatalf("expected iterator to be valid")
+	if ok, err := iter.Valid(); !ok {
+		t.Fatalf("expected iterator to be valid, err=%v", err)
 	}
 	if string(iter.Key().Key) != "b" {
 		t.Fatalf("expected b, but got %s", iter.Key())
@@ -898,7 +842,7 @@ func TestBatchDistinctPanics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -939,7 +883,7 @@ func TestBatchIteration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	defer e.Close()
 
@@ -963,8 +907,8 @@ func TestBatchIteration(t *testing.T) {
 
 	// Forward iteration
 	iter.Seek(k1)
-	if !iter.Valid() {
-		t.Fatal(iter.Error())
+	if ok, err := iter.Valid(); !ok {
+		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(iter.Key(), k1) {
 		t.Fatalf("expected %s, got %s", k1, iter.Key())
@@ -973,8 +917,8 @@ func TestBatchIteration(t *testing.T) {
 		t.Fatalf("expected %s, got %s", v1, iter.Value())
 	}
 	iter.Next()
-	if !iter.Valid() {
-		t.Fatal(iter.Error())
+	if ok, err := iter.Valid(); !ok {
+		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(iter.Key(), k2) {
 		t.Fatalf("expected %s, got %s", k2, iter.Key())
@@ -983,14 +927,16 @@ func TestBatchIteration(t *testing.T) {
 		t.Fatalf("expected %s, got %s", v2, iter.Value())
 	}
 	iter.Next()
-	if iter.Valid() {
+	if ok, err := iter.Valid(); err != nil {
+		t.Fatal(err)
+	} else if ok {
 		t.Fatalf("expected invalid, got valid at key %s", iter.Key())
 	}
 
 	// SeekReverse works, but reverse iteration is not supported.
 	iter.SeekReverse(k2)
-	if !iter.Valid() {
-		t.Fatal(iter.Error())
+	if ok, err := iter.Valid(); !ok {
+		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(iter.Key(), k2) {
 		t.Fatalf("expected %s, got %s", k2, iter.Key())
@@ -999,11 +945,10 @@ func TestBatchIteration(t *testing.T) {
 		t.Fatalf("expected %s, got %s", v2, iter.Value())
 	}
 	iter.Prev()
-	if iter.Valid() {
+	if ok, err := iter.Valid(); ok {
 		t.Fatalf("expected invalid, got valid at key %s", iter.Key())
-	}
-	if !testutils.IsError(iter.Error(), "Prev\\(\\) not supported") {
-		t.Fatalf("expected 'Prev() not supported', got %s", iter.Error())
+	} else if !testutils.IsError(err, "Prev\\(\\) not supported") {
+		t.Fatalf("expected 'Prev() not supported', got %s", err)
 	}
 }
 
@@ -1013,7 +958,7 @@ func TestBatchCombine(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	e := NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(e)
 
@@ -1057,5 +1002,44 @@ func TestBatchCombine(t *testing.T) {
 		if err := <-errs; err != nil {
 			t.Error(err)
 		}
+	}
+}
+
+func TestDecodeKey(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	e := NewInMem(roachpb.Attributes{}, 1<<20)
+	defer e.Close()
+
+	tests := []MVCCKey{
+		{Key: []byte{}},
+		{Key: []byte("foo")},
+		{Key: []byte("foo"), Timestamp: hlc.Timestamp{WallTime: 1}},
+		{Key: []byte("foo"), Timestamp: hlc.Timestamp{WallTime: 1, Logical: 1}},
+	}
+	for _, test := range tests {
+		t.Run(test.String(), func(t *testing.T) {
+			b := e.NewBatch()
+			defer b.Close()
+			if err := b.Put(test, nil); err != nil {
+				t.Fatalf("%+v", err)
+			}
+			repr := b.Repr()
+
+			r, err := NewRocksDBBatchReader(repr)
+			if err != nil {
+				t.Fatalf("%+v", err)
+			}
+			if !r.Next() {
+				t.Fatalf("could not get the first entry: %+v", r.Error())
+			}
+			decodedKey, err := DecodeKey(r.UnsafeKey())
+			if err != nil {
+				t.Fatalf("unexpected err: %+v", err)
+			}
+			if !reflect.DeepEqual(test, decodedKey) {
+				t.Errorf("expected %+v got %+v", test, decodedKey)
+			}
+		})
 	}
 }

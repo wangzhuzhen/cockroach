@@ -19,7 +19,9 @@ package distsqlrun
 import (
 	"strings"
 	"sync"
+	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -32,7 +34,11 @@ import (
 // the given aggregate function when applied on the given type.
 func GetAggregateInfo(
 	fn AggregatorSpec_Func, inputType sqlbase.ColumnType,
-) (aggregateConstructor func() parser.AggregateFunc, returnType sqlbase.ColumnType, err error) {
+) (
+	aggregateConstructor func(*parser.EvalContext) parser.AggregateFunc,
+	returnType sqlbase.ColumnType,
+	err error,
+) {
 	if fn == AggregatorSpec_IDENT {
 		return parser.NewIdentAggregate, inputType, nil
 	}
@@ -43,8 +49,8 @@ func GetAggregateInfo(
 		for _, t := range b.Types.Types() {
 			if inputDatumType.Equivalent(t) {
 				// Found!
-				constructAgg := func() parser.AggregateFunc {
-					return b.AggregateFunc([]parser.Type{inputDatumType})
+				constructAgg := func(evalCtx *parser.EvalContext) parser.AggregateFunc {
+					return b.AggregateFunc([]parser.Type{inputDatumType}, evalCtx)
 				}
 				return constructAgg, sqlbase.DatumTypeToColumnType(b.FixedReturnType()), nil
 			}
@@ -69,9 +75,12 @@ type aggregator struct {
 	outputTypes []sqlbase.ColumnType
 	datumAlloc  sqlbase.DatumAlloc
 
-	groupCols columns
-	inputCols columns
-	buckets   map[string]struct{} // The set of bucket keys.
+	bucketsAcc mon.BoundAccount
+
+	groupCols    columns
+	aggregations []AggregatorSpec_Aggregation
+
+	buckets map[string]struct{} // The set of bucket keys.
 
 	out procOutputHelper
 }
@@ -86,19 +95,15 @@ func newAggregator(
 	output RowReceiver,
 ) (*aggregator, error) {
 	ag := &aggregator{
-		flowCtx:     flowCtx,
-		input:       input,
-		buckets:     make(map[string]struct{}),
-		inputCols:   make(columns, len(spec.Aggregations)),
-		funcs:       make([]*aggregateFuncHolder, len(spec.Aggregations)),
-		outputTypes: make([]sqlbase.ColumnType, len(spec.Aggregations)),
-		groupCols:   make(columns, len(spec.GroupCols)),
+		flowCtx:      flowCtx,
+		input:        input,
+		groupCols:    spec.GroupCols,
+		aggregations: spec.Aggregations,
+		buckets:      make(map[string]struct{}),
+		funcs:        make([]*aggregateFuncHolder, len(spec.Aggregations)),
+		outputTypes:  make([]sqlbase.ColumnType, len(spec.Aggregations)),
+		bucketsAcc:   flowCtx.evalCtx.Mon.MakeBoundAccount(),
 	}
-
-	for i, aggInfo := range spec.Aggregations {
-		ag.inputCols[i] = aggInfo.ColIdx
-	}
-	copy(ag.groupCols, spec.GroupCols)
 
 	// Loop over the select expressions and extract any aggregate functions --
 	// non-aggregation functions are replaced with parser.NewIdentAggregate,
@@ -107,6 +112,21 @@ func newAggregator(
 	// the functions which need to be fed values.
 	inputTypes := input.Types()
 	for i, aggInfo := range spec.Aggregations {
+		if aggInfo.ColIdx >= uint32(len(inputTypes)) {
+			return nil, errors.Errorf("ColIdx out of range (%d)", aggInfo.ColIdx)
+		}
+		if aggInfo.FilterColIdx != nil {
+			col := *aggInfo.FilterColIdx
+			if col >= uint32(len(inputTypes)) {
+				return nil, errors.Errorf("FilterColIdx out of range (%d)", col)
+			}
+			t := inputTypes[col].Kind
+			if t != sqlbase.ColumnType_BOOL && t != sqlbase.ColumnType_NULL {
+				return nil, errors.Errorf(
+					"filter column %d must be of boolean type, not %s", *aggInfo.FilterColIdx, t,
+				)
+			}
+		}
 		aggConstructor, retType, err := GetAggregateInfo(aggInfo.Func, inputTypes[aggInfo.ColIdx])
 		if err != nil {
 			return nil, err
@@ -131,6 +151,14 @@ func (ag *aggregator) Run(ctx context.Context, wg *sync.WaitGroup) {
 	if wg != nil {
 		defer wg.Done()
 	}
+	defer ag.bucketsAcc.Close(ctx)
+	defer func() {
+		for _, f := range ag.funcs {
+			for _, aggFunc := range f.buckets {
+				aggFunc.Close(ctx)
+			}
+		}
+	}()
 
 	ctx = log.WithLogTag(ctx, "Agg", nil)
 	ctx, span := tracing.ChildSpan(ctx, "aggregator")
@@ -159,7 +187,17 @@ func (ag *aggregator) Run(ctx context.Context, wg *sync.WaitGroup) {
 	row := make(sqlbase.EncDatumRow, len(ag.funcs))
 	for bucket := range ag.buckets {
 		for i, f := range ag.funcs {
-			row[i] = sqlbase.DatumToEncDatum(ag.outputTypes[i], f.get(bucket))
+			result, err := f.get(bucket)
+			if err != nil {
+				DrainAndClose(ctx, ag.out.output, err, ag.input)
+				return
+			}
+			if result == nil {
+				// Special case useful when this is a local stage of a distributed
+				// aggregation.
+				result = parser.DNull
+			}
+			row[i] = sqlbase.DatumToEncDatum(ag.outputTypes[i], result)
 		}
 
 		consumerDone = !emitHelper(ctx, &ag.out, row, ProducerMetadata{})
@@ -182,8 +220,11 @@ func (ag *aggregator) Run(ctx context.Context, wg *sync.WaitGroup) {
 func (ag *aggregator) accumulateRows(ctx context.Context) (err error) {
 	cleanupRequired := true
 	defer func() {
-		if err != nil && cleanupRequired {
-			DrainAndClose(ctx, ag.out.output, err, ag.input)
+		if err != nil {
+			log.Infof(ctx, "accumulate error %s", err)
+			if cleanupRequired {
+				DrainAndClose(ctx, ag.out.output, err, ag.input)
+			}
 		}
 	}()
 
@@ -217,13 +258,26 @@ func (ag *aggregator) accumulateRows(ctx context.Context) (err error) {
 			return err
 		}
 
+		if err := ag.bucketsAcc.Grow(ctx, int64(len(encoded))); err != nil {
+			return err
+		}
+
 		ag.buckets[string(encoded)] = struct{}{}
 		// Feed the func holders for this bucket the non-grouping datums.
-		for i, colIdx := range ag.inputCols {
-			if err := row[colIdx].EnsureDecoded(&ag.datumAlloc); err != nil {
+		for i, a := range ag.aggregations {
+			if a.FilterColIdx != nil {
+				if err := row[*a.FilterColIdx].EnsureDecoded(&ag.datumAlloc); err != nil {
+					return err
+				}
+				if row[*a.FilterColIdx].Datum != parser.DBoolTrue {
+					// This row doesn't contribute to this aggregation.
+					continue
+				}
+			}
+			if err := row[a.ColIdx].EnsureDecoded(&ag.datumAlloc); err != nil {
 				return err
 			}
-			if err := ag.funcs[i].add(encoded, row[colIdx].Datum); err != nil {
+			if err := ag.funcs[i].add(ctx, encoded, row[a.ColIdx].Datum); err != nil {
 				return err
 			}
 		}
@@ -232,23 +286,27 @@ func (ag *aggregator) accumulateRows(ctx context.Context) (err error) {
 }
 
 type aggregateFuncHolder struct {
-	create  func() parser.AggregateFunc
-	group   *aggregator
-	buckets map[string]parser.AggregateFunc
-	seen    map[string]struct{}
+	create        func(*parser.EvalContext) parser.AggregateFunc
+	group         *aggregator
+	buckets       map[string]parser.AggregateFunc
+	seen          map[string]struct{}
+	bucketsMemAcc *mon.BoundAccount
 }
 
+const sizeOfAggregateFunc = int64(unsafe.Sizeof(parser.AggregateFunc(nil)))
+
 func (ag *aggregator) newAggregateFuncHolder(
-	create func() parser.AggregateFunc,
+	create func(*parser.EvalContext) parser.AggregateFunc,
 ) *aggregateFuncHolder {
 	return &aggregateFuncHolder{
-		create:  create,
-		group:   ag,
-		buckets: make(map[string]parser.AggregateFunc),
+		create:        create,
+		group:         ag,
+		buckets:       make(map[string]parser.AggregateFunc),
+		bucketsMemAcc: &ag.bucketsAcc,
 	}
 }
 
-func (a *aggregateFuncHolder) add(bucket []byte, d parser.Datum) error {
+func (a *aggregateFuncHolder) add(ctx context.Context, bucket []byte, d parser.Datum) error {
 	if a.seen != nil {
 		encoded, err := sqlbase.EncodeDatum(bucket, d)
 		if err != nil {
@@ -258,23 +316,35 @@ func (a *aggregateFuncHolder) add(bucket []byte, d parser.Datum) error {
 			// skip
 			return nil
 		}
+		if err := a.bucketsMemAcc.Grow(ctx, int64(len(encoded))); err != nil {
+			return err
+		}
 		a.seen[string(encoded)] = struct{}{}
 	}
 
 	impl, ok := a.buckets[string(bucket)]
 	if !ok {
-		impl = a.create()
+		// TODO(radu): we should account for the size of impl (this needs to be done
+		// in each aggregate constructor).
+		impl = a.create(&a.group.flowCtx.evalCtx)
+		usage := int64(len(bucket))
+		usage += sizeOfAggregateFunc
+		// TODO(radu): this model of each func having a map of buckets (one per
+		// group) for each func plus a global map is very wasteful. We should have a
+		// single map that stores all the AggregateFuncs.
+		if err := a.bucketsMemAcc.Grow(ctx, usage); err != nil {
+			return err
+		}
 		a.buckets[string(bucket)] = impl
 	}
 
-	impl.Add(&a.group.flowCtx.evalCtx, d)
-	return nil
+	return impl.Add(ctx, d)
 }
 
-func (a *aggregateFuncHolder) get(bucket string) parser.Datum {
+func (a *aggregateFuncHolder) get(bucket string) (parser.Datum, error) {
 	found, ok := a.buckets[bucket]
 	if !ok {
-		found = a.create()
+		found = a.create(&a.group.flowCtx.evalCtx)
 	}
 
 	return found.Result()
@@ -282,7 +352,9 @@ func (a *aggregateFuncHolder) get(bucket string) parser.Datum {
 
 // encode returns the encoding for the grouping columns, this is then used as
 // our group key to determine which bucket to add to.
-func (ag *aggregator) encode(appendTo []byte, row sqlbase.EncDatumRow) (encoding []byte, err error) {
+func (ag *aggregator) encode(
+	appendTo []byte, row sqlbase.EncDatumRow,
+) (encoding []byte, err error) {
 	for _, colIdx := range ag.groupCols {
 		appendTo, err = row[colIdx].Encode(&ag.datumAlloc, sqlbase.DatumEncoding_VALUE, appendTo)
 		if err != nil {

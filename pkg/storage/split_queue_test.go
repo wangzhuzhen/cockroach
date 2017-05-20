@@ -23,7 +23,6 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
@@ -38,42 +37,38 @@ func TestSplitQueueShouldQueue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	tc.Start(t, stopper)
 
 	// Set zone configs.
 	config.TestingSetZoneConfig(2000, config.ZoneConfig{RangeMaxBytes: 32 << 20})
 	config.TestingSetZoneConfig(2002, config.ZoneConfig{RangeMaxBytes: 32 << 20})
 
-	// Despite faking the zone configs, we still need to have a gossip entry.
-	if err := tc.gossip.AddInfoProto(gossip.KeySystemConfig, &config.SystemConfig{}, 0); err != nil {
-		t.Fatal(err)
-	}
-
 	testCases := []struct {
 		start, end roachpb.RKey
 		bytes      int64
+		maxBytes   int64
 		shouldQ    bool
 		priority   float64
 	}{
 		// No intersection, no bytes.
-		{roachpb.RKeyMin, roachpb.RKey("/"), 0, false, 0},
+		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 0, 64 << 20, false, 0},
 		// Intersection in zone, no bytes.
-		{keys.MakeTablePrefix(2001), roachpb.RKeyMax, 0, true, 1},
+		{keys.MakeTablePrefix(2001), roachpb.RKeyMax, 0, 64 << 20, true, 1},
 		// Already split at largest ID.
-		{keys.MakeTablePrefix(2002), roachpb.RKeyMax, 0, false, 0},
+		{keys.MakeTablePrefix(2002), roachpb.RKeyMax, 0, 32 << 20, false, 0},
 		// Multiple intersections, no bytes.
-		{roachpb.RKeyMin, roachpb.RKeyMax, 0, true, 1},
+		{roachpb.RKeyMin, roachpb.RKeyMax, 0, 64 << 20, true, 1},
 		// No intersection, max bytes.
-		{roachpb.RKeyMin, roachpb.RKey("/"), 64 << 20, false, 0},
+		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 64 << 20, 64 << 20, false, 0},
 		// No intersection, max bytes+1.
-		{roachpb.RKeyMin, roachpb.RKey("/"), 64<<20 + 1, true, 1},
+		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 64<<20 + 1, 64 << 20, true, 1},
 		// No intersection, max bytes * 2.
-		{roachpb.RKeyMin, roachpb.RKey("/"), 64 << 21, true, 2},
+		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 64 << 21, 64 << 20, true, 2},
 		// Intersection, max bytes +1.
-		{keys.MakeTablePrefix(2000), roachpb.RKeyMax, 32<<20 + 1, true, 2},
+		{keys.MakeTablePrefix(2000), roachpb.RKeyMax, 32<<20 + 1, 32 << 20, true, 2},
 		// Split needed at table boundary, but no zone config.
-		{keys.MakeTablePrefix(2001), roachpb.RKeyMax, 32<<20 + 1, true, 1},
+		{keys.MakeTablePrefix(2001), roachpb.RKeyMax, 32<<20 + 1, 64 << 20, true, 1},
 	}
 
 	splitQ := newSplitQueue(tc.store, nil, tc.gossip)
@@ -84,25 +79,23 @@ func TestSplitQueueShouldQueue(t *testing.T) {
 	}
 
 	for i, test := range testCases {
-		func() {
-			// Hold lock throughout to reduce chance of random commands leading
-			// to inconsistent state.
-			tc.repl.mu.Lock()
-			defer tc.repl.mu.Unlock()
-			ms := enginepb.MVCCStats{KeyBytes: test.bytes}
-			if err := tc.repl.stateLoader.setMVCCStats(context.Background(), tc.repl.store.Engine(), &ms); err != nil {
-				t.Fatal(err)
-			}
-			tc.repl.mu.state.Stats = ms
-		}()
-
+		// Create a replica for testing that is not hooked up to the store. This
+		// ensures that the store won't be mucking with our replica concurrently
+		// during testing (e.g. via the system config gossip update).
 		copy := *tc.repl.Desc()
 		copy.StartKey = test.start
 		copy.EndKey = test.end
-		if err := tc.repl.setDesc(&copy); err != nil {
+		repl, err := NewReplica(&copy, tc.store, 0)
+		if err != nil {
 			t.Fatal(err)
 		}
-		shouldQ, priority := splitQ.shouldQueue(context.TODO(), hlc.Timestamp{}, tc.repl, cfg)
+
+		repl.mu.Lock()
+		repl.mu.state.Stats = enginepb.MVCCStats{KeyBytes: test.bytes}
+		repl.mu.maxBytes = test.maxBytes
+		repl.mu.Unlock()
+
+		shouldQ, priority := splitQ.shouldQueue(context.TODO(), hlc.Timestamp{}, repl, cfg)
 		if shouldQ != test.shouldQ {
 			t.Errorf("%d: should queue expected %t; got %t", i, test.shouldQ, shouldQ)
 		}

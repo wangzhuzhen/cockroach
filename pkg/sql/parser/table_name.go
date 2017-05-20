@@ -38,13 +38,11 @@ type NormalizableTableName struct {
 
 // Format implements the NodeFormatter interface.
 func (nt NormalizableTableName) Format(buf *bytes.Buffer, f FmtFlags) {
-	tnr := nt.TableNameReference
-	if f.tableNameNormalizer != nil {
-		if tn := f.tableNameNormalizer(&nt); tn != nil {
-			tnr = tn
-		}
+	if f.tableNameFormatter != nil {
+		f.tableNameFormatter(&nt, buf, f)
+	} else {
+		FormatNode(buf, f, nt.TableNameReference)
 	}
-	tnr.Format(buf, f)
 }
 func (nt NormalizableTableName) String() string { return AsString(nt) }
 
@@ -111,7 +109,7 @@ type TableName struct {
 
 // Format implements the NodeFormatter interface.
 func (t *TableName) Format(buf *bytes.Buffer, f FmtFlags) {
-	if !t.DBNameOriginallyOmitted || f.tableNameNormalizer != nil {
+	if !t.DBNameOriginallyOmitted || f.tableNameFormatter != nil {
 		FormatNode(buf, f, t.DatabaseName)
 		buf.WriteByte('.')
 	}
@@ -233,13 +231,19 @@ func (t TableNameReferences) Format(buf *bytes.Buffer, f FmtFlags) {
 // TableNameWithIndex represents a "table@index", used in statements that
 // specifically refer to an index.
 type TableNameWithIndex struct {
-	Table       NormalizableTableName
-	Index       Name
+	Table NormalizableTableName
+	Index Name
+
+	// SearchTable indicates that we have just an index (no table name); we will
+	// need to search for a table that has an index with the given name.
+	//
+	// To allow schema-qualified index names in this case, the index is actually
+	// specified in Table as the table name, and Index is empty.
 	SearchTable bool
 }
 
 // Format implements the NodeFormatter interface.
-func (n *TableNameWithIndex) Format(buf *bytes.Buffer, f FmtFlags) {
+func (n TableNameWithIndex) Format(buf *bytes.Buffer, f FmtFlags) {
 	FormatNode(buf, f, n.Table)
 	if !n.SearchTable {
 		buf.WriteByte('@')

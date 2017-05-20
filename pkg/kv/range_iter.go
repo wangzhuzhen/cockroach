@@ -82,6 +82,10 @@ func (ri *RangeIterator) LeaseHolder(ctx context.Context) (roachpb.ReplicaDescri
 	if !ri.Valid() {
 		panic(ri.Error())
 	}
+	// TODO(andrei): The leaseHolderCache might have a replica that's not part of
+	// the RangeDescriptor that the iterator is currently positioned on. IOW, the
+	// leaseHolderCache can be inconsistent with the RangeDescriptorCache, and
+	// with reality. We should attempt to fix-up caches when this is encountered.
 	return ri.ds.leaseHolderCache.Lookup(ctx, ri.Desc().RangeID)
 }
 
@@ -151,12 +155,22 @@ func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir Sca
 	ri.pErr = nil  // clear any prior error
 	ri.key = key   // set the key
 
+	if (scanDir == Ascending && key.Equal(roachpb.RKeyMax)) ||
+		(scanDir == Descending && key.Equal(roachpb.RKeyMin)) {
+		ri.pErr = roachpb.NewErrorf("RangeIterator seek to invalid key %s", key)
+		return
+	}
+
 	// Retry loop for looking up next range in the span. The retry loop
 	// deals with retryable range descriptor lookups.
 	for r := retry.StartWithCtx(ctx, ri.ds.rpcRetryOptions); r.Next(); {
 		var err error
 		ri.desc, ri.token, err = ri.ds.getDescriptor(
 			ctx, ri.key, ri.token, ri.scanDir == Descending)
+
+		if log.V(2) {
+			log.Infof(ctx, "key: %s, desc: %s err: %v", ri.key, ri.desc, err)
+		}
 
 		// getDescriptor may fail retryably if, for example, the first
 		// range isn't available via Gossip. Assume that all errors at
@@ -186,6 +200,9 @@ func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir Sca
 			// On addressing errors, don't backoff; retry immediately.
 			r.Reset()
 			continue
+		}
+		if log.V(2) {
+			log.Infof(ctx, "returning; key: %s, desc: %s", ri.key, ri.desc)
 		}
 		return
 	}

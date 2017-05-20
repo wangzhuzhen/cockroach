@@ -45,8 +45,20 @@ func (ie InternalExecutor) ExecuteStatementInTransaction(
 ) (int, error) {
 	p := makeInternalPlanner(opName, txn, security.RootUser, ie.LeaseManager.memMetrics)
 	defer finishInternalPlanner(p)
-	p.session.leaseMgr = ie.LeaseManager
+	p.session.leases.leaseMgr = ie.LeaseManager
 	return p.exec(ctx, statement, qargs...)
+}
+
+// QueryRowInTransaction executes the supplied SQL statement as part of the
+// supplied transaction and returns the result. Statements are currently
+// executed as the root user.
+func (ie InternalExecutor) QueryRowInTransaction(
+	ctx context.Context, opName string, txn *client.Txn, statement string, qargs ...interface{},
+) (parser.Datums, error) {
+	p := makeInternalPlanner(opName, txn, security.RootUser, ie.LeaseManager.memMetrics)
+	defer finishInternalPlanner(p)
+	p.session.leases.leaseMgr = ie.LeaseManager
+	return p.QueryRow(ctx, statement, qargs...)
 }
 
 // GetTableSpan gets the key span for a SQL table, including any indices.
@@ -56,7 +68,7 @@ func (ie InternalExecutor) GetTableSpan(
 	// Lookup the table ID.
 	p := makeInternalPlanner("get-table-span", txn, user, ie.LeaseManager.memMetrics)
 	defer finishInternalPlanner(p)
-	p.session.leaseMgr = ie.LeaseManager
+	p.session.leases.leaseMgr = ie.LeaseManager
 
 	tn := parser.TableName{DatabaseName: parser.Name(dbName), TableName: parser.Name(tableName)}
 	tableID, err := getTableID(ctx, p, &tn)
@@ -85,7 +97,7 @@ func getTableID(ctx context.Context, p *planner, tn *parser.TableName) (sqlbase.
 		return virtual.GetID(), nil
 	}
 
-	dbID, err := p.getDatabaseID(ctx, tn.Database())
+	dbID, err := p.session.leases.databaseCache.getDatabaseID(ctx, p.txn, p.getVirtualTabler(), tn.Database())
 	if err != nil {
 		return 0, err
 	}

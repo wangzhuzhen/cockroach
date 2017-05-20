@@ -50,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -120,7 +121,7 @@ func createTestStoreWithEngine(
 	nodeDesc := &roachpb.NodeDescriptor{NodeID: 1}
 	server := rpc.NewServer(rpcContext) // never started
 	storeCfg.Gossip = gossip.NewTest(
-		nodeDesc.NodeID, rpcContext, server, nil, stopper, metric.NewRegistry(),
+		nodeDesc.NodeID, rpcContext, server, stopper, metric.NewRegistry(),
 	)
 	storeCfg.ScanMaxIdleTime = 1 * time.Second
 	stores := storage.NewStores(ac, storeCfg.Clock)
@@ -165,6 +166,21 @@ func createTestStoreWithEngine(
 	if err := store.Start(context.Background(), stopper); err != nil {
 		t.Fatal(err)
 	}
+
+	// Connect to gossip and gossip the store's capacity.
+	<-store.Gossip().Connected
+	if err := store.GossipStore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Wait for the store's single range to have quorum before proceeding.
+	repl := store.LookupReplica(roachpb.RKeyMin, nil)
+	testutils.SucceedsSoon(t, func() error {
+		if !repl.HasQuorum() {
+			return errors.New("first range has not reached quorum")
+		}
+		return nil
+	})
+
 	return store
 }
 
@@ -304,7 +320,7 @@ func (m *multiTestContext) Stop() {
 					// any test (TestRaftAfterRemove is a good example) results
 					// in deadlocks where a task can't finish because of
 					// getting stuck in addWriteCommand.
-					s.Quiesce()
+					s.Quiesce(context.TODO())
 				}
 			}(s)
 		}
@@ -315,13 +331,13 @@ func (m *multiTestContext) Stop() {
 		defer m.mu.RUnlock()
 		for _, stopper := range m.stoppers {
 			if stopper != nil {
-				stopper.Stop()
+				stopper.Stop(context.TODO())
 			}
 		}
-		m.transportStopper.Stop()
+		m.transportStopper.Stop(context.TODO())
 
 		for _, s := range m.engineStoppers {
-			s.Stop()
+			s.Stop(context.TODO())
 		}
 		close(done)
 	}()
@@ -421,6 +437,15 @@ func (t *multiTestContextKVTransport) IsExhausted() bool {
 	return t.idx == len(t.replicas)
 }
 
+func (t *multiTestContextKVTransport) SendNextTimeout(
+	defaultTimeout time.Duration,
+) (time.Duration, bool) {
+	if t.IsExhausted() {
+		return 0, false
+	}
+	return defaultTimeout, true
+}
+
 func (t *multiTestContextKVTransport) SendNext(ctx context.Context, done chan<- kv.BatchCall) {
 	rep := t.replicas[t.idx]
 	t.idx++
@@ -486,6 +511,13 @@ func (t *multiTestContextKVTransport) SendNext(ctx context.Context, done chan<- 
 		t.setPending(rep.ReplicaID, false)
 		done <- kv.BatchCall{Err: roachpb.NewSendError("store is stopped")}
 	}
+}
+
+func (t *multiTestContextKVTransport) NextReplica() roachpb.ReplicaDescriptor {
+	if t.IsExhausted() {
+		return roachpb.ReplicaDescriptor{}
+	}
+	return t.replicas[t.idx].ReplicaDescriptor
 }
 
 func (t *multiTestContextKVTransport) MoveToFront(replica roachpb.ReplicaDescriptor) {
@@ -635,7 +667,7 @@ func (m *multiTestContext) populateStorePool(idx int, nodeLiveness *storage.Node
 		m.gossips[idx],
 		m.clock,
 		storage.MakeStorePoolNodeLivenessFunc(nodeLiveness),
-		m.timeUntilStoreDead,
+		settings.TestingDuration(m.timeUntilStoreDead),
 		/* deterministic */ false,
 	)
 }
@@ -689,7 +721,6 @@ func (m *multiTestContext) addStore(idx int) {
 		roachpb.NodeID(idx+1),
 		m.rpcContext,
 		grpcServer,
-		resolvers,
 		m.transportStopper,
 		metric.NewRegistry(),
 	)
@@ -748,7 +779,6 @@ func (m *multiTestContext) addStore(idx int) {
 	sender.AddStore(store)
 	storesServer := storage.MakeServer(m.nodeDesc(nodeID), sender)
 	storage.RegisterConsistencyServer(grpcServer, storesServer)
-	storage.RegisterFreezeServer(grpcServer, storesServer)
 
 	// Add newly created objects to the multiTestContext's collections.
 	// (these must be populated before the store is started so that
@@ -771,7 +801,7 @@ func (m *multiTestContext) addStore(idx int) {
 		m.t.Fatal(err)
 	}
 
-	m.gossips[idx].Start(ln.Addr())
+	m.gossips[idx].Start(ln.Addr(), resolvers)
 
 	if err := store.Start(context.Background(), stopper); err != nil {
 		m.t.Fatal(err)
@@ -830,7 +860,7 @@ func (m *multiTestContext) stopStore(i int) {
 	stopper := m.stoppers[i]
 	m.mu.RUnlock()
 
-	stopper.Stop()
+	stopper.Stop(context.TODO())
 
 	m.mu.Lock()
 	m.stoppers[i] = nil
@@ -938,6 +968,7 @@ func (m *multiTestContext) restart() {
 func (m *multiTestContext) changeReplicasLocked(
 	rangeID roachpb.RangeID, dest int, changeType roachpb.ReplicaChangeType,
 ) (roachpb.ReplicaID, error) {
+	ctx := context.TODO()
 	startKey := m.findStartKeyLocked(rangeID)
 
 	// Perform a consistent read to get the updated range descriptor (as
@@ -946,16 +977,9 @@ func (m *multiTestContext) changeReplicasLocked(
 	// ChangeReplicas returns the raft leader is guaranteed to have the
 	// updated version, but followers are not.
 	var desc roachpb.RangeDescriptor
-	if err := m.dbs[0].GetProto(context.Background(), keys.RangeDescriptorKey(startKey), &desc); err != nil {
+	if err := m.dbs[0].GetProto(ctx, keys.RangeDescriptorKey(startKey), &desc); err != nil {
 		return 0, err
 	}
-
-	repl, err := m.findMemberStoreLocked(desc).GetReplica(desc.RangeID)
-	if err != nil {
-		return 0, err
-	}
-
-	ctx := repl.AnnotateCtx(context.Background())
 
 	var alreadyDoneErr string
 	switch changeType {
@@ -966,36 +990,34 @@ func (m *multiTestContext) changeReplicasLocked(
 	}
 
 	for {
-		if err := repl.ChangeReplicas(
-			ctx,
-			changeType,
-			roachpb.ReplicaDescriptor{
+		err := m.dbs[0].AdminChangeReplicas(
+			ctx, startKey.AsRawKey(), changeType,
+			[]roachpb.ReplicationTarget{{
 				NodeID:  m.idents[dest].NodeID,
 				StoreID: m.idents[dest].StoreID,
-			},
-			&desc,
-		); err == nil || testutils.IsError(err, alreadyDoneErr) {
+			}},
+		)
+
+		if err == nil || testutils.IsError(err, alreadyDoneErr) {
 			break
-		} else if _, ok := errors.Cause(err).(*roachpb.AmbiguousResultError); ok {
-			// Try again after an AmbigousResultError. If the operation
+		}
+
+		if _, ok := errors.Cause(err).(*roachpb.AmbiguousResultError); ok {
+			// Try again after an AmbiguousResultError. If the operation
 			// succeeded, then the next attempt will return alreadyDoneErr;
 			// if it failed then the next attempt should succeed.
 			continue
-		} else if _, ok := errors.Cause(err).(*roachpb.ConditionFailedError); ok {
-			// Try again after a ConditionFailedError. This could be
-			// because the replica we used here is out of date, and the
-			// operation will succeed after it has caught up.
-			//
-			// TODO(bdarnell): it would be nicer to find the lease holder
-			// and call ChangeReplicas on that replica, instead of calling
-			// it on an arbitrary replica and catching this failure.
-			continue
-		} else if storage.IsSnapshotError(err) {
-			continue
-		} else {
-			return 0, err
 		}
+
+		// We can't use storage.IsSnapshotError() because the original error object
+		// is lost. We could make a this into a roachpb.Error but it seems overkill
+		// for this one usage.
+		if testutils.IsError(err, "snapshot failed: .*") {
+			continue
+		}
+		return 0, err
 	}
+
 	return desc.NextReplicaID, nil
 }
 

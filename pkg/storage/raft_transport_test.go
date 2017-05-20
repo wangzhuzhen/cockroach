@@ -119,13 +119,13 @@ func newRaftTransportTestContext(t testing.TB) *raftTransportTestContext {
 	)
 	server := rpc.NewServer(rttc.nodeRPCContext) // never started
 	rttc.gossip = gossip.NewTest(
-		1, rttc.nodeRPCContext, server, nil, rttc.stopper, metric.NewRegistry(),
+		1, rttc.nodeRPCContext, server, rttc.stopper, metric.NewRegistry(),
 	)
 	return rttc
 }
 
 func (rttc *raftTransportTestContext) Stop() {
-	rttc.stopper.Stop()
+	rttc.stopper.Stop(context.TODO())
 }
 
 // AddNode registers a node with the cluster. Nodes must be added
@@ -531,7 +531,7 @@ func TestReopenConnection(t *testing.T) {
 
 	// Take down the old server and start a new one at the same address.
 	serverTransport.Stop(serverReplica.StoreID)
-	serverStopper.Stop()
+	serverStopper.Stop(context.TODO())
 
 	replacementReplica := roachpb.ReplicaDescriptor{
 		NodeID:    3,

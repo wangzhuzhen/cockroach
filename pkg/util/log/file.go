@@ -29,23 +29,25 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/pkg/errors"
+
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
-// MaxSize is the maximum size of a log file in bytes.
-var MaxSize uint64 = 1024 * 1024 * 10
+// LogFileMaxSize is the maximum size of a log file in bytes.
+var LogFileMaxSize int64 = 10 << 20 // 10MiB
 
-// MaxSizePerSeverity is the maximum total size in bytes for log files per
-// severity. Note that this is only checked when log files are created, so the
-// total size of log files per severity might temporarily be up to MaxSize
-// larger.
-var MaxSizePerSeverity = MaxSize * 10
+// LogFilesCombinedMaxSize is the maximum total size in bytes for log
+// files. Note that this is only checked when log files are created,
+// so the total size of log files per severity might temporarily be up
+// to LogFileMaxSize larger.
+var LogFilesCombinedMaxSize = LogFileMaxSize * 10 // 100MiB
 
 // If non-empty, overrides the choice of directory in which to write logs. See
 // createLogDirs for the full list of possible destinations. Note that the
@@ -62,6 +64,16 @@ var logDir logDirName
 
 // Set implements the flag.Value interface.
 func (l *logDirName) Set(dir string) error {
+	if len(dir) > 0 && dir[0] == '~' {
+		return fmt.Errorf("log directory cannot start with '~': %s", dir)
+	}
+	if len(dir) > 0 {
+		absDir, err := filepath.Abs(dir)
+		if err != nil {
+			return err
+		}
+		dir = absDir
+	}
 	l.Lock()
 	defer l.Unlock()
 	l.name = dir
@@ -101,13 +113,13 @@ func DirSet() bool { return logDir.isSet() }
 
 // logFileRE matches log files to avoid exposing non-log files accidentally
 // and it splits the details of the filename into groups for easy parsing.
-// The log file format is {process}.{host}.{username}.{timestamp}.{pid}.{severity}.log
-// cockroach.Brams-MacBook-Pro.bram.2015-06-09T16-10-48Z.30209.WARNING.log
+// The log file format is {process}.{host}.{username}.{timestamp}.{pid}.log
+// cockroach.Brams-MacBook-Pro.bram.2015-06-09T16-10-48Z.30209.log
 // All underscore in process, host and username are escaped to double
 // underscores and all periods are escaped to an underscore.
 // For compatibility with Windows filenames, all colons from the timestamp
 // (RFC3339) are converted from underscores.
-var logFileRE = regexp.MustCompile(`^(?:.*/)?([^/.]+)\.([^/\.]+)\.([^/\.]+)\.([^/\.]+)\.(\d+)\.(ERROR|WARNING|INFO)\.log$`)
+var logFileRE = regexp.MustCompile(`^(?:.*/)?([^/.]+)\.([^/\.]+)\.([^/\.]+)\.([^/\.]+)\.(\d+)\.log$`)
 
 var (
 	pid      = os.Getpid()
@@ -147,29 +159,27 @@ func removePeriods(s string) string {
 	return strings.Replace(s, ".", "", -1)
 }
 
-// logName returns a new log file name containing the severity, with start time
-// t, and the name for the symlink for the severity.
-func logName(severity Severity, t time.Time) (name, link string) {
+// logName returns a new log file name with start time t, and the name
+// for the symlink.
+func logName(t time.Time) (name, link string) {
 	// Replace the ':'s in the time format with '_'s to allow for log files in
 	// Windows.
 	tFormatted := strings.Replace(t.Format(time.RFC3339), ":", "_", -1)
 
-	name = fmt.Sprintf("%s.%s.%s.%s.%06d.%s.log",
+	name = fmt.Sprintf("%s.%s.%s.%s.%06d.log",
 		removePeriods(program),
 		removePeriods(host),
 		removePeriods(userName),
 		tFormatted,
-		pid,
-		severity.Name())
-	return name, removePeriods(program) + "." + severity.Name()
+		pid)
+	return name, removePeriods(program) + ".log"
 }
 
 var errMalformedName = errors.New("malformed log filename")
-var errMalformedSev = errors.New("malformed severity")
 
 func parseLogFilename(filename string) (FileDetails, error) {
 	matches := logFileRE.FindStringSubmatch(filename)
-	if matches == nil || len(matches) != 7 {
+	if matches == nil || len(matches) != 6 {
 		return FileDetails{}, errMalformedName
 	}
 
@@ -185,16 +195,11 @@ func parseLogFilename(filename string) (FileDetails, error) {
 		return FileDetails{}, err
 	}
 
-	sev, sevFound := SeverityByName(matches[6])
-	if !sevFound {
-		return FileDetails{}, errMalformedSev
-	}
-
 	return FileDetails{
 		Program:  matches[1],
 		Host:     matches[2],
 		UserName: matches[3],
-		Severity: sev,
+		Severity: Severity_INFO,
 		Time:     time.UnixNano(),
 		PID:      pid,
 	}, nil
@@ -202,12 +207,11 @@ func parseLogFilename(filename string) (FileDetails, error) {
 
 var errDirectoryNotSet = errors.New("log: log directory not set")
 
-// create creates a new log file and returns the file and its filename, which
-// contains severity ("INFO", "FATAL", etc.) and t. If the file is created
-// successfully, create also attempts to update the symlink for that tag, ignoring
-// errors.
+// create creates a new log file and returns the file and its
+// filename. If the file is created successfully, create also attempts
+// to update the symlink for that tag, ignoring errors.
 func create(
-	severity Severity, t time.Time, lastRotation int64,
+	t time.Time, lastRotation int64,
 ) (f *os.File, updatedRotation int64, filename string, err error) {
 	dir, err := logDir.get()
 	if err != nil {
@@ -224,44 +228,29 @@ func create(
 	t = time.Unix(unix, 0)
 
 	// Generate the file name.
-	name, link := logName(severity, t)
+	name, link := logName(t)
 	fname := filepath.Join(dir, name)
 	// Open the file os.O_APPEND|os.O_CREATE rather than use os.Create.
 	// Append is almost always more efficient than O_RDRW on most modern file systems.
 	f, err = os.OpenFile(fname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0664)
 	if err == nil {
 		symlink := filepath.Join(dir, link)
-		_ = os.Remove(symlink) // ignore err
-		err = os.Symlink(filepath.Base(fname), symlink)
+
+		// Symlinks are best-effort.
+
+		if err := os.Remove(symlink); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(OrigStderr, "log: failed to remove symlink %s: %s", symlink, err)
+		}
+		if err := os.Symlink(filepath.Base(fname), symlink); err != nil {
+			// On Windows, this will be the common case, as symlink creation
+			// requires special privileges.
+			// See: https://docs.microsoft.com/en-us/windows/device-security/security-policy-settings/create-symbolic-links
+			if runtime.GOOS != "windows" {
+				fmt.Fprintf(OrigStderr, "log: failed to create symlink %s: %s", symlink, err)
+			}
+		}
 	}
 	return f, updatedRotation, fname, errors.Wrapf(err, "log: cannot create log")
-}
-
-var errNotAFile = errors.New("not a regular file")
-
-// getFileDetails verifies that the file specified by filename is a
-// regular file and filename matches the expected filename pattern.
-// Returns the log file details success; otherwise error.
-func getFileDetails(info os.FileInfo) (FileDetails, error) {
-	if info.Mode()&os.ModeType != 0 {
-		return FileDetails{}, errNotAFile
-	}
-
-	details, err := parseLogFilename(info.Name())
-	if err != nil {
-		return FileDetails{}, err
-	}
-
-	return details, nil
-}
-
-func verifyFile(filename string) error {
-	info, err := os.Stat(filename)
-	if err != nil {
-		return errors.Errorf("stat: %s: %v", filename, err)
-	}
-	_, err = getFileDetails(info)
-	return err
 }
 
 // ListLogFiles returns a slice of FileInfo structs for each log file
@@ -279,14 +268,16 @@ func ListLogFiles() ([]FileInfo, error) {
 		return results, err
 	}
 	for _, info := range infos {
-		details, err := getFileDetails(info)
-		if err == nil {
-			results = append(results, FileInfo{
-				Name:         info.Name(),
-				SizeBytes:    info.Size(),
-				ModTimeNanos: info.ModTime().UnixNano(),
-				Details:      details,
-			})
+		if info.Mode().IsRegular() {
+			details, err := parseLogFilename(info.Name())
+			if err == nil {
+				results = append(results, FileInfo{
+					Name:         info.Name(),
+					SizeBytes:    info.Size(),
+					ModTimeNanos: info.ModTime().UnixNano(),
+					Details:      details,
+				})
+			}
 		}
 	}
 	return results, nil
@@ -313,53 +304,68 @@ func GetLogReader(filename string, restricted bool) (io.ReadCloser, error) {
 			return nil, errors.Errorf("pathnames must be basenames only: %s", filename)
 		}
 		filename = filepath.Join(dir, filename)
-
-	case false:
-		if !filepath.IsAbs(filename) {
-			exists, err := fileExists(filename)
-			if err != nil {
-				return nil, err
+		// Symlinks are not followed in restricted mode.
+		info, err := os.Lstat(filename)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, errors.Errorf("no such file %s in the log directory", filename)
 			}
-			if !exists && filepath.Base(filename) == filename {
-				// If the file name is not absolute and is simple and not
-				// found in the cwd, try to find the file first relative to
-				// the log directory.
-				fileNameAttempt := filepath.Join(dir, filename)
-				exists, err = fileExists(fileNameAttempt)
-				if err != nil {
-					return nil, err
-				}
-				if !exists {
+			return nil, errors.Wrapf(err, "Lstat: %s", filename)
+		}
+		mode := info.Mode()
+		if mode&os.ModeSymlink != 0 {
+			return nil, errors.Errorf("symlinks are not allowed")
+		}
+		if !mode.IsRegular() {
+			return nil, errors.Errorf("not a regular file")
+		}
+	case false:
+		info, err := osStat(filename)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return nil, errors.Wrapf(err, "Stat: %s", filename)
+			}
+			// The absolute filename didn't work, so try within the log
+			// directory if the filename isn't a path.
+			if filepath.IsAbs(filename) {
+				return nil, errors.Errorf("no such file %s", filename)
+			}
+			filenameAttempt := filepath.Join(dir, filename)
+			info, err = osStat(filenameAttempt)
+			if err != nil {
+				if os.IsNotExist(err) {
 					return nil, errors.Errorf("no such file %s either in current directory or in %s", filename, dir)
 				}
-				filename = fileNameAttempt
+				return nil, errors.Wrapf(err, "Stat: %s", filename)
 			}
+			filename = filenameAttempt
 		}
-
-		// Normalize the name to an absolute path without symlinks.
 		filename, err = filepath.EvalSymlinks(filename)
 		if err != nil {
-			return nil, errors.Errorf("EvalSymLinks: %s: %v", filename, err)
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, errors.Errorf("not a regular file")
 		}
 	}
 
-	// Check the file name is valid.
-	if err := verifyFile(filename); err != nil {
+	// Check that the file name is valid.
+	if _, err := parseLogFilename(filepath.Base(filename)); err != nil {
 		return nil, err
 	}
 
 	return os.Open(filename)
 }
 
-func fileExists(path string) (bool, error) {
-	_, err := os.Stat(path)
-	if err == nil {
-		return true, nil
+// TODO(bram): remove when Go1.9 is required.
+//
+// See https://github.com/golang/go/issues/19870.
+func osStat(path string) (os.FileInfo, error) {
+	path, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, err
 	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	return true, err
+	return os.Lstat(path)
 }
 
 // sortableFileInfoSlice is required so we can sort FileInfos.
@@ -371,13 +377,13 @@ func (a sortableFileInfoSlice) Less(i, j int) bool {
 	return a[i].Details.Time < a[j].Details.Time
 }
 
-// selectFiles selects all log files that have an timestamp before the endTime and
-// the correct severity. It then sorts them in decreasing order, with the most
+// selectFiles selects all log files that have an timestamp before the
+// endTime. It then sorts them in decreasing order, with the most
 // recent as the first one.
-func selectFiles(logFiles []FileInfo, severity Severity, endTimestamp int64) []FileInfo {
+func selectFiles(logFiles []FileInfo, endTimestamp int64) []FileInfo {
 	files := sortableFileInfoSlice{}
 	for _, logFile := range logFiles {
-		if logFile.Details.Severity == severity && logFile.Details.Time <= endTimestamp {
+		if logFile.Details.Time <= endTimestamp {
 			files = append(files, logFile)
 		}
 	}
@@ -387,21 +393,21 @@ func selectFiles(logFiles []FileInfo, severity Severity, endTimestamp int64) []F
 	return files
 }
 
-// FetchEntriesFromFiles fetches all available log entries on disk that match
-// the log 'severity' (or worse) and are between the 'startTimestamp' and
-// 'endTimestamp'. It will stop reading new files if the number of entries
-// exceeds 'maxEntries'. Log entries are further filtered by the regexp
-// 'pattern' if provided. The logs entries are returned in reverse chronological
-// order.
+// FetchEntriesFromFiles fetches all available log entries on disk
+// that are between the 'startTimestamp' and 'endTimestamp'. It will
+// stop reading new files if the number of entries exceeds
+// 'maxEntries'. Log entries are further filtered by the regexp
+// 'pattern' if provided. The logs entries are returned in reverse
+// chronological order.
 func FetchEntriesFromFiles(
-	severity Severity, startTimestamp, endTimestamp int64, maxEntries int, pattern *regexp.Regexp,
+	startTimestamp, endTimestamp int64, maxEntries int, pattern *regexp.Regexp,
 ) ([]Entry, error) {
 	logFiles, err := ListLogFiles()
 	if err != nil {
 		return nil, err
 	}
 
-	selectedFiles := selectFiles(logFiles, severity, endTimestamp)
+	selectedFiles := selectFiles(logFiles, endTimestamp)
 
 	entries := []Entry{}
 	for _, file := range selectedFiles {

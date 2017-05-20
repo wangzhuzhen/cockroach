@@ -118,6 +118,7 @@ func TestSystemTableLiterals(t *testing.T) {
 		{keys.RangeEventTableID, sqlbase.RangeEventTableSchema, sqlbase.RangeEventTable},
 		{keys.UITableID, sqlbase.UITableSchema, sqlbase.UITable},
 		{keys.JobsTableID, sqlbase.JobsTableSchema, sqlbase.JobsTable},
+		{keys.SettingsTableID, sqlbase.SettingsTableSchema, sqlbase.SettingsTable},
 	} {
 		gen, err := sql.CreateTestTableDescriptor(
 			context.TODO(),
@@ -131,7 +132,7 @@ func TestSystemTableLiterals(t *testing.T) {
 		}
 		if !proto.Equal(&test.pkg, &gen) {
 			diff := strings.Join(pretty.Diff(&test.pkg, &gen), "\n")
-			t.Fatalf("%s table descriptor generated from CREATE TABLE statement does not match "+
+			t.Errorf("%s table descriptor generated from CREATE TABLE statement does not match "+
 				"hardcoded table descriptor:\n%s", test.pkg.Name, diff)
 		}
 	}

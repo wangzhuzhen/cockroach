@@ -30,8 +30,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -43,6 +43,11 @@ const (
 	// stores.
 	maxFractionUsedThreshold = 0.95
 
+	// baseRebalanceThreshold is the minimum ratio of a store's range/lease surplus to
+	// the mean range/lease count that permits rebalances/lease-transfers away from
+	// that store.
+	baseRebalanceThreshold = 0.05
+
 	// priorities for various repair operations.
 	addMissingReplicaPriority  float64 = 10000
 	removeDeadReplicaPriority  float64 = 1000
@@ -52,14 +57,18 @@ const (
 var (
 	// MinLeaseTransferStatsDuration configures the minimum amount of time a
 	// replica must wait for stats about request counts to accumulate before
-	// making decisions based on them.
+	// making decisions based on them. The higher this is, the less likely
+	// thrashing is (up to a point).
 	// Made configurable for the sake of testing.
-	MinLeaseTransferStatsDuration = time.Minute
+	MinLeaseTransferStatsDuration = replStatsRotateInterval
 
 	// EnableLoadBasedLeaseRebalancing controls whether lease rebalancing is done
 	// via the new heuristic based on request load and latency or via the simpler
 	// approach that purely seeks to balance the number of leases per node evenly.
-	EnableLoadBasedLeaseRebalancing = envutil.EnvOrDefaultBool("COCKROACH_ENABLE_LOAD_BASED_LEASE_REBALANCING", false)
+	EnableLoadBasedLeaseRebalancing = settings.RegisterBoolSetting(
+		"kv.allocator.load_based_lease_rebalancing.enabled",
+		"set to enable rebalancing of range leases based on load and latency",
+		true)
 
 	// LeaseRebalancingAggressiveness enables users to tweak how aggressive their
 	// cluster is at moving leases towards the localities where the most requests
@@ -69,15 +78,12 @@ var (
 	//
 	// Setting this to 0 effectively disables load-based lease rebalancing, and
 	// settings less than 0 are disallowed.
-	LeaseRebalancingAggressiveness = envutil.EnvOrDefaultFloat("COCKROACH_LEASE_REBALANCING_AGGRESSIVENESS", 1.0)
+	LeaseRebalancingAggressiveness = settings.RegisterNonNegativeFloatSetting(
+		"kv.allocator.lease_rebalancing_aggressiveness",
+		"set greater than 1.0 to rebalance leases toward load more aggressively, "+
+			"or between 0 and 1.0 to be more conservative about rebalancing leases",
+		1.0)
 )
-
-func init() {
-	if LeaseRebalancingAggressiveness < 0 {
-		panic(fmt.Sprintf("COCKROACH_LEASE_REBALANCING_AGGRESSIVENESS must not be negative, got %f",
-			LeaseRebalancingAggressiveness))
-	}
-}
 
 // AllocatorAction enumerates the various replication adjustments that may be
 // recommended by the allocator.
@@ -363,6 +369,25 @@ func (a Allocator) RebalanceTarget(
 		a.storePool.deterministic,
 	)
 
+	// We're going to add another replica to the range which will change the
+	// quorum size. Verify that the number of existing candidates is sufficient
+	// to meet the new quorum. Note that "existingCandidates" only contains
+	// replicas on live nodes while "existing" contains all of the replicas for a
+	// range. For a range configured for 3 replicas, this will disable
+	// rebalancing if one of the replicas is on a down node. Instead, we'll have
+	// to wait for the down node to be declared dead and go through the dead-node
+	// removal dance: remove dead replica, add new replica.
+	//
+	// NB: The len(existing) > 1 check allows rebalancing of ranges with only a
+	// single replica. This is a corner case which could happen in practice and
+	// also affects tests.
+	newQuorum := computeQuorum(len(existing) + 1)
+	if len(existing) > 1 && len(existingCandidates) < newQuorum {
+		// Don't rebalance as we won't be able to make quorum after the rebalance
+		// until the new replica has been caught up.
+		return nil, nil
+	}
+
 	// No need to rebalance.
 	if len(existingCandidates) == 0 {
 		return nil, nil
@@ -485,21 +510,26 @@ func (a *Allocator) ShouldTransferLease(
 	sl, _, _ := a.storePool.getStoreList(rangeID)
 	sl = sl.filter(constraints)
 	if log.V(3) {
-		log.Infof(ctx, "ShouldTransferLease source (lease-holder=%d):\n%s", leaseStoreID, sl)
+		log.Infof(ctx, "ShouldTransferLease (lease-holder=%d):\n%s", leaseStoreID, sl)
 	}
 
 	transferDec, _ := a.shouldTransferLeaseUsingStats(ctx, sl, source, existing, stats)
+	var result bool
 	switch transferDec {
 	case shouldNotTransfer:
-		return false
+		result = false
 	case shouldTransfer:
-		return true
+		result = true
 	case decideWithoutStats:
+		result = a.shouldTransferLeaseWithoutStats(ctx, sl, source, existing)
 	default:
 		log.Fatalf(ctx, "unexpected transfer decision %d", transferDec)
 	}
 
-	return a.shouldTransferLeaseWithoutStats(ctx, sl, source, existing)
+	if log.V(3) {
+		log.Infof(ctx, "ShouldTransferLease decision (lease-holder=%d): %t", leaseStoreID, result)
+	}
+	return result
 }
 
 func (a Allocator) shouldTransferLeaseUsingStats(
@@ -509,9 +539,18 @@ func (a Allocator) shouldTransferLeaseUsingStats(
 	existing []roachpb.ReplicaDescriptor,
 	stats *replicaStats,
 ) (transferDecision, roachpb.ReplicaDescriptor) {
-	if stats == nil || !EnableLoadBasedLeaseRebalancing {
+	// Only use load-based rebalancing if it's enabled and we have both
+	// stats and locality information to base our decision on.
+	if stats == nil || !EnableLoadBasedLeaseRebalancing.Get() {
 		return decideWithoutStats, roachpb.ReplicaDescriptor{}
 	}
+	replicaLocalities := a.storePool.getLocalities(existing)
+	for _, locality := range replicaLocalities {
+		if len(locality.Tiers) == 0 {
+			return decideWithoutStats, roachpb.ReplicaDescriptor{}
+		}
+	}
+
 	requestCounts, requestCountsDur := stats.getRequestCounts()
 
 	// If we haven't yet accumulated enough data, avoid transferring for now. Do
@@ -531,7 +570,6 @@ func (a Allocator) shouldTransferLeaseUsingStats(
 	}
 
 	replicaWeights := make(map[roachpb.NodeID]float64)
-	replicaLocalities := a.storePool.getLocalities(existing)
 	for requestLocalityStr, count := range requestCounts {
 		var requestLocality roachpb.Locality
 		if err := requestLocality.Set(requestLocalityStr); err != nil {
@@ -638,12 +676,15 @@ func loadBasedLeaseRebalanceScore(
 ) int32 {
 	remoteLatencyMillis := float64(remoteLatency) / float64(time.Millisecond)
 	rebalanceAdjustment :=
-		LeaseRebalancingAggressiveness * 0.1 * math.Log10(remoteWeight/sourceWeight) * math.Log1p(remoteLatencyMillis)
-	rebalanceThreshold := baseRebalanceThreshold - rebalanceAdjustment
+		LeaseRebalancingAggressiveness.Get() * 0.1 * math.Log10(remoteWeight/sourceWeight) * math.Log1p(remoteLatencyMillis)
+	// Start with twice the base rebalance threshold in order to fight more
+	// strongly against thrashing caused by small variances in the distribution
+	// of request weights.
+	rebalanceThreshold := (2 * baseRebalanceThreshold) - rebalanceAdjustment
 
 	overfullLeaseThreshold := int32(math.Ceil(meanLeases * (1 + rebalanceThreshold)))
 	overfullScore := source.Capacity.LeaseCount - overfullLeaseThreshold
-	underfullLeaseThreshold := int32(math.Ceil(meanLeases * (1 - rebalanceThreshold)))
+	underfullLeaseThreshold := int32(math.Floor(meanLeases * (1 - rebalanceThreshold)))
 	underfullScore := underfullLeaseThreshold - remoteStore.Capacity.LeaseCount
 	totalScore := overfullScore + underfullScore
 
@@ -696,11 +737,6 @@ func (a Allocator) shouldTransferLeaseWithoutStats(
 	}
 	return false
 }
-
-// baseRebalanceThreshold is the minimum ratio of a store's range/lease surplus to
-// the mean range/lease count that permits rebalances/lease-transfers away from
-// that store.
-var baseRebalanceThreshold = envutil.EnvOrDefaultFloat("COCKROACH_REBALANCE_THRESHOLD", 0.05)
 
 // computeQuorum computes the quorum value for the given number of nodes.
 func computeQuorum(nodes int) int {

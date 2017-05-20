@@ -19,10 +19,9 @@ package storage_test
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
-	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -72,7 +71,7 @@ func adminSplitArgs(key, splitKey roachpb.Key) *roachpb.AdminSplitRequest {
 func TestStoreRangeSplitAtIllegalKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	cfg := storage.TestStoreConfig(nil)
 	cfg.TestingKnobs.DisableSplitQueue = true
@@ -100,7 +99,7 @@ func TestStoreRangeSplitAtTablePrefix(t *testing.T) {
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
 	key := keys.MakeRowSentinelKey(append([]byte(nil), keys.UserTableDataMin...))
@@ -117,7 +116,9 @@ func TestStoreRangeSplitAtTablePrefix(t *testing.T) {
 
 	// Update SystemConfig to trigger gossip.
 	if err := store.DB().Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
-		txn.SetSystemConfigTrigger()
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
 		// We don't care about the values, just the keys.
 		k := sqlbase.MakeDescMetadataKey(sqlbase.ID(keys.MaxReservedDescID + 1))
 		return txn.Put(ctx, k, &desc)
@@ -153,7 +154,7 @@ func TestStoreRangeSplitInsideRow(t *testing.T) {
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
 	// Manually create some the column keys corresponding to the table:
@@ -207,7 +208,7 @@ func TestStoreRangeSplitIntents(t *testing.T) {
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
 	// First, write some values left and right of the proposed split key.
@@ -251,7 +252,13 @@ func TestStoreRangeSplitIntents(t *testing.T) {
 	iter := store.Engine().NewIterator(false)
 
 	defer iter.Close()
-	for iter.Seek(start); iter.Valid() && iter.Less(end); iter.Next() {
+	for iter.Seek(start); ; iter.Next() {
+		if ok, err := iter.Valid(); err != nil {
+			t.Fatal(err)
+		} else if !ok || !iter.Less(end) {
+			break
+		}
+
 		if bytes.HasPrefix([]byte(iter.Key().Key), txnPrefix(roachpb.KeyMin)) ||
 			bytes.HasPrefix([]byte(iter.Key().Key), txnPrefix(splitKey)) {
 			t.Errorf("unexpected system key: %s; txn record should have been cleaned up", iter.Key())
@@ -269,7 +276,7 @@ func TestStoreRangeSplitAtRangeBounds(t *testing.T) {
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
 	args := adminSplitArgs(roachpb.KeyMin, []byte("a"))
@@ -295,7 +302,7 @@ func TestStoreRangeSplitConcurrent(t *testing.T) {
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
 	splitKey := roachpb.Key("a")
@@ -313,15 +320,10 @@ func TestStoreRangeSplitConcurrent(t *testing.T) {
 	for i := 0; i < concurrentCount; i++ {
 		pErr := <-errCh
 		if pErr != nil {
-			// There are only three expected errors from concurrent splits:
-			// conflicting range descriptors if the splits are initiated
-			// concurrently, the range is already split at the specified key or the
-			// split key is outside of the bounds for the range.
-			expected := strings.Join([]string{
-				"range is already split at key",
-				"key range .* outside of bounds of range",
-			}, "|")
-			if !testutils.IsError(pErr.GoError(), expected) {
+			// The only expected error from concurrent splits is the split key being
+			// outside the bounds for the range. Note that conflicting range
+			// descriptor errors are retried internally.
+			if !testutils.IsError(pErr.GoError(), "key range .* outside of bounds of range") {
 				t.Fatalf("unexpected error: %v", pErr)
 			}
 			failureCount++
@@ -354,7 +356,7 @@ func TestStoreRangeSplitIdempotency(t *testing.T) {
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 	rangeID := roachpb.RangeID(1)
 	splitKey := roachpb.Key("m")
@@ -504,7 +506,7 @@ func TestStoreRangeSplitStats(t *testing.T) {
 	storeCfg := storage.TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
 	// Split the range after the last table data key.
@@ -614,7 +616,7 @@ func TestStoreRangeSplitStatsWithMerges(t *testing.T) {
 	storeCfg := storage.TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
 	// Split the range after the last table data key.
@@ -715,7 +717,7 @@ func fillRange(
 func TestStoreZoneUpdateAndRangeSplit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store, _ := createTestStore(t, stopper)
 	config.TestingSetupZoneConfigHook(stopper)
 
@@ -771,7 +773,7 @@ func TestStoreZoneUpdateAndRangeSplit(t *testing.T) {
 func TestStoreRangeSplitWithMaxBytesUpdate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store, _ := createTestStore(t, stopper)
 	config.TestingSetupZoneConfigHook(stopper)
 
@@ -806,7 +808,7 @@ func TestStoreRangeSplitWithMaxBytesUpdate(t *testing.T) {
 func TestStoreRangeSystemSplits(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store, _ := createTestStore(t, stopper)
 
 	schema := sqlbase.MakeMetadataSchema()
@@ -820,7 +822,9 @@ func TestStoreRangeSystemSplits(t *testing.T) {
 	// We should end up with splits at each user table prefix.
 	if err := store.DB().Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 		prefix := keys.MakeTablePrefix(keys.DescriptorTableID)
-		txn.SetSystemConfigTrigger()
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
 		for i, kv := range initialSystemValues {
 			if !bytes.HasPrefix(kv.Key, prefix) {
 				continue
@@ -849,12 +853,15 @@ func TestStoreRangeSystemSplits(t *testing.T) {
 	}
 
 	verifySplitsAtTablePrefixes := func(maxTableID int) {
-		// We expect splits at each of the user tables, but not at the system
-		// tables boundaries.
+		// We expect splits at each of the user tables and at a few fixed system
+		// range boundaries, but not at system table boundaries.
+		expKeys := []roachpb.Key{
+			testutils.MakeKey(keys.Meta2Prefix, keys.SystemPrefix),
+			testutils.MakeKey(keys.Meta2Prefix, keys.TimeseriesPrefix),
+			testutils.MakeKey(keys.Meta2Prefix, keys.TimeseriesPrefix.PrefixEnd()),
+			testutils.MakeKey(keys.Meta2Prefix, keys.TableDataMin),
+		}
 		numReservedTables := schema.SystemDescriptorCount() - schema.SystemConfigDescriptorCount()
-		var expKeys []roachpb.Key
-		expKeys = append(expKeys,
-			testutils.MakeKey(keys.Meta2Prefix, keys.TableDataMin))
 		for i := 1; i <= int(numReservedTables); i++ {
 			expKeys = append(expKeys,
 				testutils.MakeKey(keys.Meta2Prefix,
@@ -889,7 +896,9 @@ func TestStoreRangeSystemSplits(t *testing.T) {
 	// Write another, disjoint (+3) descriptor for a user table.
 	numTotalValues := userTableMax + 3
 	if err := store.DB().Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
-		txn.SetSystemConfigTrigger()
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
 		// This time, only write the last table descriptor. Splits
 		// still occur for every intervening ID.
 		// We don't care about the values, just the keys.
@@ -1108,107 +1117,6 @@ func TestSplitSnapshotRace_SnapshotWins(t *testing.T) {
 	})
 }
 
-// TestStoreSplitTimestampCacheReadRace prevents regression of #3148. It begins
-// a couple of read requests and lets them complete while a split is happening;
-// the reads hit the right half of the split. If the split happens
-// non-atomically with respect to the reads (and in particular their update of
-// the timestamp cache), then some of them may not be reflected in the
-// timestamp cache of the new range, in which case this test would fail.
-//
-// TODO(tschottdorf): hacks around #10084, see usage of
-// ProposerEvaluatedKVEnabled() within.
-func TestStoreSplitTimestampCacheReadRace(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	splitKey := roachpb.Key("a")
-	key := func(i int) roachpb.Key {
-		splitCopy := append([]byte(nil), splitKey.Next()...)
-		return append(splitCopy, []byte(fmt.Sprintf("%03d", i))...)
-	}
-
-	getContinues := make(chan struct{})
-	if storage.ProposerEvaluatedKVEnabled() {
-		// TODO(tschottdorf): because of command queue hack (would deadlock
-		// otherwise); see #10084.
-		close(getContinues)
-	}
-	var getStarted sync.WaitGroup
-	storeCfg := storage.TestStoreConfig(nil)
-	storeCfg.TestingKnobs.DisableSplitQueue = true
-	storeCfg.TestingKnobs.TestingEvalFilter =
-		func(filterArgs storagebase.FilterArgs) *roachpb.Error {
-			if et, ok := filterArgs.Req.(*roachpb.EndTransactionRequest); ok {
-				st := et.InternalCommitTrigger.GetSplitTrigger()
-				if st == nil || !st.LeftDesc.EndKey.Equal(splitKey) {
-					return nil
-				}
-				if !storage.ProposerEvaluatedKVEnabled() {
-					close(getContinues)
-				}
-			} else if filterArgs.Req.Method() == roachpb.Get &&
-				bytes.HasPrefix(filterArgs.Req.Header().Key, splitKey.Next()) {
-				getStarted.Done()
-				<-getContinues
-			}
-			return nil
-		}
-	stopper := stop.NewStopper()
-	defer stopper.Stop()
-	store := createTestStoreWithConfig(t, stopper, storeCfg)
-
-	now := store.Clock().Now()
-
-	ts := func(i int) hlc.Timestamp {
-		return now.Add(0, int32(1000+i))
-	}
-
-	const num = 10
-
-	errChan := make(chan *roachpb.Error)
-	for i := 0; i < num; i++ {
-		getStarted.Add(1)
-		go func(i int) {
-			args := getArgs(key(i))
-			var h roachpb.Header
-			h.Timestamp = ts(i)
-			_, pErr := client.SendWrappedWith(context.Background(), rg1(store), h, args)
-			errChan <- pErr
-		}(i)
-	}
-
-	getStarted.Wait()
-
-	func() {
-		args := adminSplitArgs(roachpb.KeyMin, splitKey)
-		if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
-			t.Fatal(pErr)
-		}
-	}()
-
-	for i := 0; i < num; i++ {
-		if pErr := <-errChan; pErr != nil {
-			t.Fatal(pErr)
-		}
-	}
-
-	for i := 0; i < num; i++ {
-		var h roachpb.Header
-		h.Timestamp = now
-		args := putArgs(key(i), []byte("foo"))
-		keyAddr, err := keys.Addr(args.Key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		h.RangeID = store.LookupReplica(keyAddr, nil).RangeID
-		_, respH, pErr := storage.SendWrapped(context.Background(), store, h, args)
-		if pErr != nil {
-			t.Fatal(pErr)
-		}
-		if respH.Timestamp.Less(ts(i)) {
-			t.Fatalf("%d: expected Put to be forced higher than %s by timestamp caches, but wrote at %s", i, ts(i), respH.Timestamp)
-		}
-	}
-}
-
 // TestStoreSplitTimestampCacheDifferentLeaseHolder prevents regression of
 // #7899. When the first lease holder of the right-hand side of a Split was
 // not equal to the left-hand side lease holder (at the time of the split),
@@ -1250,7 +1158,7 @@ func TestStoreSplitTimestampCacheDifferentLeaseHolder(t *testing.T) {
 	}
 
 	tc := testcluster.StartTestCluster(t, 2, args)
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	// Split the data range, mainly to avoid other splits getting in our way.
 	for _, k := range []roachpb.Key{leftKey, rightKey} {
@@ -1366,7 +1274,6 @@ func TestStoreSplitTimestampCacheDifferentLeaseHolder(t *testing.T) {
 // and the uninitialized replica reacting to messages.
 func TestStoreRangeSplitRaceUninitializedRHS(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("#10172")
 	mtc := &multiTestContext{}
 	storeCfg := storage.TestStoreConfig(nil)
 	// An aggressive tick interval lets groups communicate more and thus
@@ -1533,7 +1440,7 @@ func BenchmarkStoreRangeSplit(b *testing.B) {
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(b, stopper, storeCfg)
 
 	// Perform initial split of ranges.
@@ -1698,7 +1605,7 @@ func TestStoreSplitBeginTxnPushMetaIntentRace(t *testing.T) {
 		return nil
 	}
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 
 	// Advance the clock past the transaction cleanup expiration.
@@ -1775,7 +1682,7 @@ func TestStoreRangeGossipOnSplits(t *testing.T) {
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	storeCfg.TestingKnobs.DisableScanner = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, storeCfg)
 	storeKey := gossip.MakeStoreKey(store.StoreID())
 
@@ -1783,21 +1690,25 @@ func TestStoreRangeGossipOnSplits(t *testing.T) {
 	config.TestingSetupZoneConfigHook(stopper)
 	config.TestingSetZoneConfig(0, config.ZoneConfig{NumReplicas: 1})
 
-	<-store.Gossip().Connected
-
+	var lastSD roachpb.StoreDescriptor
 	rangeCountCh := make(chan int32)
 	unregister := store.Gossip().RegisterCallback(storeKey, func(_ string, val roachpb.Value) {
 		var sd roachpb.StoreDescriptor
 		if err := val.GetProto(&sd); err != nil {
 			panic(err)
 		}
-		// Wait for lease count to equal range count, as they're incremented in lockstep.
-		if sd.Capacity.LeaseCount != sd.Capacity.RangeCount {
+		// Wait for range count to change as this callback is invoked
+		// for lease count changes as well.
+		if sd.Capacity.RangeCount == lastSD.Capacity.RangeCount {
 			return
 		}
+		lastSD = sd
 		rangeCountCh <- sd.Capacity.RangeCount
 	})
 	defer unregister()
+
+	// Pull the first gossiped range count.
+	lastRangeCount := <-rangeCountCh
 
 	splitFunc := func(i int) *roachpb.Error {
 		splitKey := roachpb.Key(fmt.Sprintf("%02d", i))
@@ -1810,43 +1721,322 @@ func TestStoreRangeGossipOnSplits(t *testing.T) {
 		return pErr
 	}
 
-	// Split 9 times; verify range count is gossiped.
-	for i := 0; i < 9; i++ {
+	// Split until we split at least 20 ranges.
+	var rangeCount int32
+	for i := 0; rangeCount < 20; i++ {
 		if pErr := splitFunc(i); pErr != nil {
 			t.Fatal(pErr)
 		}
+		select {
+		case rangeCount = <-rangeCountCh:
+			changeCount := int32(math.Ceil(math.Max(float64(lastRangeCount)*0.5, 1)))
+			diff := rangeCount - (lastRangeCount + changeCount)
+			if diff < -1 || diff > 1 {
+				t.Errorf("gossiped range count %d more than 1 away from expected %d", rangeCount, lastRangeCount+changeCount)
+			}
+			lastRangeCount = rangeCount
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
+}
+
+// TestStorePushTxnQueueEnabledOnSplit verifies that the PushTxnQueue for
+// the right hand side of the split range is enabled after a split.
+func TestStorePushTxnQueueEnabledOnSplit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	storeCfg := storage.TestStoreConfig(nil)
+	storeCfg.TestingKnobs.DisableSplitQueue = true
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+	store := createTestStoreWithConfig(t, stopper, storeCfg)
+
+	key := keys.MakeRowSentinelKey(append([]byte(nil), keys.UserTableDataMin...))
+	args := adminSplitArgs(key, key)
+	if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
+		t.Fatalf("%q: split unexpected error: %s", key, pErr)
+	}
+
+	rhsRepl := store.LookupReplica(roachpb.RKey(keys.UserTableDataMin), nil)
+	if !rhsRepl.IsPushTxnQueueEnabled() {
+		t.Errorf("expected RHS replica's push txn queue to be enabled post-split")
+	}
+}
+
+// TestDistributedTxnCleanup verifies that distributed transactions
+// cleanup their txn records after commit or abort.
+func TestDistributedTxnCleanup(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	storeCfg := storage.TestStoreConfig(nil)
+	storeCfg.TestingKnobs.DisableSplitQueue = true
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+	store := createTestStoreWithConfig(t, stopper, storeCfg)
+
+	// Split at "a".
+	lhsKey := roachpb.Key("a")
+	args := adminSplitArgs(lhsKey, lhsKey)
+	if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
+		t.Fatalf("split at %q: %s", lhsKey, pErr)
+	}
+	lhs := store.LookupReplica(roachpb.RKey("a"), nil)
+
+	// Split at "b".
+	rhsKey := roachpb.Key("b")
+	args = adminSplitArgs(rhsKey, rhsKey)
+	if _, pErr := client.SendWrappedWith(context.Background(), store, roachpb.Header{
+		RangeID: lhs.RangeID,
+	}, args); pErr != nil {
+		t.Fatalf("split at %q: %s", rhsKey, pErr)
+	}
+	rhs := store.LookupReplica(roachpb.RKey("b"), nil)
+
+	if lhs == rhs {
+		t.Errorf("LHS == RHS after split: %s == %s", lhs, rhs)
+	}
+
+	// Test both commit and abort cases.
+	for _, force := range []bool{true, false} {
+		for _, commit := range []bool{true, false} {
+			t.Run(fmt.Sprintf("force=%t,commit=%t", force, commit), func(t *testing.T) {
+				// Run a distributed transaction involving the lhsKey and rhsKey.
+				var txnKey roachpb.Key
+				ctx := context.Background()
+				txn := client.NewTxn(store.DB())
+				opts := client.TxnExecOptions{
+					AutoCommit: true,
+					AutoRetry:  false,
+				}
+				if err := txn.Exec(ctx, opts, func(ctx context.Context, txn *client.Txn, _ *client.TxnExecOptions) error {
+					b := txn.NewBatch()
+					b.Put(fmt.Sprintf("%s.force=%t,commit=%t", string(lhsKey), force, commit), "lhsValue")
+					b.Put(fmt.Sprintf("%s.force=%t,commit=%t", string(rhsKey), force, commit), "rhsValue")
+					if err := txn.Run(ctx, b); err != nil {
+						return err
+					}
+					txnKey = keys.TransactionKey(txn.Proto().Key, *txn.Proto().ID)
+					// If force=true, we're force-aborting the txn out from underneath.
+					// This simulates txn deadlock or a max priority txn aborting a
+					// normal or min priority txn.
+					if force {
+						ba := roachpb.BatchRequest{}
+						ba.RangeID = lhs.RangeID
+						ba.Add(&roachpb.PushTxnRequest{
+							Span: roachpb.Span{
+								Key: txn.Proto().Key,
+							},
+							Now:           store.Clock().Now(),
+							PusheeTxn:     txn.Proto().TxnMeta,
+							PushType:      roachpb.PUSH_ABORT,
+							Force:         true,
+							NewPriorities: true,
+						})
+						_, pErr := store.Send(ctx, ba)
+						if pErr != nil {
+							t.Errorf("failed to abort the txn: %s", pErr)
+						}
+					}
+					if commit {
+						return nil
+					}
+					return errors.New("forced abort")
+				}); err != nil {
+					txn.CleanupOnError(ctx, err)
+					if !force && commit {
+						t.Fatalf("expected success with commit == true; got %v", err)
+					}
+				}
+
+				// Verify that the transaction record is cleaned up.
+				testutils.SucceedsSoon(t, func() error {
+					kv, err := store.DB().Get(ctx, txnKey)
+					if err != nil {
+						return err
+					}
+					if kv.Value != nil {
+						return errors.Errorf("expected txn record %s to have been cleaned", txnKey)
+					}
+					return nil
+				})
+			})
+		}
+	}
+}
+
+func TestUnsplittableRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+
+	store := createTestStoreWithConfig(t, stopper, storage.TestStoreConfig(nil))
+	store.ForceSplitScanAndProcess()
+
+	// Add a single large row to /Table/14.
+	tableKey := keys.MakeTablePrefix(keys.UITableID)
+	row1Key := roachpb.Key(encoding.EncodeVarintAscending(append([]byte(nil), tableKey...), 1))
+	col1Key := keys.MakeFamilyKey(append([]byte(nil), row1Key...), 0)
+	value := bytes.Repeat([]byte("x"), 64<<10)
+	if err := store.DB().Put(context.Background(), col1Key, value); err != nil {
+		t.Fatal(err)
+	}
+
+	store.ForceSplitScanAndProcess()
 	testutils.SucceedsSoon(t, func() error {
-		if err := store.GossipStore(context.Background()); err != nil {
-			t.Fatal(err)
+		repl := store.LookupReplica(tableKey, nil)
+		if repl.Desc().StartKey.Equal(tableKey) {
+			return nil
 		}
-		if rangeCount := <-rangeCountCh; rangeCount != 10 {
-			return errors.Errorf("expected 10 ranges; got %d", rangeCount)
-		}
-		return nil
+		return errors.Errorf("waiting for split: %s", repl)
 	})
 
-	// Now, since we require 50% of range/lease count to re-gossip, verify
-	// that with 5 more splits, we gossip.
-	for i := 9; i < 14; i++ {
-		if pErr := splitFunc(i); pErr != nil {
-			t.Fatal(pErr)
+	repl := store.LookupReplica(tableKey, nil)
+	origMaxBytes := repl.GetMaxBytes()
+	repl.SetMaxBytes(int64(len(value)))
+
+	// Wait for an attempt to split the range which will fail because it contains
+	// a single large value. The max-bytes for the range will be changed, but it
+	// should not have been reset to its original value.
+	store.ForceSplitScanAndProcess()
+	testutils.SucceedsSoon(t, func() error {
+		maxBytes := repl.GetMaxBytes()
+		if maxBytes != int64(len(value)) && maxBytes < origMaxBytes {
+			return nil
+		}
+		return errors.Errorf("expected max-bytes to be changed: %d", repl.GetMaxBytes())
+	})
+
+	// Add two more rows to the range.
+	for i := int64(2); i < 4; i++ {
+		rowKey := roachpb.Key(encoding.EncodeVarintAscending(append([]byte(nil), tableKey...), i))
+		colKey := keys.MakeFamilyKey(append([]byte(nil), rowKey...), 0)
+		if err := store.DB().Put(context.Background(), colKey, value); err != nil {
+			t.Fatal(err)
 		}
 	}
 
-	if rangeCount := <-rangeCountCh; rangeCount != 15 {
-		t.Errorf("expected 15 ranges; got %d", rangeCount)
-	}
-
-	// However, with four more splits, expect no gossip.
-	for i := 14; i < 18; i++ {
-		if pErr := splitFunc(i); pErr != nil {
-			t.Fatal(pErr)
+	// Wait for the range to be split and verify that max-bytes was reset to the
+	// value in the zone config.
+	store.ForceSplitScanAndProcess()
+	testutils.SucceedsSoon(t, func() error {
+		if origMaxBytes == repl.GetMaxBytes() {
+			return nil
 		}
-	}
-	select {
-	case <-rangeCountCh:
-		t.Errorf("expected no further gossip")
-	default:
+		return errors.Errorf("expected max-bytes=%d, but got max-bytes=%d",
+			origMaxBytes, repl.GetMaxBytes())
+	})
+}
+
+// TestPushTxnQueueDependencyCycleWithRangeSplit verifies that a range
+// split which occurs while a dependency cycle is partially underway
+// will cause the pending push txns to be retried such that they
+// relocate to the appropriate new range.
+func TestPushTxnQueueDependencyCycleWithRangeSplit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	for _, read2ndPass := range []bool{false, true} {
+		t.Run(fmt.Sprintf("read-2nd-pass:%t", read2ndPass), func(t *testing.T) {
+			var pushCount int32
+			firstPush := make(chan struct{})
+
+			storeCfg := storage.TestStoreConfig(nil)
+			storeCfg.TestingKnobs.DisableSplitQueue = true
+			storeCfg.TestingKnobs.TestingEvalFilter =
+				func(filterArgs storagebase.FilterArgs) *roachpb.Error {
+					if _, ok := filterArgs.Req.(*roachpb.PushTxnRequest); ok {
+						if atomic.AddInt32(&pushCount, 1) == 1 {
+							close(firstPush)
+						}
+					}
+					return nil
+				}
+			stopper := stop.NewStopper()
+			defer stopper.Stop(context.TODO())
+			store := createTestStoreWithConfig(t, stopper, storeCfg)
+
+			lhsKey := roachpb.Key("a")
+			rhsKey := roachpb.Key("b")
+
+			// Split at "a".
+			args := adminSplitArgs(lhsKey, lhsKey)
+			if _, pErr := client.SendWrapped(context.Background(), rg1(store), args); pErr != nil {
+				t.Fatalf("split at %q: %s", lhsKey, pErr)
+			}
+			lhs := store.LookupReplica(roachpb.RKey("a"), nil)
+
+			var txnACount, txnBCount int32
+
+			txnAWritesA := make(chan struct{})
+			txnAProceeds := make(chan struct{})
+			txnBWritesB := make(chan struct{})
+			txnBProceeds := make(chan struct{})
+
+			// Start txn to write key a.
+			txnACh := make(chan error)
+			go func() {
+				txnACh <- store.DB().Txn(context.Background(), func(ctx context.Context, txn *client.Txn) error {
+					if err := txn.Put(ctx, lhsKey, "value"); err != nil {
+						return err
+					}
+					if atomic.LoadInt32(&txnACount) == 0 {
+						close(txnAWritesA)
+						<-txnAProceeds
+					}
+					atomic.AddInt32(&txnACount, 1)
+					return txn.Put(ctx, rhsKey, "value-from-A")
+				})
+			}()
+			<-txnAWritesA
+
+			// Start txn to write key b.
+			txnBCh := make(chan error)
+			go func() {
+				txnBCh <- store.DB().Txn(context.Background(), func(ctx context.Context, txn *client.Txn) error {
+					if err := txn.Put(ctx, rhsKey, "value"); err != nil {
+						return err
+					}
+					if atomic.LoadInt32(&txnBCount) == 0 {
+						close(txnBWritesB)
+						<-txnBProceeds
+					}
+					atomic.AddInt32(&txnBCount, 1)
+					// Read instead of write key "a" if directed. This caused a
+					// PUSH_TIMESTAMP to be issued from txn B instead of PUSH_ABORT.
+					if read2ndPass {
+						if _, err := txn.Get(ctx, lhsKey); err != nil {
+							return err
+						}
+					} else {
+						if err := txn.Put(ctx, lhsKey, "value-from-B"); err != nil {
+							return err
+						}
+					}
+					return nil
+				})
+			}()
+			<-txnBWritesB
+
+			// Now, let txnA proceed before splitting.
+			close(txnAProceeds)
+			// Wait for the push to occur.
+			<-firstPush
+
+			// Split at "b".
+			args = adminSplitArgs(rhsKey, rhsKey)
+			if _, pErr := client.SendWrappedWith(context.Background(), store, roachpb.Header{
+				RangeID: lhs.RangeID,
+			}, args); pErr != nil {
+				t.Fatalf("split at %q: %s", rhsKey, pErr)
+			}
+
+			// Now that we've split, allow txnB to proceed.
+			close(txnBProceeds)
+
+			// Verify that both complete.
+			for i, ch := range []chan error{txnACh, txnBCh} {
+				if err := <-ch; err != nil {
+					t.Fatalf("%d: txn failure: %v", i, err)
+				}
+			}
+		})
 	}
 }

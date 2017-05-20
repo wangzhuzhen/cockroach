@@ -25,6 +25,7 @@ import (
 	"io"
 	"net/url"
 	"sort"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	humanize "github.com/dustin/go-humanize"
@@ -87,7 +88,12 @@ func (a *AggregatorSpec) summary() (string, []string) {
 		if agg.Distinct {
 			distinct = "DISTINCT "
 		}
-		str := fmt.Sprintf("%s(%s@%d)", agg.Func, distinct, agg.ColIdx+1)
+		filter := ""
+		if agg.FilterColIdx != nil {
+			filter = fmt.Sprintf(" FILTER @%d", *agg.FilterColIdx+1)
+		}
+
+		str := fmt.Sprintf("%s(%s@%d)%s", agg.Func, distinct, agg.ColIdx+1, filter)
 		details = append(details, str)
 	}
 
@@ -118,10 +124,16 @@ func (jr *JoinReaderSpec) summary() (string, []string) {
 }
 
 func (hj *HashJoinerSpec) summary() (string, []string) {
-	details := []string{
-		fmt.Sprintf(
-			"ON left(%s)=right(%s)", colListStr(hj.LeftEqColumns), colListStr(hj.RightEqColumns),
-		),
+	details := make([]string, 0, 2)
+
+	if len(hj.LeftEqColumns) > 0 {
+		details = append(details, fmt.Sprintf(
+			"left(%s)=right(%s)",
+			colListStr(hj.LeftEqColumns), colListStr(hj.RightEqColumns),
+		))
+	}
+	if hj.OnExpr.Expr != "" {
+		details = append(details, fmt.Sprintf("ON %s", hj.OnExpr.Expr))
 	}
 	return "HashJoiner", details
 }
@@ -130,9 +142,6 @@ func (s *SorterSpec) summary() (string, []string) {
 	details := []string{s.OutputOrdering.diagramString()}
 	if s.OrderingMatchLen != 0 {
 		details = append(details, fmt.Sprintf("match len: %d", s.OrderingMatchLen))
-	}
-	if s.Limit != 0 {
-		details = append(details, fmt.Sprintf("limit: %d", s.Limit))
 	}
 	return "Sorter", details
 }
@@ -143,6 +152,16 @@ func (bf *BackfillerSpec) summary() (string, []string) {
 		fmt.Sprintf("Type: %s", bf.Type.String()),
 	}
 	return "Backfiller", details
+}
+
+func (d *DistinctSpec) summary() (string, []string) {
+	details := []string{
+		colListStr(d.DistinctColumns),
+	}
+	if len(d.OrderedColumns) > 0 {
+		details = append(details, fmt.Sprintf("Ordered: %s", colListStr(d.DistinctColumns)))
+	}
+	return "Distinct", details
 }
 
 func (is *InputSyncSpec) summary() (string, []string) {
@@ -176,15 +195,19 @@ func (post *PostProcessSpec) summary() []string {
 	if post.Filter.Expr != "" {
 		res = append(res, fmt.Sprintf("Filter: %s", post.Filter.Expr))
 	}
-	if len(post.OutputColumns) > 0 {
+	if post.Projection {
 		res = append(res, fmt.Sprintf("Out: %s", colListStr(post.OutputColumns)))
 	}
 	if len(post.RenderExprs) > 0 {
 		var buf bytes.Buffer
-		buf.WriteString("Render:")
-		for _, expr := range post.RenderExprs {
-			buf.WriteByte(' ')
-			buf.WriteString(expr.Expr)
+		buf.WriteString("Render: ")
+		for i, expr := range post.RenderExprs {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			// Remove any spaces in the expression (makes things more compact
+			// and it's easier to visually separate expressions).
+			buf.WriteString(strings.Replace(expr.Expr, " ", "", -1))
 		}
 		res = append(res, buf.String())
 	}
@@ -214,6 +237,7 @@ type diagramProcessor struct {
 	Inputs  []diagramCell `json:"inputs"`
 	Core    diagramCell   `json:"core"`
 	Outputs []diagramCell `json:"outputs"`
+	StageID int32         `json:"stage"`
 }
 
 type diagramEdge struct {
@@ -289,6 +313,7 @@ func generateDiagramData(flows []FlowSpec, nodeNames []string) (diagramData, err
 			} else {
 				proc.Outputs = []diagramCell{}
 			}
+			proc.StageID = p.StageID
 			d.Processors = append(d.Processors, proc)
 			pIdx++
 		}
@@ -385,11 +410,10 @@ func GeneratePlanDiagramWithURL(flows map[roachpb.NodeID]FlowSpec) (string, url.
 	if err := encoder.Close(); err != nil {
 		return "", url.URL{}, err
 	}
-	// TODO(radu): using raduberinde.github.io is temporary; #13758.
 	url := url.URL{
 		Scheme:   "https",
-		Host:     "raduberinde.github.io",
-		Path:     "decode.html",
+		Host:     "cockroachdb.github.io",
+		Path:     "distsqlplan/decode.html",
 		RawQuery: compressed.String(),
 	}
 

@@ -38,7 +38,6 @@ type upsertHelper struct {
 	evalExprs          []parser.TypedExpr
 	sourceInfo         *dataSourceInfo
 	excludedSourceInfo *dataSourceInfo
-	allExprsIdentity   bool
 	curSourceRow       parser.Datums
 	curExcludedRow     parser.Datums
 
@@ -89,7 +88,7 @@ func (p *planner) makeUpsertHelper(
 	updateExprs parser.UpdateExprs,
 	upsertConflictIndex *sqlbase.IndexDescriptor,
 ) (*upsertHelper, error) {
-	defaultExprs, err := makeDefaultExprs(updateCols, &p.parser, &p.evalCtx)
+	defaultExprs, err := sqlbase.MakeDefaultExprs(updateCols, &p.parser, &p.evalCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -100,22 +99,24 @@ func (p *planner) makeUpsertHelper(
 		if updateExpr.Tuple {
 			if t, ok := updateExpr.Expr.(*parser.Tuple); ok {
 				for _, e := range t.Exprs {
-					typ := updateCols[i].Type.ToDatumType()
-					e = fillDefault(e, typ, i, defaultExprs)
+					e = fillDefault(e, i, defaultExprs)
 					untupledExprs = append(untupledExprs, e)
 					i++
 				}
 			}
 		} else {
-			typ := updateCols[i].Type.ToDatumType()
-			e := fillDefault(updateExpr.Expr, typ, i, defaultExprs)
+			e := fillDefault(updateExpr.Expr, i, defaultExprs)
 			untupledExprs = append(untupledExprs, e)
 			i++
 		}
 	}
 
-	sourceInfo := newSourceInfoForSingleTable(*tn, makeResultColumns(tableDesc.Columns))
-	excludedSourceInfo := newSourceInfoForSingleTable(upsertExcludedTable, makeResultColumns(insertCols))
+	sourceInfo := newSourceInfoForSingleTable(
+		*tn, sqlbase.ResultColumnsFromColDescs(tableDesc.Columns),
+	)
+	excludedSourceInfo := newSourceInfoForSingleTable(
+		upsertExcludedTable, sqlbase.ResultColumnsFromColDescs(insertCols),
+	)
 
 	helper := &upsertHelper{
 		p:                  p,
@@ -134,22 +135,6 @@ func (p *planner) makeUpsertHelper(
 		evalExprs = append(evalExprs, normExpr)
 	}
 	helper.evalExprs = evalExprs
-
-	helper.allExprsIdentity = true
-	for _, expr := range evalExprs {
-		ivar, ok := expr.(*parser.IndexedVar)
-		if !ok {
-			helper.allExprsIdentity = false
-			break
-		}
-		// Idx on the IndexedVar references a columns from one of the two
-		// sources. They're ordered table source then excluded source. If any
-		// expr references a table column, then the fast path doesn't apply.
-		if ivar.Idx < len(sourceInfo.sourceColumns) {
-			helper.allExprsIdentity = false
-			break
-		}
-	}
 
 	return helper, nil
 }
@@ -177,10 +162,6 @@ func (uh *upsertHelper) eval(
 		}
 	}
 	return ret, nil
-}
-
-func (uh *upsertHelper) isIdentityEvaler() bool {
-	return uh.allExprsIdentity
 }
 
 // upsertExprsAndIndex returns the upsert conflict index and the (possibly

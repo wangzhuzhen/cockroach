@@ -23,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
@@ -38,10 +39,14 @@ type Iterator interface {
 	// SeekReverse advances the iterator to the first key in the engine which
 	// is <= the provided key.
 	SeekReverse(key MVCCKey)
-	// Valid returns true if the iterator is currently valid. An iterator that
-	// hasn't had Seek called on it or has gone past the end of the key range
-	// is invalid.
-	Valid() bool
+	// Valid must be called after any call to Seek(), Next(), Prev(), or
+	// similar methods. It returns (true, nil) if the iterator points to
+	// a valid key (it is undefined to call Key(), Value(), or similar
+	// methods unless Valid() has returned (true, nil)). It returns
+	// (false, nil) if the iterator has moved past the end of the valid
+	// range, or (false, err) if an error has occurred. Valid() will
+	// never return true with a non-nil error.
+	Valid() (bool, error)
 	// Next advances the iterator to the next key/value in the
 	// iteration. After this call, Valid() will be true if the
 	// iterator was not positioned at the last key.
@@ -67,17 +72,15 @@ type Iterator interface {
 	// ValueProto unmarshals the value the iterator is currently
 	// pointing to using a protobuf decoder.
 	ValueProto(msg proto.Message) error
-	// unsafeKey returns the same value as Key, but the memory is invalidated on
+	// UnsafeKey returns the same value as Key, but the memory is invalidated on
 	// the next call to {Next,Prev,Seek,SeekReverse,Close}.
 	UnsafeKey() MVCCKey
-	// unsafeKey returns the same value as Value, but the memory is invalidated
-	// on the next call to {Next,Prev,Seek,SeekReverse,Close}.
+	// UnsafeValue returns the same value as Value, but the memory is
+	// invalidated on the next call to {Next,Prev,Seek,SeekReverse,Close}.
 	UnsafeValue() []byte
 	// Less returns true if the key the iterator is currently positioned at is
 	// less than the specified key.
 	Less(key MVCCKey) bool
-	// Error returns the error, if any, which the iterator encountered.
-	Error() error
 	// ComputeStats scans the underlying engine from start to end keys and
 	// computes stats counters based on the values. This method is used after a
 	// range is split to recompute stats for each subrange. The start key is
@@ -120,6 +123,10 @@ type Reader interface {
 	// skipped). The caller must invoke Iterator.Close() when finished with the
 	// iterator to free resources.
 	NewIterator(prefix bool) Iterator
+	// NewTimeBoundIterator is like NewIterator, but the underlying iterator will
+	// efficiently skip over SSTs that contain no MVCC keys in the time range
+	// [start, end].
+	NewTimeBoundIterator(start, end hlc.Timestamp) Iterator
 }
 
 // Writer is the write interface to an engine's data.
@@ -180,6 +187,8 @@ type Engine interface {
 	Flush() error
 	// GetStats retrieves stats from the engine.
 	GetStats() (*Stats, error)
+	// GetTempDir returns a path under which tempdirs or tempfiles can be created.
+	GetTempDir() string
 	// NewBatch returns a new instance of a batched engine which wraps
 	// this engine. Batched engines accumulate all mutations and apply
 	// them atomically on a call to Commit().
@@ -199,6 +208,8 @@ type Engine interface {
 	// by invoking Close(). Note that snapshots must not be used after the
 	// original engine has been stopped.
 	NewSnapshot() Reader
+	// SetTempDir overrides the tempdir path returned by GetTempDir.
+	SetTempDir(dir string) error
 }
 
 // Batch is the interface for batch specific operations.

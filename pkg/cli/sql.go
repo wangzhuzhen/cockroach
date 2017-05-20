@@ -26,7 +26,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -75,7 +74,7 @@ type cliState struct {
 	checkSyntax bool
 	// Determines whether to store normalized syntax in the shell history
 	// when check_syntax is set.
-	// TODO(knz) this can possibly be set back to false by default when
+	// TODO(knz): this can possibly be set back to false by default when
 	// the upstream readline library handles multi-line history entries
 	// properly.
 	normalizeHistory bool
@@ -116,13 +115,6 @@ type cliState struct {
 	// doCheckStatement and then reused in doRunStatement().
 	concatLines string
 
-	// querySyntax determines whether to query the current syntax mode
-	// from the server before starting to read the next line of input.
-	querySyntax bool
-	// syntax determines the current syntax to use for scanning and parsing
-	// new lines of input.
-	syntax parser.Syntax
-
 	// exitErr defines the error to report to the user upon termination.
 	// This can carry over from one line of input to another. For
 	// example in the interactive shell, a statement causing a SQL
@@ -138,10 +130,6 @@ type cliStateEnum int
 const (
 	cliStart cliStateEnum = iota
 	cliStop
-
-	// Querying the server for the current syntax prior to starting
-	// input.
-	cliQuerySyntax
 
 	// Querying the server for the current transaction status
 	// and setting the prompt accordingly.
@@ -274,15 +262,19 @@ var options = map[string]struct {
 // handleSet supports the \set client-side command.
 func (c *cliState) handleSet(args []string, nextState, errState cliStateEnum) cliStateEnum {
 	if len(args) == 0 {
-		printQueryOutput(os.Stdout,
+		err := printQueryOutput(os.Stdout,
 			[]string{"Option", "Value"},
-			[][]string{
+			newRowSliceIter([][]string{
 				{"display_format", cliCtx.tableDisplayFormat.String()},
 				{"errexit", strconv.FormatBool(c.errExit)},
 				{"check_syntax", strconv.FormatBool(c.checkSyntax)},
 				{"normalize_history", strconv.FormatBool(c.normalizeHistory)},
-			},
+			}),
 			"set", cliCtx.tableDisplayFormat)
+		if err != nil {
+			panic(err)
+		}
+
 		return nextState
 	}
 	opt, ok := options[args[0]]
@@ -318,18 +310,15 @@ func (c *cliState) handleUnset(args []string, nextState, errState cliStateEnum) 
 	return nextState
 }
 
-func isEndOfStatement(fullStmt string, syntax parser.Syntax) (isEmpty, isEnd, hasSet bool) {
-	sc := parser.MakeScanner(fullStmt, syntax)
+func isEndOfStatement(fullStmt string) (isEmpty, isEnd bool) {
+	sc := parser.MakeScanner(fullStmt)
 	isEmpty = true
 	var last int
 	sc.Tokens(func(t int) {
 		isEmpty = false
 		last = t
-		if t == parser.SET {
-			hasSet = true
-		}
 	})
-	return isEmpty, last == ';', hasSet
+	return isEmpty, last == ';'
 }
 
 // execSyscmd executes system commands.
@@ -540,8 +529,6 @@ var cmdHistFile = envutil.EnvOrDefaultString("COCKROACH_SQL_CLI_HISTORY", ".cock
 
 func (c *cliState) doStart(nextState cliStateEnum) cliStateEnum {
 	// Common initialization.
-	c.syntax = parser.Traditional
-	c.querySyntax = true
 	c.partialLines = []string{}
 
 	if isInteractive {
@@ -550,14 +537,14 @@ func (c *cliState) doStart(nextState cliStateEnum) cliStateEnum {
 		// We only enable history management when the terminal is actually
 		// interactive. This saves on memory when e.g. piping a large SQL
 		// script through the command-line client.
-		userAcct, err := user.Current()
+		homeDir, err := envutil.HomeDir()
 		if err != nil {
 			if log.V(2) {
-				log.Warningf(context.TODO(), "cannot retrieve user information: %s", err)
+				log.Warningf(context.TODO(), "cannot retrieve user information: %v", err)
 				log.Info(context.TODO(), "cannot load or save the command-line history")
 			}
 		} else {
-			histFile := filepath.Join(userAcct.HomeDir, cmdHistFile)
+			histFile := filepath.Join(homeDir, cmdHistFile)
 			cfg := c.ins.Config.Clone()
 			cfg.HistoryFile = histFile
 			cfg.HistorySearchFold = true
@@ -581,39 +568,9 @@ func (c *cliState) doStart(nextState cliStateEnum) cliStateEnum {
 	return nextState
 }
 
-func getSyntax(conn *sqlConn) (parser.Syntax, error) {
-	_, rows, _, err := runQuery(conn, makeQuery("SHOW SYNTAX"), false)
-	if err != nil {
-		return 0, err
-	}
-	switch rows[0][0] {
-	case parser.Traditional.String():
-		return parser.Traditional, nil
-	case parser.Modern.String():
-		return parser.Modern, nil
-	}
-	return 0, fmt.Errorf("unknown syntax: %s", rows[0][0])
-}
-
-func (c *cliState) doQuerySyntax(nextState cliStateEnum) cliStateEnum {
-	if !c.querySyntax {
-		return nextState
-	}
-
-	newSyntax, err := getSyntax(c.conn)
-	if err != nil {
-		fmt.Fprintf(stderr, "warning: could not get session syntax: %s\n", err)
-		// For now this is just a warning.
-	} else {
-		c.syntax = newSyntax
-	}
-	return nextState
-}
-
 func (c *cliState) doStartLine(nextState cliStateEnum) cliStateEnum {
 	// Clear the input buffer.
 	c.atEOF = false
-	c.querySyntax = false
 	c.partialLines = c.partialLines[:0]
 	c.partialStmtsLen = 0
 
@@ -801,7 +758,7 @@ func (c *cliState) doPrepareStatementLine(
 		return startState
 	}
 
-	isEmpty, endsWithSemi, hasSet := isEndOfStatement(c.concatLines, c.syntax)
+	isEmpty, endsWithSemi := isEndOfStatement(c.concatLines)
 	if c.partialStmtsLen == 0 && isEmpty {
 		// More whitespace, or comments. Still nothing to do. However
 		// if the syntax was non-trivial to arrive here,
@@ -811,9 +768,6 @@ func (c *cliState) doPrepareStatementLine(
 		}
 		return startState
 	}
-
-	c.querySyntax = hasSet
-
 	if c.atEOF {
 		// Definitely no more input expected.
 		if !endsWithSemi {
@@ -839,8 +793,7 @@ func (c *cliState) doPrepareStatementLine(
 
 func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnum) cliStateEnum {
 	// From here on, client-side syntax checking is enabled.
-	var parser parser.Parser
-	parsedStmts, err := parser.Parse(c.concatLines, c.syntax)
+	parsedStmts, err := parser.Parse(c.concatLines)
 	if err != nil {
 		_ = c.invalidSyntax(0, "statement ignored: %v", err)
 
@@ -868,22 +821,35 @@ func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnu
 		return execState
 	}
 
+	var lastInputChunk bytes.Buffer
 	if c.normalizeHistory {
 		// Add statements, not lines, to the history.
+		// The last input chunk is one unit of input by the user, so
+		// we want the user to be able to recall it all at once
+		// (= one history entry)
 		for i := c.partialStmtsLen; i < len(parsedStmts); i++ {
-			c.addHistory(parsedStmts[i].String() + ";")
+			if i > c.partialStmtsLen {
+				lastInputChunk.WriteByte(' ')
+			}
+			fmt.Fprint(&lastInputChunk, parser.AsStringWithFlags(parsedStmts[i], parser.FmtParsable)+";")
 		}
 	} else {
 		// Add the last lines received to the history.
+		// Like above, this is one input chunk. However there may be
+		// sensitive newlines in string literals or SQL comments, so we
+		// can't blindly concatenate all the partial input into a single
+		// line. Leave them separate.
 		for i := c.partialStmtsLen; i < len(c.partialLines); i++ {
-			c.addHistory(c.partialLines[i])
+			fmt.Fprintln(&lastInputChunk, c.partialLines[i])
 		}
 	}
+	c.addHistory(lastInputChunk.String())
 
 	// Replace the last entered lines by the last entered statements.
 	c.partialLines = c.partialLines[:c.partialStmtsLen]
 	for i := c.partialStmtsLen; i < len(parsedStmts); i++ {
-		c.partialLines = append(c.partialLines, parsedStmts[i].String()+";")
+		c.partialLines = append(c.partialLines,
+			parser.AsStringWithFlags(parsedStmts[i], parser.FmtSimpleWithPasswords)+";")
 	}
 
 	nextState := execState
@@ -959,10 +925,7 @@ func runInteractive(conn *sqlConn, config *readline.Config) (exitErr error) {
 				c.buf = bufio.NewReader(stdin)
 			}
 
-			state = c.doStart(cliQuerySyntax)
-
-		case cliQuerySyntax:
-			state = c.doQuerySyntax(cliRefreshPrompts)
+			state = c.doStart(cliRefreshPrompts)
 
 		case cliRefreshPrompts:
 			state = c.doRefreshPrompts(cliStartLine)
@@ -994,7 +957,7 @@ func runInteractive(conn *sqlConn, config *readline.Config) (exitErr error) {
 			state = c.doCheckStatement(cliRefreshPrompts, cliContinueLine, cliRunStatement)
 
 		case cliRunStatement:
-			state = c.doRunStatement(cliQuerySyntax)
+			state = c.doRunStatement(cliRefreshPrompts)
 
 		default:
 			panic(fmt.Sprintf("unknown state: %d", state))

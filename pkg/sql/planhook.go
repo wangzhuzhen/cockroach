@@ -19,7 +19,9 @@ package sql
 import (
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // planHookFn is a function that can intercept a statement being planned and
@@ -27,12 +29,12 @@ import (
 // implementation of certain sql statements to live outside of the sql package.
 //
 // To intercept a statement the function should return a non-nil function for
-// `fn` as well as the appropriate ResultColumns describing the results it will
+// `fn` as well as the appropriate sqlbase.ResultColumns describing the results it will
 // return (if any). `fn` will be called during the `Start` phase of plan
 // execution.
 type planHookFn func(
 	context.Context, parser.Statement, PlanHookState,
-) (fn func() ([]parser.Datums, error), header ResultColumns, err error)
+) (fn func() ([]parser.Datums, error), header sqlbase.ResultColumns, err error)
 
 var planHooks []planHookFn
 
@@ -42,6 +44,10 @@ var planHooks []planHookFn
 // the hooks that implement it.
 type PlanHookState interface {
 	ExecCfg() *ExecutorConfig
+	LeaseMgr() *LeaseManager
+	TypeAsString(e parser.Expr, op string) (func() (string, error), error)
+	TypeAsStringArray(e parser.Exprs, op string) (func() ([]string, error), error)
+	User() string
 	AuthorizationAccessor
 }
 
@@ -57,7 +63,7 @@ func AddPlanHook(f planHookFn) {
 type hookFnNode struct {
 	f func() ([]parser.Datums, error)
 
-	header ResultColumns
+	header sqlbase.ResultColumns
 
 	res    []parser.Datums
 	resIdx int
@@ -67,13 +73,17 @@ func (*hookFnNode) Ordering() orderingInfo  { return orderingInfo{} }
 func (*hookFnNode) MarkDebug(_ explainMode) {}
 func (*hookFnNode) Close(context.Context)   {}
 
+func (*hookFnNode) Spans(context.Context) (_, _ roachpb.Spans, _ error) {
+	panic("unimplemented")
+}
+
 func (f *hookFnNode) Start(context.Context) error {
 	var err error
 	f.res, err = f.f()
 	f.resIdx = -1
 	return err
 }
-func (f *hookFnNode) Columns() ResultColumns {
+func (f *hookFnNode) Columns() sqlbase.ResultColumns {
 	return f.header
 }
 func (f *hookFnNode) Next(context.Context) (bool, error) {

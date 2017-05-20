@@ -36,25 +36,30 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 var errNoTransactionInProgress = errors.New("there is no transaction in progress")
 var errStaleMetadata = errors.New("metadata is still stale")
 var errTransactionInProgress = errors.New("there is already a transaction in progress")
-var errNotRetriable = errors.New("the transaction is not in a retriable state")
+
+func errWrongNumberOfPreparedStatements(n int) error {
+	return pgerror.NewErrorf(pgerror.CodeInvalidPreparedStatementDefinitionError,
+		"prepared statement had %d statements, expected 1", n)
+}
 
 const sqlTxnName string = "sql txn"
 const sqlImplicitTxnName string = "sql txn implicit"
@@ -62,67 +67,55 @@ const metricsSampleInterval = 10 * time.Second
 
 // Fully-qualified names for metrics.
 var (
-	MetaTxnBegin           = metric.Metadata{Name: "sql.txn.begin.count"}
-	MetaTxnCommit          = metric.Metadata{Name: "sql.txn.commit.count"}
-	MetaTxnAbort           = metric.Metadata{Name: "sql.txn.abort.count"}
-	MetaTxnRollback        = metric.Metadata{Name: "sql.txn.rollback.count"}
-	MetaSelect             = metric.Metadata{Name: "sql.select.count"}
-	MetaSQLExecLatency     = metric.Metadata{Name: "sql.exec.latency"}
-	MetaDistSQLSelect      = metric.Metadata{Name: "sql.distsql.select.count"}
-	MetaDistSQLExecLatency = metric.Metadata{Name: "sql.distsql.exec.latency"}
-	MetaUpdate             = metric.Metadata{Name: "sql.update.count"}
-	MetaInsert             = metric.Metadata{Name: "sql.insert.count"}
-	MetaDelete             = metric.Metadata{Name: "sql.delete.count"}
-	MetaDdl                = metric.Metadata{Name: "sql.ddl.count"}
-	MetaMisc               = metric.Metadata{Name: "sql.misc.count"}
-	MetaQuery              = metric.Metadata{Name: "sql.query.count"}
+	MetaTxnBegin = metric.Metadata{
+		Name: "sql.txn.begin.count",
+		Help: "Number of SQL transaction BEGIN statements"}
+	MetaTxnCommit = metric.Metadata{
+		Name: "sql.txn.commit.count",
+		Help: "Number of SQL transaction COMMIT statements"}
+	MetaTxnAbort = metric.Metadata{
+		Name: "sql.txn.abort.count",
+		Help: "Number of SQL transaction ABORT statements"}
+	MetaTxnRollback = metric.Metadata{
+		Name: "sql.txn.rollback.count",
+		Help: "Number of SQL transaction ROLLBACK statements"}
+	MetaSelect = metric.Metadata{
+		Name: "sql.select.count",
+		Help: "Number of SQL SELECT statements"}
+	MetaSQLExecLatency = metric.Metadata{
+		Name: "sql.exec.latency",
+		Help: "Latency of SQL statement execution"}
+	MetaSQLServiceLatency = metric.Metadata{
+		Name: "sql.service.latency",
+		Help: "Latency of SQL request execution"}
+	MetaDistSQLSelect = metric.Metadata{
+		Name: "sql.distsql.select.count",
+		Help: "Number of dist-SQL SELECT statements"}
+	MetaDistSQLExecLatency = metric.Metadata{
+		Name: "sql.distsql.exec.latency",
+		Help: "Latency of dist-SQL statement execution"}
+	MetaDistSQLServiceLatency = metric.Metadata{
+		Name: "sql.distsql.service.latency",
+		Help: "Latency of dist-SQL request execution"}
+	MetaUpdate = metric.Metadata{
+		Name: "sql.update.count",
+		Help: "Number of SQL UPDATE statements"}
+	MetaInsert = metric.Metadata{
+		Name: "sql.insert.count",
+		Help: "Number of SQL INSERT statements"}
+	MetaDelete = metric.Metadata{
+		Name: "sql.delete.count",
+		Help: "Number of SQL DELETE statements"}
+	MetaDdl = metric.Metadata{
+		Name: "sql.ddl.count",
+		Help: "Number of SQL DDL statements"}
+	MetaMisc = metric.Metadata{
+		Name: "sql.misc.count",
+		Help: "Number of other SQL statements"}
+	MetaQuery = metric.Metadata{
+		Name: "sql.query.count",
+		Help: "Number of SQL queries"}
 )
-
-// distSQLExecMode controls if and when the Executor uses DistSQL.
-type distSQLExecMode int
-
-const (
-	// distSQLOff means that we never use distSQL.
-	distSQLOff distSQLExecMode = iota
-	// distSQLAuto means that we automatically decide on a case-by-case basis if
-	// we use distSQL.
-	distSQLAuto
-	// distSQLOn means that we use distSQL for queries that are supported.
-	distSQLOn
-	// distSQLAlways means that we only use distSQL; unsupported queries fail.
-	distSQLAlways
-)
-
-func distSQLExecModeFromString(val string) distSQLExecMode {
-	switch strings.ToUpper(val) {
-	case "OFF":
-		return distSQLOff
-	case "AUTO":
-		return distSQLAuto
-	case "ON":
-		return distSQLOn
-	case "ALWAYS":
-		return distSQLAlways
-	default:
-		panic(fmt.Sprintf("unknown DistSQL mode %s", val))
-	}
-}
-
-// defaultDistSQLMode controls the default DistSQL mode (see above). It can
-// still be overridden per-session using `SET DIST_SQL = ...`.
-var defaultDistSQLMode = distSQLExecModeFromString(
-	envutil.EnvOrDefaultString("COCKROACH_DISTSQL_MODE", "OFF"),
-)
-
-// SetDefaultDistSQLMode changes the default DistSQL mode; returns a function
-// that can be used to restore the previous mode.
-func SetDefaultDistSQLMode(mode string) func() {
-	prevMode := defaultDistSQLMode
-	defaultDistSQLMode = distSQLExecModeFromString(mode)
-	return func() {
-		defaultDistSQLMode = prevMode
-	}
-}
 
 type traceResult struct {
 	tag   string
@@ -173,11 +166,11 @@ type Result struct {
 	// the names and types of the columns returned in the result set in the order
 	// specified in the SQL statement. The number of columns will equal the number
 	// of values in each Row.
-	Columns ResultColumns
+	Columns sqlbase.ResultColumns
 	// Rows will be populated if the statement type is "Rows". It will contain
 	// the result set of the result.
 	// TODO(nvanbenschoten): Can this be streamed from the planNode?
-	Rows *RowContainer
+	Rows *sqlbase.RowContainer
 }
 
 // Close ensures that the resources claimed by the result are released.
@@ -188,22 +181,6 @@ func (r *Result) Close(ctx context.Context) {
 		r.Rows.Close(ctx)
 	}
 }
-
-// ResultColumn contains the name and type of a SQL "cell".
-type ResultColumn struct {
-	Name string
-	Typ  parser.Type
-
-	// If set, this is an implicit column; used internally.
-	hidden bool
-
-	// If set, a value won't be produced for this column; used internally.
-	omitted bool
-}
-
-// ResultColumns is the type used throughout the sql module to
-// describe the column types of a table.
-type ResultColumns []ResultColumn
 
 // An Executor executes SQL statements.
 // Executor is thread-safe.
@@ -216,10 +193,12 @@ type Executor struct {
 	// Transient stats.
 	SelectCount *metric.Counter
 	// The subset of SELECTs that are processed through DistSQL.
-	DistSQLSelectCount *metric.Counter
-	DistSQLExecLatency *metric.Histogram
-	SQLExecLatency     *metric.Histogram
-	TxnBeginCount      *metric.Counter
+	DistSQLSelectCount    *metric.Counter
+	DistSQLExecLatency    *metric.Histogram
+	SQLExecLatency        *metric.Histogram
+	DistSQLServiceLatency *metric.Histogram
+	SQLServiceLatency     *metric.Histogram
+	TxnBeginCount         *metric.Counter
 
 	// txnCommitCount counts the number of times a COMMIT was attempted.
 	TxnCommitCount *metric.Counter
@@ -254,6 +233,7 @@ type Executor struct {
 // a Executor; the rest will have sane defaults set if omitted.
 type ExecutorConfig struct {
 	AmbientCtx   log.AmbientContext
+	ClusterID    func() uuid.UUID
 	NodeID       *base.NodeIDContainer
 	DB           *client.DB
 	Gossip       *gossip.Gossip
@@ -267,6 +247,10 @@ type ExecutorConfig struct {
 	SchemaChangerTestingKnobs *SchemaChangerTestingKnobs
 	// HistogramWindowInterval is (server.Context).HistogramWindowInterval.
 	HistogramWindowInterval time.Duration
+
+	// Caches updated by DistSQL.
+	RangeDescriptorCache *kv.RangeDescriptorCache
+	LeaseHolderCache     *kv.LeaseHolderCache
 }
 
 var _ base.ModuleTestingKnobs = &ExecutorTestingKnobs{}
@@ -294,6 +278,12 @@ type ExecutorTestingKnobs struct {
 	// statement has been executed.
 	StatementFilter StatementFilter
 
+	// BeforePrepare is called by the Executor before preparing any statement. It
+	// gives access to the planner that will be used to do the prepare. If any of
+	// the return values are not nil, the values are used as the prepare results
+	// and normal preparation is short-circuited.
+	BeforePrepare func(ctx context.Context, stmt string, planner *planner) (*PreparedStatement, error)
+
 	// DisableAutoCommit, if set, disables the auto-commit functionality of some
 	// SQL statements. That functionality allows some statements to commit
 	// directly when they're executed in an implicit SQL txn, without waiting for
@@ -302,6 +292,20 @@ type ExecutorTestingKnobs struct {
 	// StatementFilter; otherwise, the statement commits immediately after
 	// execution so there'll be nothing left to abort by the time the filter runs.
 	DisableAutoCommit bool
+
+	// If OverrideDistSQLMode is set, it is used instead of the cluster setting.
+	OverrideDistSQLMode *settings.EnumSetting
+
+	// DistSQLPlannerKnobs are testing knobs for distSQLPlanner.
+	DistSQLPlannerKnobs DistSQLPlannerTestingKnobs
+}
+
+// DistSQLPlannerTestingKnobs is used to control internals of the distSQLPlanner
+// for testing purposes.
+type DistSQLPlannerTestingKnobs struct {
+	// If OverrideSQLHealthCheck is set, we use this callback to get the health of
+	// a node.
+	OverrideHealthCheck func(node roachpb.NodeID, addrString string) error
 }
 
 // NewExecutor creates an Executor and registers a callback on the
@@ -323,6 +327,10 @@ func NewExecutor(cfg ExecutorConfig, stopper *stop.Stopper) *Executor {
 			6*metricsSampleInterval),
 		SQLExecLatency: metric.NewLatency(MetaSQLExecLatency,
 			6*metricsSampleInterval),
+		DistSQLServiceLatency: metric.NewLatency(MetaDistSQLServiceLatency,
+			6*metricsSampleInterval),
+		SQLServiceLatency: metric.NewLatency(MetaSQLServiceLatency,
+			6*metricsSampleInterval),
 		UpdateCount: metric.NewCounter(MetaUpdate),
 		InsertCount: metric.NewCounter(MetaInsert),
 		DeleteCount: metric.NewCounter(MetaDelete),
@@ -340,13 +348,20 @@ func (e *Executor) Start(
 	ctx = e.AnnotateCtx(ctx)
 	log.Infof(ctx, "creating distSQLPlanner with address %s", nodeDesc.Address)
 	e.distSQLPlanner = newDistSQLPlanner(
-		nodeDesc, e.cfg.RPCContext, e.cfg.DistSQLSrv, e.cfg.DistSender, e.cfg.Gossip,
+		nodeDesc,
+		e.cfg.RPCContext,
+		e.cfg.DistSQLSrv,
+		e.cfg.DistSender,
+		e.cfg.Gossip,
+		e.stopper,
+		e.cfg.TestingKnobs.DistSQLPlannerKnobs,
 	)
 
+	e.databaseCache = newDatabaseCache(e.systemConfig)
 	e.systemConfigCond = sync.NewCond(e.systemConfigMu.RLocker())
 
 	gossipUpdateC := e.cfg.Gossip.RegisterSystemConfigChannel()
-	e.stopper.RunWorker(func() {
+	e.stopper.RunWorker(ctx, func(ctx context.Context) {
 		for {
 			select {
 			case <-gossipUpdateC:
@@ -361,7 +376,7 @@ func (e *Executor) Start(
 	ctx = log.WithLogTag(ctx, "startup", nil)
 	startupSession := NewSession(ctx, SessionArgs{}, e, nil, startupMemMetrics)
 	startupSession.StartUnlimitedMonitor()
-	if err := e.virtualSchemas.init(ctx, &startupSession.planner); err != nil {
+	if err := e.virtualSchemas.init(ctx, startupSession.newPlanner(e, nil)); err != nil {
 		log.Fatal(ctx, err)
 	}
 	startupSession.Finish(e)
@@ -385,36 +400,31 @@ func (e *Executor) updateSystemConfig(cfg config.SystemConfig) {
 	defer e.systemConfigMu.Unlock()
 	e.systemConfig = cfg
 	// The database cache gets reset whenever the system config changes.
-	e.databaseCache = &databaseCache{
-		databases: map[string]sqlbase.ID{},
-	}
+	e.databaseCache = newDatabaseCache(cfg)
 	e.systemConfigCond.Broadcast()
 }
 
-// getSystemConfig returns a copy of the latest system config.
-func (e *Executor) getSystemConfig() (config.SystemConfig, *databaseCache) {
+// getDatabaseCache returns a database cache with a copy of the latest
+// system config.
+func (e *Executor) getDatabaseCache() *databaseCache {
 	e.systemConfigMu.RLock()
 	defer e.systemConfigMu.RUnlock()
-	cfg, cache := e.systemConfig, e.databaseCache
-	return cfg, cache
+	cache := e.databaseCache
+	return cache
 }
 
 // Prepare returns the result types of the given statement. pinfo may
 // contain partial type information for placeholders. Prepare will
 // populate the missing types. The PreparedStatement is returned (or
-// nil if there are no results).
+// nil if there are no results). An error is returned if there is more than
+// one statement in the statement list.
 func (e *Executor) Prepare(
-	query string, session *Session, pinfo parser.PlaceholderTypes,
+	stmts parser.StatementList, session *Session, pinfo parser.PlaceholderTypes,
 ) (*PreparedStatement, error) {
-	log.VEventf(session.Ctx(), 2, "preparing: %s", query)
-	var p parser.Parser
-	stmts, err := p.Parse(query, session.Syntax)
-	if err != nil {
-		return nil, err
-	}
+	session.resetForBatch(e)
+	sessionEventf(session, "preparing: %s", stmts)
 
 	prepared := &PreparedStatement{
-		Query:       query,
 		SQLTypes:    pinfo,
 		portalNames: make(map[string]struct{}),
 	}
@@ -424,44 +434,53 @@ func (e *Executor) Prepare(
 	case 1:
 		// ignore
 	default:
-		return nil, errors.Errorf("expected 1 statement, but found %d", len(stmts))
+		return nil, errWrongNumberOfPreparedStatements(len(stmts))
 	}
 	stmt := stmts[0]
-	prepared.Type = stmt.StatementType()
-	if err = pinfo.ProcessPlaceholderAnnotations(stmt); err != nil {
+	prepared.Statement = stmt
+	if err := pinfo.ProcessPlaceholderAnnotations(stmt); err != nil {
 		return nil, err
 	}
-	protoTS, err := isAsOf(&session.planner, stmt, e.cfg.Clock.Now())
+	protoTS, err := isAsOf(session, stmt, e.cfg.Clock.Now())
 	if err != nil {
 		return nil, err
 	}
 
-	session.planner.resetForBatch(e)
-	session.planner.semaCtx.Placeholders.SetTypes(pinfo)
-	session.planner.evalCtx.PrepareOnly = true
-
 	// Prepare needs a transaction because it needs to retrieve db/table
 	// descriptors for type checking.
-	// TODO(andrei): is this OK? If we're preparing as part of a SQL txn, how do
-	// we check that they're reading descriptors consistent with the txn in which
-	// they'll be used?
-	txn := client.NewTxn(e.cfg.DB)
-	if err := txn.SetIsolation(session.DefaultIsolationLevel); err != nil {
-		panic(err)
+	txn := session.TxnState.txn
+	if txn == nil {
+		// The new txn need not be the same transaction used by statements following
+		// this prepare statement because it can only be used by prepare() to get a
+		// table lease that is eventually added to the session.
+		//
+		// TODO(vivek): perhaps we should be more consistent and update
+		// session.TxnState.txn, but more thought needs to be put into whether that
+		// is really needed.
+		txn = client.NewTxn(e.cfg.DB)
+		if err := txn.SetIsolation(session.DefaultIsolationLevel); err != nil {
+			panic(err)
+		}
+		txn.Proto().OrigTimestamp = e.cfg.Clock.Now()
 	}
-	session.planner.setTxn(txn)
-	defer session.planner.setTxn(nil)
+
+	planner := session.newPlanner(e, txn)
+	planner.semaCtx.Placeholders.SetTypes(pinfo)
+	planner.evalCtx.PrepareOnly = true
 
 	if protoTS != nil {
-		session.planner.avoidCachedDescriptors = true
-		defer func() {
-			session.planner.avoidCachedDescriptors = false
-		}()
-
-		SetTxnTimestamps(txn, *protoTS)
+		planner.avoidCachedDescriptors = true
+		txn.SetFixedTimestamp(*protoTS)
 	}
 
-	plan, err := session.planner.prepare(session.Ctx(), stmt)
+	if filter := e.cfg.TestingKnobs.BeforePrepare; filter != nil {
+		res, err := filter(session.Ctx(), stmt.String(), planner)
+		if res != nil || err != nil {
+			return res, err
+		}
+	}
+
+	plan, err := planner.prepare(session.Ctx(), stmt)
 	if err != nil {
 		return nil, err
 	}
@@ -478,34 +497,65 @@ func (e *Executor) Prepare(
 	return prepared, nil
 }
 
+// logIfPanicking intercepts a panic and adds extra logs to it before
+// repanicking. It must be deferred directly, not from within another deferred
+// function.
+func logIfPanicking(ctx context.Context, sql string) {
+	if r := recover(); r != nil {
+		log.Shout(ctx, log.Severity_ERROR, "a SQL panic has occurred!")
+		// On a panic, prepend the executed SQL.
+		panic(fmt.Errorf("%s: %v", sql, r))
+	}
+}
+
 // ExecuteStatements executes the given statement(s) and returns a response.
 func (e *Executor) ExecuteStatements(
 	session *Session, stmts string, pinfo *parser.PlaceholderInfo,
 ) StatementResults {
-	session.planner.resetForBatch(e)
-	session.planner.semaCtx.Placeholders.Assign(pinfo)
-	session.planner.phaseTimes[sessionStartBatch] = timeutil.Now()
+	session.resetForBatch(e)
+	session.phaseTimes[sessionStartBatch] = timeutil.Now()
 
-	defer func() {
-		if r := recover(); r != nil {
-			// On a panic, prepend the executed SQL.
-			panic(fmt.Errorf("%s: %s", stmts, r))
-		}
-	}()
+	defer logIfPanicking(session.Ctx(), stmts)
 
 	// Send the Request for SQL execution and set the application-level error
 	// for each result in the reply.
-	return e.execRequest(session, stmts, copyMsgNone)
+	return e.execRequest(session, stmts, pinfo, copyMsgNone)
+}
+
+// ExecutePreparedStatement executes the given statement and returns a response.
+func (e *Executor) ExecutePreparedStatement(
+	session *Session, stmt *PreparedStatement, pinfo *parser.PlaceholderInfo,
+) StatementResults {
+
+	var stmts parser.StatementList
+	if stmt.Statement != nil {
+		stmts = parser.StatementList{stmt.Statement}
+	}
+
+	defer logIfPanicking(session.Ctx(), stmts.String())
+
+	{
+		// No parsing is taking place, but we need to set the parsing phase time
+		// because the service latency is measured from
+		// phaseTimes[sessionStartParse].
+		now := timeutil.Now()
+		session.phaseTimes[sessionStartParse] = now
+		session.phaseTimes[sessionEndParse] = now
+	}
+
+	// Send the Request for SQL execution and set the application-level error
+	// for each result in the reply.
+	return e.execParsed(session, stmts, pinfo, copyMsgNone)
 }
 
 // CopyData adds data to the COPY buffer and executes if there are enough rows.
 func (e *Executor) CopyData(session *Session, data string) StatementResults {
-	return e.execRequest(session, data, copyMsgData)
+	return e.execRequest(session, data, nil, copyMsgData)
 }
 
 // CopyDone executes the buffered COPY data.
 func (e *Executor) CopyDone(session *Session) StatementResults {
-	return e.execRequest(session, "", copyMsgDone)
+	return e.execRequest(session, "", nil, copyMsgDone)
 }
 
 // CopyEnd ends the COPY mode. Any buffered data is discarded.
@@ -523,13 +573,33 @@ func (e *Executor) blockConfigUpdates() func() {
 	}
 }
 
+// blockConfigUpdatesMaybe will ask the Executor to block config updates,
+// so that checkTestingVerifyMetadataInitialOrDie() can later be run.
+// The point is to lock the system config so that no gossip updates sneak in
+// under us, so that we're able to assert that the verify callback only succeeds
+// after a gossip update.
+//
+// It returns an unblock function which can be called after
+// checkTestingVerifyMetadata{Initial}OrDie() has been called.
+//
+// This lock does not change semantics. Even outside of tests, the Executor uses
+// static systemConfig for a user request, so locking the Executor's
+// systemConfig cannot change the semantics of the SQL operation being performed
+// under lock.
+func (e *Executor) blockConfigUpdatesMaybe() func() {
+	if !e.cfg.TestingKnobs.WaitForGossipUpdate {
+		return func() {}
+	}
+	return e.blockConfigUpdates()
+}
+
 // waitForConfigUpdate blocks the caller until a new SystemConfig is received
 // via gossip. This can only be called after blockConfigUpdates().
 func (e *Executor) waitForConfigUpdate() {
 	e.systemConfigCond.Wait()
 }
 
-// execRequest executes the request using the provided planner.
+// execRequest executes the request in the provided Session.
 // It parses the sql into statements, iterates through the statements, creates
 // KV transactions and automatically retries them when possible, and executes
 // the (synchronous attempt of) schema changes.
@@ -542,33 +612,29 @@ func (e *Executor) waitForConfigUpdate() {
 // callbacks passed to be executed in the context of a transaction. Actual
 // execution of statements in the context of a KV txn is delegated to
 // runTxnAttempt().
-//
-// Args:
-//  txnState: State about about ongoing transaction (if any). The state will be
-//   updated.
-func (e *Executor) execRequest(session *Session, sql string, copymsg copyMsg) StatementResults {
-	var res StatementResults
-	txnState := &session.TxnState
-	planMaker := &session.planner
+func (e *Executor) execRequest(
+	session *Session, sql string, pinfo *parser.PlaceholderInfo, copymsg copyMsg,
+) StatementResults {
 	var stmts parser.StatementList
 	var err error
+	txnState := &session.TxnState
 
-	if log.V(2) {
+	if log.V(2) || logStatementsExecuteEnabled.Get() {
 		log.Infof(session.Ctx(), "execRequest: %s", sql)
 	}
 
-	planMaker.phaseTimes[sessionStartParse] = timeutil.Now()
+	session.phaseTimes[sessionStartParse] = timeutil.Now()
 	if session.copyFrom != nil {
-		stmts, err = session.planner.ProcessCopyData(session.Ctx(), sql, copymsg)
+		stmts, err = session.ProcessCopyData(session.Ctx(), sql, copymsg)
 	} else if copymsg != copyMsgNone {
 		err = fmt.Errorf("unexpected copy command")
 	} else {
-		stmts, err = planMaker.parser.Parse(sql, session.Syntax)
+		stmts, err = parser.Parse(sql)
 	}
-	planMaker.phaseTimes[sessionEndParse] = timeutil.Now()
+	session.phaseTimes[sessionEndParse] = timeutil.Now()
 
 	if err != nil {
-		if log.V(2) {
+		if log.V(2) || logStatementsExecuteEnabled.Get() {
 			log.Infof(session.Ctx(), "execRequest: error: %v", err)
 		}
 		// A parse error occurred: we can't determine if there were multiple
@@ -577,16 +643,27 @@ func (e *Executor) execRequest(session *Session, sql string, copymsg copyMsg) St
 			// Rollback the txn.
 			txnState.updateStateAndCleanupOnErr(err, e)
 		}
+		var res StatementResults
 		res.ResultList = append(res.ResultList, Result{Err: err})
 		return res
 	}
+	return e.execParsed(session, stmts, pinfo, copymsg)
+}
+
+func (e *Executor) execParsed(
+	session *Session, stmts parser.StatementList, pinfo *parser.PlaceholderInfo, copymsg copyMsg,
+) StatementResults {
+	var res StatementResults
+	var avoidCachedDescriptors bool
+	txnState := &session.TxnState
+
 	if len(stmts) == 0 {
 		res.Empty = true
 		return res
 	}
 
-	// If the planMaker wants config updates to be blocked, then block them.
-	defer planMaker.blockConfigUpdatesMaybe(e)()
+	// If the Executor wants config updates to be blocked, then block them.
+	defer e.blockConfigUpdatesMaybe()()
 
 	for len(stmts) > 0 {
 		// Each iteration consumes a transaction's worth of statements.
@@ -612,16 +689,18 @@ func (e *Executor) execRequest(session *Session, sql string, copymsg copyMsg) St
 				stmtsToExec = stmtsToExec[:1]
 				// Check for AS OF SYSTEM TIME. If it is present but not detected here,
 				// it will raise an error later on.
-				protoTS, err = isAsOf(planMaker, stmtsToExec[0], e.cfg.Clock.Now())
+				var err error
+				protoTS, err = isAsOf(session, stmtsToExec[0], e.cfg.Clock.Now())
 				if err != nil {
 					res.ResultList = append(res.ResultList, Result{Err: err})
 					return res
 				}
 				if protoTS != nil {
-					planMaker.avoidCachedDescriptors = true
-					defer func() {
-						planMaker.avoidCachedDescriptors = false
-					}()
+					// When running AS OF SYSTEM TIME queries, we want to use the
+					// table descriptors from the specified time, and never lease
+					// anything. To do this, we pass down the avoidCachedDescriptors
+					// flag and set the transaction's timestamp to the specified time.
+					avoidCachedDescriptors = true
 				}
 			}
 			txnState.resetForNewSQLTxn(e, session)
@@ -655,7 +734,7 @@ func (e *Executor) execRequest(session *Session, sql string, copymsg copyMsg) St
 			txnState.txn = txn
 
 			if protoTS != nil {
-				SetTxnTimestamps(txnState.txn, *protoTS)
+				txnState.txn.SetFixedTimestamp(*protoTS)
 			}
 
 			var err error
@@ -664,7 +743,8 @@ func (e *Executor) execRequest(session *Session, sql string, copymsg copyMsg) St
 				ResultList(results).Close(ctx)
 			}
 			results, remainingStmts, err = runTxnAttempt(
-				e, planMaker, origState, txnState, opt, stmtsToExec, automaticRetryCount)
+				e, session, stmtsToExec, pinfo, origState, opt,
+				avoidCachedDescriptors, automaticRetryCount)
 
 			// TODO(andrei): Until #7881 fixed.
 			if err == nil && txnState.State == Aborted {
@@ -696,7 +776,7 @@ func (e *Executor) execRequest(session *Session, sql string, copymsg copyMsg) St
 			lastRes.Err = convertToErrWithPGCode(err)
 		}
 
-		if err != nil && log.V(2) {
+		if err != nil && (log.V(2) || logStatementsExecuteEnabled.Get()) {
 			log.Infof(session.Ctx(), "execRequest: error: %v", err)
 		}
 
@@ -707,25 +787,28 @@ func (e *Executor) execRequest(session *Session, sql string, copymsg copyMsg) St
 			if aErr, ok := err.(*client.AutoCommitError); ok {
 				// TODO(andrei): Until #7881 fixed.
 				{
-					log.Eventf(session.Ctx(), "executor got AutoCommitError: %s\n"+
-						"txn: %+v\nexecOpt.AutoRetry %t, execOpt.AutoCommit:%t, stmts %+v, remaining %+v",
-						aErr, txnState.txn.Proto(), execOpt.AutoRetry, execOpt.AutoCommit, stmts,
-						remainingStmts)
-					if txnState.txn == nil {
+					if txnState.txn != nil {
+						log.Eventf(session.Ctx(), "executor got AutoCommitError: %s\n"+
+							"txn: %+v\nexecOpt.AutoRetry %t, execOpt.AutoCommit:%t, stmts %+v, remaining %+v",
+							aErr, txnState.txn.Proto(), execOpt.AutoRetry, execOpt.AutoCommit, stmts,
+							remainingStmts)
+					} else {
 						log.Errorf(session.Ctx(), "7881: AutoCommitError on nil txn: %s, "+
-							"txnState %+v, execOpt %+v, stmts %+v, remaining %+v",
-							aErr, txnState, execOpt, stmts, remainingStmts)
+							"txnState %+v, execOpt %+v, stmts %+v, remaining %+v, txn captured before executing batch: %+v",
+							aErr, txnState, execOpt, stmts, remainingStmts, txn)
 						txnState.sp.SetBaggageItem(keyFor7881Sample, "sample me please")
 					}
 				}
 				e.TxnAbortCount.Inc(1)
+				// TODO(andrei): Once 7881 is fixed, this should be
+				// txnState.txn.CleanupOnError().
 				txn.CleanupOnError(session.Ctx(), err)
 			}
 		}
 
 		// Sanity check about not leaving KV txns open on errors.
 		if err != nil && txnState.txn != nil && !txnState.txn.IsFinalized() {
-			if _, retryable := err.(*roachpb.RetryableTxnError); !retryable {
+			if _, retryable := err.(*roachpb.HandledRetryableTxnError); !retryable {
 				log.Fatalf(session.Ctx(), "got a non-retryable error but the KV "+
 					"transaction is not finalized. TxnState: %s, err: %s\n"+
 					"err:%+v\n\ntxn: %s", txnState.State, err, err, txnState.txn.Proto())
@@ -759,18 +842,19 @@ func (e *Executor) execRequest(session *Session, sql string, copymsg copyMsg) St
 		// rolled back from the table descriptor.
 		stmtsExecuted := stmts[:len(stmtsToExec)-len(remainingStmts)]
 		if txnState.State != Open {
-			planMaker.checkTestingVerifyMetadataInitialOrDie(e, stmts)
-			planMaker.checkTestingVerifyMetadataOrDie(e, stmtsExecuted)
+			session.checkTestingVerifyMetadataInitialOrDie(e, stmts)
+			session.checkTestingVerifyMetadataOrDie(e, stmtsExecuted)
+
 			// Exec the schema changers (if the txn rolled back, the schema changers
 			// will short-circuit because the corresponding descriptor mutation is not
 			// found).
-			planMaker.releaseLeases(session.Ctx())
-			txnState.schemaChangers.execSchemaChanges(session.Ctx(), e, planMaker, res.ResultList)
+			session.leases.releaseLeases(session.Ctx())
+			txnState.schemaChangers.execSchemaChanges(session.Ctx(), e, session, res.ResultList)
 		} else {
 			// We're still in a txn, so we only check that the verifyMetadata callback
 			// fails the first time it's run. The gossip update that will make the
 			// callback succeed only happens when the txn is done.
-			planMaker.checkTestingVerifyMetadataInitialOrDie(e, stmtsExecuted)
+			session.checkTestingVerifyMetadataInitialOrDie(e, stmtsExecuted)
 		}
 
 		// Figure out what statements to run on the next iteration.
@@ -805,39 +889,40 @@ func countRowsAffected(ctx context.Context, p planNode) (int, error) {
 
 // runTxnAttempt is used in the closure we pass to txn.Exec(). It
 // will be called possibly multiple times (if opt.AutoRetry is set).
-// It sets up a planner and delegates execution of statements to
-// execStmtsInCurrentTxn().
 func runTxnAttempt(
 	e *Executor,
-	planMaker *planner,
-	origState TxnStateEnum,
-	txnState *txnState,
-	opt *client.TxnExecOptions,
+	session *Session,
 	stmts parser.StatementList,
+	pinfo *parser.PlaceholderInfo,
+	origState TxnStateEnum,
+	opt *client.TxnExecOptions,
+	avoidCachedDescriptors bool,
 	automaticRetryCount int,
 ) ([]Result, parser.StatementList, error) {
 
-	// Ignore the state that might have been set by a previous try
-	// of this closure.
-	txnState.State = origState
-	txnState.commitSeen = false
-
-	planMaker.setTxn(txnState.txn)
-	results, remainingStmts, err := e.execStmtsInCurrentTxn(
-		stmts, planMaker, txnState,
-		opt.AutoCommit /* implicitTxn */, opt.AutoRetry /* txnBeginning */, automaticRetryCount)
-	if opt.AutoCommit {
-		if len(remainingStmts) > 0 {
-			panic("implicit txn failed to execute all stmts")
-		}
+	// Ignore the state that might have been set by a previous try of this
+	// closure. By putting these modifications to txnState behind the
+	// automaticRetryCount condition, we guarantee that no asynchronous
+	// statements are still executing and reading from the state. This
+	// means that no synchronization is necessary to prevent data races.
+	if automaticRetryCount > 0 {
+		session.TxnState.State = origState
+		session.TxnState.commitSeen = false
 	}
-	planMaker.resetTxn()
+
+	results, remainingStmts, err := e.execStmtsInCurrentTxn(
+		session, stmts, pinfo, opt.AutoCommit, /* implicitTxn */
+		opt.AutoRetry /* txnBeginning */, avoidCachedDescriptors, automaticRetryCount)
+
+	if opt.AutoCommit && len(remainingStmts) > 0 {
+		panic("implicit txn failed to execute all stmts")
+	}
 	return results, remainingStmts, err
 }
 
 // execStmtsInCurrentTxn consumes a prefix of stmts, namely the
 // statements belonging to a single SQL transaction. It executes in
-// the planner's transaction, which is assumed to exist.
+// the session's current transaction, which is assumed to exist.
 //
 // COMMIT/ROLLBACK statements can end the current transaction. If that happens,
 // this method returns, and the remaining statements are returned.
@@ -852,11 +937,18 @@ func runTxnAttempt(
 // first one in stmts.
 //
 // Args:
-//  txnState: Specifies whether we're executing inside a txn, or inside an aborted txn.
-//    The state is updated.
-//  implicitTxn: set if the current transaction was implicitly
-//    created by the system (i.e. the client sent the statement outside of
-//    a transaction).
+// session: the session to execute the statement in.
+// stmts: the semicolon-separated list of statements to execute.
+// pinfo: the placeholders to use in the statements.
+// implicitTxn: set if the current transaction was implicitly
+//  created by the system (i.e. the client sent the statement outside of
+//  a transaction).
+//  COMMIT/ROLLBACK statements are rejected if set. Also, the transaction
+//  might be auto-committed in this function.
+// avoidCachedDescriptors: set if the statement execution should avoid
+//  using cached descriptors.
+// automaticRetryCount: increases with each retry; 0 for the first attempt.
+//
 // Returns:
 //  - the list of results (one per executed statement).
 //  - the statements that haven't been executed because the transaction has
@@ -867,29 +959,31 @@ func runTxnAttempt(
 //    this last result; the caller is responsible copying it into the result
 //    after converting it adequately.
 func (e *Executor) execStmtsInCurrentTxn(
+	session *Session,
 	stmts parser.StatementList,
-	planMaker *planner,
-	txnState *txnState,
+	pinfo *parser.PlaceholderInfo,
 	implicitTxn bool,
 	txnBeginning bool,
+	avoidCachedDescriptors bool,
 	automaticRetryCount int,
 ) ([]Result, parser.StatementList, error) {
 	var results []Result
+
+	txnState := &session.TxnState
 	if txnState.State == NoTxn {
 		panic("execStmtsInCurrentTransaction called outside of a txn")
 	}
-	if txnState.State == Open && planMaker.txn == nil {
-		panic(fmt.Sprintf("inconsistent planMaker txn state. txnState: %+v", txnState))
-	}
 
 	for i, stmt := range stmts {
-		if log.V(2) || log.HasSpanOrEvent(planMaker.session.Ctx()) {
-			log.VEventf(planMaker.session.Ctx(), 2, "executing %d/%d: %s", i+1, len(stmts), stmt)
+		if log.V(2) || logStatementsExecuteEnabled.Get() ||
+			log.HasSpanOrEvent(session.Ctx()) {
+			log.VEventf(session.Ctx(), 2, "executing %d/%d: %s", i+1, len(stmts), stmt)
 		}
+
 		txnState.schemaChangers.curStatementIdx = i
 
 		var stmtStrBefore string
-		// TODO(nvanbenschoten) Constant literals can change their representation (1.0000 -> 1) when type checking,
+		// TODO(nvanbenschoten): Constant literals can change their representation (1.0000 -> 1) when type checking,
 		// so we need to reconsider how this works.
 		if (e.cfg.TestingKnobs.CheckStmtStringChange && false) ||
 			(e.cfg.TestingKnobs.StatementFilter != nil) {
@@ -904,17 +998,17 @@ func (e *Executor) execStmtsInCurrentTxn(
 		// Run SHOW TRANSACTION STATUS in a separate code path so it is
 		// always guaranteed to execute regardless of the current transaction state.
 		if _, ok := stmt.(*parser.ShowTransactionStatus); ok {
-			res, err = planMaker.runShowTransactionState(planMaker.session.Ctx(), txnState, implicitTxn)
+			res, err = runShowTransactionState(session, implicitTxn)
 		} else {
 			switch txnState.State {
 			case Open:
 				res, err = e.execStmtInOpenTxn(
-					stmt, planMaker, implicitTxn, txnBeginning && (i == 0), /* firstInTxn */
-					txnState, automaticRetryCount)
+					session, stmt, pinfo, implicitTxn, txnBeginning && (i == 0), /* firstInTxn */
+					avoidCachedDescriptors, automaticRetryCount)
 			case Aborted, RestartWait:
-				res, err = e.execStmtInAbortedTxn(stmt, txnState, planMaker)
+				res, err = e.execStmtInAbortedTxn(session, stmt)
 			case CommitWait:
-				res, err = e.execStmtInCommitWaitTxn(stmt, txnState)
+				res, err = e.execStmtInCommitWaitTxn(session, stmt)
 			default:
 				panic(fmt.Sprintf("unexpected txn state: %s", txnState.State))
 			}
@@ -927,7 +1021,7 @@ func (e *Executor) execStmtsInCurrentTxn(
 			}
 		}
 		if filter := e.cfg.TestingKnobs.StatementFilter; filter != nil {
-			filter(planMaker.session.Ctx(), stmt.String(), &res)
+			filter(session.Ctx(), stmt.String(), &res)
 		}
 		results = append(results, res)
 		if err != nil {
@@ -946,15 +1040,41 @@ func (e *Executor) execStmtsInCurrentTxn(
 	return results, nil, nil
 }
 
+// getTransactionState retrieves a text representation of the given state.
+func getTransactionState(txnState *txnState, implicitTxn bool) string {
+	state := txnState.State
+	if implicitTxn {
+		state = NoTxn
+	}
+	return state.String()
+}
+
+// runShowTransactionState returns the state of current transaction.
+func runShowTransactionState(session *Session, implicitTxn bool) (Result, error) {
+	var result Result
+	result.PGTag = (*parser.Show)(nil).StatementTag()
+	result.Type = (*parser.Show)(nil).StatementType()
+	result.Columns = sqlbase.ResultColumns{{Name: "TRANSACTION STATUS", Typ: parser.TypeString}}
+	result.Rows = sqlbase.NewRowContainer(
+		session.makeBoundAccount(), sqlbase.ColTypeInfoFromResCols(result.Columns), 0,
+	)
+	state := getTransactionState(&session.TxnState, implicitTxn)
+	if _, err := result.Rows.AddRow(
+		session.Ctx(), parser.Datums{parser.NewDString(state)},
+	); err != nil {
+		result.Rows.Close(session.Ctx())
+		return result, err
+	}
+	return result, nil
+}
+
 // execStmtInAbortedTxn executes a statement in a txn that's in state
 // Aborted or RestartWait. All statements cause errors except:
 // - COMMIT / ROLLBACK: aborts the current transaction.
 // - ROLLBACK TO SAVEPOINT / SAVEPOINT: reopens the current transaction,
 //   allowing it to be retried.
-func (e *Executor) execStmtInAbortedTxn(
-	stmt parser.Statement, txnState *txnState, planMaker *planner,
-) (Result, error) {
-
+func (e *Executor) execStmtInAbortedTxn(session *Session, stmt parser.Statement) (Result, error) {
+	txnState := &session.TxnState
 	if txnState.State != Aborted && txnState.State != RestartWait {
 		panic("execStmtInAbortedTxn called outside of an aborted txn")
 	}
@@ -962,7 +1082,7 @@ func (e *Executor) execStmtInAbortedTxn(
 	switch s := stmt.(type) {
 	case *parser.CommitTransaction, *parser.RollbackTransaction:
 		if txnState.State == RestartWait {
-			return rollbackSQLTransaction(txnState, planMaker), nil
+			return rollbackSQLTransaction(txnState), nil
 		}
 		// Reset the state to allow new transactions to start.
 		// The KV txn has already been rolled back when we entered the Aborted state.
@@ -989,7 +1109,6 @@ func (e *Executor) execStmtInAbortedTxn(
 		if txnState.State == RestartWait {
 			// Reset the state. Txn is Open again.
 			txnState.State = Open
-			txnState.retrying = true
 			// TODO(andrei/cdo): add a counter for user-directed retries.
 			return Result{}, nil
 		}
@@ -998,8 +1117,18 @@ func (e *Executor) execStmtInAbortedTxn(
 			parser.RestartSavepointName))
 		return Result{}, err
 	default:
-		err := sqlbase.NewTransactionAbortedError("")
-		return Result{}, err
+		if txnState.State == RestartWait {
+			err := sqlbase.NewTransactionAbortedError(
+				"Expected \"ROLLBACK TO SAVEPOINT COCKROACH_RESTART\"" /* customMsg */)
+			// If we were waiting for a restart, but the client failed to perform it,
+			// we'll cleanup the txn. The client is not respecting the protocol, so
+			// there seems to be little point in staying in RestartWait (plus,
+			// higher-level code asserts that we're only in RestartWait when returning
+			// retryable errors to the client).
+			txnState.updateStateAndCleanupOnErr(err, e)
+			return Result{}, err
+		}
+		return Result{}, sqlbase.NewTransactionAbortedError("" /* customMsg */)
 	}
 }
 
@@ -1007,8 +1136,9 @@ func (e *Executor) execStmtInAbortedTxn(
 // CommitWait.
 // Everything but COMMIT/ROLLBACK causes errors. ROLLBACK is treated like COMMIT.
 func (e *Executor) execStmtInCommitWaitTxn(
-	stmt parser.Statement, txnState *txnState,
+	session *Session, stmt parser.Statement,
 ) (Result, error) {
+	txnState := &session.TxnState
 	if txnState.State != CommitWait {
 		panic("execStmtInCommitWaitTxn called outside of an aborted txn")
 	}
@@ -1025,8 +1155,20 @@ func (e *Executor) execStmtInCommitWaitTxn(
 	}
 }
 
+// sessionEventf logs an event to the current transaction context and to the
+// session event log.
+func sessionEventf(session *Session, format string, args ...interface{}) {
+	if session.eventLog == nil {
+		log.VEventf(session.context, 2, format, args...)
+	} else {
+		str := fmt.Sprintf(format, args...)
+		log.VEvent(session.context, 2, str)
+		session.eventLog.Printf("%s", str)
+	}
+}
+
 // execStmtInOpenTxn executes one statement in the context
-// of the planner's transaction (which is assumed to exist).
+// of the session's current transaction (which is assumed to exist).
 // It handles statements that affect the transaction state (BEGIN, COMMIT)
 // and delegates everything else to `execStmt`.
 // It binds placeholders.
@@ -1035,6 +1177,9 @@ func (e *Executor) execStmtInCommitWaitTxn(
 // It might also have transitioned to the aborted or RestartWait state.
 //
 // Args:
+// session: the session to execute the statement in.
+// stmt: the statement to execute.
+// pinfo: the placeholders to use in the statement.
 // implicitTxn: set if the current transaction was implicitly
 //  created by the system (i.e. the client sent the statement outside of
 //  a transaction).
@@ -1042,100 +1187,89 @@ func (e *Executor) execStmtInCommitWaitTxn(
 //  might be auto-committed in this function.
 // firstInTxn: set for the first statement in a transaction. Used
 //  so that nested BEGIN statements are caught.
-// stmtTimestamp: Used as the statement_timestamp().
+// avoidCachedDescriptors: set if the statement execution should avoid
+//  using cached descriptors.
 // automaticRetryCount: increases with each retry; 0 for the first attempt.
 //
 // Returns:
 // - a Result
 // - an error, if any. In case of error, the result returned also reflects this error.
 func (e *Executor) execStmtInOpenTxn(
+	session *Session,
 	stmt parser.Statement,
-	planMaker *planner,
+	pinfo *parser.PlaceholderInfo,
 	implicitTxn bool,
 	firstInTxn bool,
-	txnState *txnState,
+	avoidCachedDescriptors bool,
 	automaticRetryCount int,
-) (Result, error) {
+) (_ Result, err error) {
+	txnState := &session.TxnState
 	if txnState.State != Open {
 		panic("execStmtInOpenTxn called outside of an open txn")
 	}
-	if planMaker.txn == nil {
-		panic("execStmtInOpenTxn called with a txn not set on the planner")
-	}
 
-	session := planMaker.session
-	log.Eventf(session.context, "%s", stmt)
-
-	planMaker.phaseTimes[sessionStartExecStmt] = timeutil.Now()
-	planMaker.evalCtx.SetTxnTimestamp(txnState.sqlTimestamp)
-	planMaker.evalCtx.SetStmtTimestamp(e.cfg.Clock.PhysicalTime())
+	sessionEventf(session, "%s", stmt)
 
 	// Do not double count automatically retried transactions.
 	if automaticRetryCount == 0 {
 		e.updateStmtCounts(stmt)
 	}
+
+	defer func() {
+		if err != nil {
+			if txnState.State != Open {
+				panic(fmt.Sprintf("unexpected txnState when cleaning up: %v", txnState.State))
+			}
+			txnState.updateStateAndCleanupOnErr(err, e)
+		}
+	}()
+
+	// Check if the statement is parallelized or is independent from parallel
+	// execution. If neither of these cases are true, we need to synchronize
+	// parallel execution by letting it drain before we can begin executing ourselves.
+	parallelize := IsStmtParallelized(stmt)
+	_, independentFromParallelStmts := stmt.(parser.IndependentFromParallelizedPriors)
+	if !(parallelize || independentFromParallelStmts) {
+		if err := session.parallelizeQueue.Wait(); err != nil {
+			return Result{}, err
+		}
+	}
+
+	if implicitTxn && !stmtAllowedInImplicitTxn(stmt) {
+		return Result{}, errNoTransactionInProgress
+	}
+
 	switch s := stmt.(type) {
 	case *parser.BeginTransaction:
 		if !firstInTxn {
-			txnState.updateStateAndCleanupOnErr(errTransactionInProgress, e)
 			return Result{}, errTransactionInProgress
 		}
 	case *parser.CommitTransaction:
-		if implicitTxn {
-			return e.noTransactionHelper(txnState)
-		}
 		// CommitTransaction is executed fully here; there's no planNode for it
-		// and the planner is not involved at all.
-		res, err := commitSQLTransaction(txnState, planMaker, commit, e)
-		return res, err
+		// and a planner is not involved at all.
+		return commitSQLTransaction(txnState, commit)
 	case *parser.ReleaseSavepoint:
-		if implicitTxn {
-			return e.noTransactionHelper(txnState)
-		}
 		if err := parser.ValidateRestartCheckpoint(s.Savepoint); err != nil {
-			txnState.updateStateAndCleanupOnErr(err, e)
 			return Result{}, err
 		}
 		// ReleaseSavepoint is executed fully here; there's no planNode for it
-		// and the planner is not involved at all.
-		res, err := commitSQLTransaction(txnState, planMaker, release, e)
-		return res, err
+		// and a planner is not involved at all.
+		return commitSQLTransaction(txnState, release)
 	case *parser.RollbackTransaction:
-		if implicitTxn {
-			return e.noTransactionHelper(txnState)
-		}
 		// RollbackTransaction is executed fully here; there's no planNode for it
-		// and the planner is not involved at all.
+		// and a planner is not involved at all.
 		// Notice that we don't return any errors on rollback.
-		return rollbackSQLTransaction(txnState, planMaker), nil
-	case *parser.SetTransaction:
-		if implicitTxn {
-			return e.noTransactionHelper(txnState)
-		}
+		return rollbackSQLTransaction(txnState), nil
 	case *parser.Savepoint:
-		if implicitTxn {
-			return e.noTransactionHelper(txnState)
-		}
 		if err := parser.ValidateRestartCheckpoint(s.Name); err != nil {
-			txnState.updateStateAndCleanupOnErr(err, e)
 			return Result{}, err
 		}
 		// We want to disallow SAVEPOINTs to be issued after a transaction has
-		// started running, but such enforcement is problematic in the
-		// presence of transaction retries (since the transaction proto is
-		// necessarily reused). To work around this, we keep track of the
-		// transaction's retrying state and special-case SAVEPOINT when it is
-		// set.
-		//
-		// TODO(andrei): the check for retrying is a hack - we erroneously
-		// allow SAVEPOINT to be issued at any time during a retry, not just
-		// in the beginning. We should figure out how to track whether we
-		// started using the transaction during a retry.
-		if txnState.txn.IsInitialized() && !txnState.retrying {
-			err := fmt.Errorf("SAVEPOINT %s needs to be the first statement in a transaction",
-				parser.RestartSavepointName)
-			txnState.updateStateAndCleanupOnErr(err, e)
-			return Result{}, err
+		// started running. The client txn's statement count indicates how many
+		// statements have been executed as part of this transaction.
+		if txnState.txn.CommandCount() > 0 {
+			return Result{}, errors.Errorf("SAVEPOINT %s needs to be the first statement in a "+
+				"transaction", parser.RestartSavepointName)
 		}
 		// Note that Savepoint doesn't have a corresponding plan node.
 		// This here is all the execution there is.
@@ -1143,47 +1277,104 @@ func (e *Executor) execStmtInOpenTxn(
 		return Result{}, nil
 	case *parser.RollbackToSavepoint:
 		err := parser.ValidateRestartCheckpoint(s.Savepoint)
-		if err == nil {
-			// Can't restart if we didn't get an error first, which would've put the
-			// txn in a different state.
-			err = errNotRetriable
+		// If commands have already been sent through the transaction,
+		// restart the client txn's proto to increment the epoch. The SQL
+		// txn's state is already set to OPEN.
+		if err == nil && txnState.txn.CommandCount() > 0 {
+			txnState.txn.Proto().Restart(0, 0, hlc.Timestamp{})
 		}
-		txnState.updateStateAndCleanupOnErr(err, e)
 		return Result{}, err
 	case *parser.Prepare:
-		err := util.UnimplementedWithIssueErrorf(7568,
-			"Prepared statements are supported only via the Postgres wire protocol")
-		txnState.updateStateAndCleanupOnErr(err, e)
+		name := s.Name.String()
+		if session.PreparedStatements.Exists(name) {
+			return Result{}, pgerror.NewErrorf(pgerror.CodeDuplicateDatabaseError,
+				"prepared statement %q already exists", name)
+		}
+		typeHints := make(parser.PlaceholderTypes, len(s.Types))
+		for i, t := range s.Types {
+			typeHints[strconv.Itoa(i+1)] = parser.CastTargetToDatumType(t)
+		}
+		_, err := session.PreparedStatements.New(e, name, parser.StatementList{s.Statement}, len(s.Statement.String()), typeHints)
 		return Result{}, err
 	case *parser.Execute:
-		err := util.UnimplementedWithIssueErrorf(7568,
-			"Executing prepared statements is supported only via the Postgres wire protocol")
-		txnState.updateStateAndCleanupOnErr(err, e)
-		return Result{}, err
+		name := s.Name.String()
+		prepared, ok := session.PreparedStatements.Get(name)
+		if !ok {
+			return Result{}, pgerror.NewErrorf(pgerror.CodeInvalidSQLStatementNameError,
+				"prepared statement %q does not exist", name)
+		}
+		if len(prepared.SQLTypes) != len(s.Params) {
+			return Result{}, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				"wrong number of parameters for prepared statement %q: expected %d, got %d",
+				name, len(prepared.SQLTypes), len(s.Params))
+		}
+		qArgs := make(parser.QueryArguments, len(s.Params))
+		for i, e := range s.Params {
+			idx := strconv.Itoa(i + 1)
+			typedExpr, err := sqlbase.SanitizeVarFreeExpr(e, prepared.SQLTypes[idx], "EXECUTE parameter", session.SearchPath)
+			if err != nil {
+				return Result{}, pgerror.NewError(pgerror.CodeFeatureNotSupportedError, err.Error())
+			}
+			var p parser.Parser
+			if err := p.AssertNoAggregationOrWindowing(typedExpr, "EXECUTE parameters", session.SearchPath); err != nil {
+				return Result{}, err
+			}
+			qArgs[idx] = typedExpr
+		}
+		results := e.ExecutePreparedStatement(session, prepared, &parser.PlaceholderInfo{Values: qArgs, Types: prepared.SQLTypes})
+		if results.Empty {
+			return Result{}, nil
+		}
+		if len(results.ResultList) > 1 {
+			return Result{}, errWrongNumberOfPreparedStatements(len(results.ResultList))
+		}
+		return results.ResultList[0], nil
+
 	case *parser.Deallocate:
 		if s.Name == "" {
-			planMaker.session.PreparedStatements.DeleteAll(session.Ctx())
+			session.PreparedStatements.DeleteAll(session.Ctx())
 		} else {
-			if found := planMaker.session.PreparedStatements.Delete(
+			if found := session.PreparedStatements.Delete(
 				session.Ctx(), string(s.Name),
 			); !found {
-				err := fmt.Errorf("prepared statement %s does not exist", s.Name)
-				txnState.updateStateAndCleanupOnErr(err, e)
-				return Result{}, err
+				return Result{}, pgerror.NewErrorf(pgerror.CodeInvalidSQLStatementNameError,
+					"prepared statement %q does not exist", s.Name)
 			}
 		}
 		return Result{PGTag: s.StatementTag()}, nil
 	}
 
-	autoCommit := implicitTxn && !e.cfg.TestingKnobs.DisableAutoCommit
-	result, err := e.execStmt(stmt, planMaker, autoCommit, automaticRetryCount)
+	// Create a new planner from the Session to execute the statement.
+	planner := session.newPlanner(e, txnState.txn)
+	planner.evalCtx.SetTxnTimestamp(txnState.sqlTimestamp)
+	planner.evalCtx.SetStmtTimestamp(e.cfg.Clock.PhysicalTime())
+	planner.semaCtx.Placeholders.Assign(pinfo)
+	planner.avoidCachedDescriptors = avoidCachedDescriptors
+	planner.phaseTimes[plannerStartExecStmt] = timeutil.Now()
+
+	var result Result
+	if parallelize && !implicitTxn {
+		// Only run statements asynchronously through the parallelize queue if the
+		// statements are parallelized and we're in a transaction. Parallelized
+		// statements outside of a transaction are run synchronously with mocked
+		// results, which has the same effect as running asynchronously but
+		// immediately blocking.
+		result, err = e.execStmtInParallel(stmt, planner)
+	} else {
+		planner.autoCommit = implicitTxn && !e.cfg.TestingKnobs.DisableAutoCommit
+		result, err = e.execStmt(stmt, planner,
+			automaticRetryCount, parallelize /* mockResults */)
+	}
+
 	if err != nil {
-		if result.Rows != nil {
-			result.Rows.Close(session.Ctx())
-			result.Rows = nil
+		if independentFromParallelStmts {
+			// If the statement run was independent from parallelized execution, it
+			// might have been run concurrently with parallelized statements. Make
+			// sure all complete before returning the error.
+			_ = session.parallelizeQueue.Wait()
 		}
-		log.ErrEventf(session.Ctx(), "ERROR: %v", err)
-		txnState.updateStateAndCleanupOnErr(err, e)
+
+		sessionEventf(session, "ERROR: %v", err)
 		return Result{}, err
 	}
 
@@ -1194,28 +1385,32 @@ func (e *Executor) execStmtInOpenTxn(
 	case parser.Rows:
 		tResult.count = result.Rows.Len()
 	}
-	log.Eventf(session.Ctx(), "%s done", tResult)
+	sessionEventf(session, "%s done", tResult)
 	return result, nil
 }
 
-// Clean up after trying to execute a transactional statement while not in a SQL
-// transaction.
-func (e *Executor) noTransactionHelper(txnState *txnState) (Result, error) {
-	// Clean up the KV txn and set the SQL state to Aborted.
-	txnState.updateStateAndCleanupOnErr(errNoTransactionInProgress, e)
-	return Result{}, errNoTransactionInProgress
+// stmtAllowedInImplicitTxn returns whether the statement is allowed in an
+// implicit transaction or not.
+func stmtAllowedInImplicitTxn(stmt parser.Statement) bool {
+	switch stmt.(type) {
+	case *parser.CommitTransaction:
+	case *parser.ReleaseSavepoint:
+	case *parser.RollbackTransaction:
+	case *parser.SetTransaction:
+	case *parser.Savepoint:
+	default:
+		return true
+	}
+	return false
 }
 
 // rollbackSQLTransaction rolls back a transaction. All errors are swallowed.
-func rollbackSQLTransaction(txnState *txnState, p *planner) Result {
-	if p.txn != txnState.txn {
-		panic("rollbackSQLTransaction called on a different txn than the planner's")
-	}
+func rollbackSQLTransaction(txnState *txnState) Result {
 	if txnState.State != Open && txnState.State != RestartWait {
 		panic(fmt.Sprintf("rollbackSQLTransaction called on txn in wrong state: %s (txn: %s)",
 			txnState.State, txnState.txn.Proto()))
 	}
-	err := p.txn.Rollback(txnState.Ctx)
+	err := txnState.txn.Rollback(txnState.Ctx)
 	result := Result{PGTag: (*parser.RollbackTransaction)(nil).StatementTag()}
 	if err != nil {
 		log.Warningf(txnState.Ctx, "txn rollback failed. The error was swallowed: %s", err)
@@ -1223,8 +1418,6 @@ func rollbackSQLTransaction(txnState *txnState, p *planner) Result {
 	}
 	// We're done with this txn.
 	txnState.resetStateAndTxn(NoTxn)
-	// Reset transaction to prevent running further commands on this planner.
-	p.resetTxn()
 	return result
 }
 
@@ -1236,49 +1429,49 @@ const (
 )
 
 // commitSqlTransaction commits a transaction.
-func commitSQLTransaction(
-	txnState *txnState, p *planner, commitType commitType, e *Executor,
-) (Result, error) {
-
-	if p.txn != txnState.txn {
-		panic("commitSQLTransaction called on a different txn than the planner's")
-	}
+func commitSQLTransaction(txnState *txnState, commitType commitType) (Result, error) {
 	if txnState.State != Open {
 		panic(fmt.Sprintf("commitSqlTransaction called on non-open txn: %+v", txnState.txn))
 	}
 	if commitType == commit {
 		txnState.commitSeen = true
 	}
-	err := txnState.txn.Commit(txnState.Ctx)
-	result := Result{PGTag: (*parser.CommitTransaction)(nil).StatementTag()}
-	if err != nil {
-		// Errors on COMMIT need special handling, as COMMIT needs to finalize the
-		// transaction (it can't leave it in Aborted or RestartWait). Except if it's
-		// an auto-retry txn, in which case we do want to leave it in RestartWait
-		// here. We ignore all of this here and do regular cleanup. A higher layer
-		// handles closing the txn if the auto-retry doesn't get rid of the error.
-		txnState.updateStateAndCleanupOnErr(err, e)
-	} else {
-		switch commitType {
-		case release:
-			// We'll now be waiting for a COMMIT.
-			txnState.resetStateAndTxn(CommitWait)
-		case commit:
-			// We're done with this txn.
-			txnState.resetStateAndTxn(NoTxn)
-		}
+	if err := txnState.txn.Commit(txnState.Ctx); err != nil {
+		// Errors on COMMIT need special handling: if the errors is not handled by
+		// auto-retry, COMMIT needs to finalize the transaction (it can't leave it
+		// in Aborted or RestartWait). Higher layers will handle this with the help
+		// of `txnState.commitSeen`, set above.
+		return Result{}, err
 	}
-	// Reset transaction to prevent running further commands on this planner.
-	p.resetTxn()
-	return result, err
+
+	switch commitType {
+	case release:
+		// We'll now be waiting for a COMMIT.
+		txnState.resetStateAndTxn(CommitWait)
+	case commit:
+		// We're done with this txn.
+		txnState.resetStateAndTxn(NoTxn)
+	}
+	return Result{PGTag: (*parser.CommitTransaction)(nil).StatementTag()}, nil
 }
 
 // exectDistSQL converts a classic plan to a distributed SQL physical plan and
 // runs it.
-func (e *Executor) execDistSQL(planMaker *planner, tree planNode, result *Result) error {
+func (e *Executor) execDistSQL(planner *planner, tree planNode, result *Result) error {
 	// Note: if we just want the row count, result.Rows is nil here.
-	recv := makeDistSQLReceiver(planMaker.session.Ctx(), result.Rows)
-	err := e.distSQLPlanner.PlanAndRun(planMaker.session.Ctx(), planMaker.txn, tree, &recv)
+	ctx := planner.session.Ctx()
+	recv, err := makeDistSQLReceiver(
+		ctx, result.Rows,
+		e.cfg.RangeDescriptorCache, e.cfg.LeaseHolderCache,
+		planner.txn,
+		func(ts hlc.Timestamp) {
+			_ = e.cfg.Clock.Update(ts)
+		},
+	)
+	if err != nil {
+		return err
+	}
+	err = e.distSQLPlanner.PlanAndRun(ctx, planner.txn, tree, &recv, planner.evalCtx)
 	if err != nil {
 		return err
 	}
@@ -1293,22 +1486,23 @@ func (e *Executor) execDistSQL(planMaker *planner, tree planNode, result *Result
 
 // execClassic runs a plan using the classic (non-distributed) SQL
 // implementation.
-func (e *Executor) execClassic(planMaker *planner, plan planNode, result *Result) error {
-	if err := planMaker.startPlan(planMaker.session.Ctx(), plan); err != nil {
+func (e *Executor) execClassic(planner *planner, plan planNode, result *Result) error {
+	ctx := planner.session.Ctx()
+	if err := planner.startPlan(ctx, plan); err != nil {
 		return err
 	}
 
 	switch result.Type {
 	case parser.RowsAffected:
-		count, err := countRowsAffected(planMaker.session.Ctx(), plan)
+		count, err := countRowsAffected(ctx, plan)
 		if err != nil {
 			return err
 		}
 		result.RowsAffected += count
 
 	case parser.Rows:
-		next, err := plan.Next(planMaker.session.Ctx())
-		for ; next; next, err = plan.Next(planMaker.session.Ctx()) {
+		next, err := plan.Next(ctx)
+		for ; next; next, err = plan.Next(ctx) {
 			// The plan.Values Datums needs to be copied on each iteration.
 			values := plan.Values()
 
@@ -1317,12 +1511,16 @@ func (e *Executor) execClassic(planMaker *planner, plan planNode, result *Result
 					return err
 				}
 			}
-			if _, err := result.Rows.AddRow(planMaker.session.Ctx(), values); err != nil {
+			if _, err := result.Rows.AddRow(ctx, values); err != nil {
 				return err
 			}
 		}
 		if err != nil {
 			return err
+		}
+	case parser.DDL:
+		if n, ok := plan.(*createTableNode); ok && n.n.As() {
+			result.RowsAffected += n.count
 		}
 	}
 	return nil
@@ -1330,13 +1528,9 @@ func (e *Executor) execClassic(planMaker *planner, plan planNode, result *Result
 
 // shouldUseDistSQL determines whether we should use DistSQL for a plan, based
 // on the session settings.
-func (e *Executor) shouldUseDistSQL(planMaker *planner, plan planNode) (bool, error) {
-	distSQLMode := defaultDistSQLMode
-	if planMaker.session.DistSQLMode != distSQLOff {
-		distSQLMode = planMaker.session.DistSQLMode
-	}
-
-	if distSQLMode == distSQLOff {
+func (e *Executor) shouldUseDistSQL(planner *planner, plan planNode) (bool, error) {
+	distSQLMode := planner.session.DistSQLMode
+	if distSQLMode == DistSQLOff {
 		return false, nil
 	}
 	// Don't try to run empty nodes (e.g. SET commands) with distSQL.
@@ -1347,10 +1541,13 @@ func (e *Executor) shouldUseDistSQL(planMaker *planner, plan planNode) (bool, er
 	var err error
 	var distribute bool
 
-	// Temporary workaround for #13376: if the transaction modified something,
-	// TxnCoordSender will freak out if it sees scans in this txn from other
-	// nodes. We detect this by checking if the transaction's "anchor" key is set.
-	if planMaker.txn.Proto().TxnMeta.Key != nil {
+	// Temporary workaround for #13376: if the transaction wrote something,
+	// we can't allow it to do DistSQL reads any more because we can't guarantee
+	// that the reads don't happen after the gateway's TxnCoordSender has
+	// abandoned the transaction (and so the reads could miss to see their own
+	// writes). We detect this by checking if the transaction's "anchor" key is
+	// set.
+	if planner.txn.AnchorKey() != nil {
 		err = errors.New("writing txn")
 	} else {
 		// Trigger limit propagation.
@@ -1360,16 +1557,16 @@ func (e *Executor) shouldUseDistSQL(planMaker *planner, plan planNode) (bool, er
 
 	if err != nil {
 		// If the distSQLMode is ALWAYS, any unsupported statement is an error.
-		if distSQLMode == distSQLAlways {
+		if distSQLMode == DistSQLAlways {
 			return false, err
 		}
 		// Don't use distSQL for this request.
-		log.VEventf(planMaker.session.Ctx(), 1, "query not supported for distSQL: %s", err)
+		log.VEventf(planner.session.Ctx(), 1, "query not supported for distSQL: %s", err)
 		return false, nil
 	}
 
-	if distSQLMode == distSQLAuto && !distribute {
-		log.VEventf(planMaker.session.Ctx(), 1, "not distributing query")
+	if distSQLMode == DistSQLAuto && !distribute {
+		log.VEventf(planner.session.Ctx(), 1, "not distributing query")
 		return false, nil
 	}
 
@@ -1377,22 +1574,8 @@ func (e *Executor) shouldUseDistSQL(planMaker *planner, plan planNode) (bool, er
 	return true, nil
 }
 
-// The current transaction might have been committed/rolled back when this returns.
-// The caller closes result.Rows (even in error cases).
-func (e *Executor) execStmt(
-	stmt parser.Statement, planMaker *planner, autoCommit bool, automaticRetryCount int,
-) (Result, error) {
-	session := planMaker.session
-
-	planMaker.phaseTimes[sessionStartLogicalPlan] = timeutil.Now()
-	plan, err := planMaker.makePlan(session.Ctx(), stmt, autoCommit)
-	planMaker.phaseTimes[sessionEndLogicalPlan] = timeutil.Now()
-	if err != nil {
-		return Result{}, err
-	}
-
-	defer plan.Close(planMaker.session.Ctx())
-
+// makeRes creates an empty result set for the given statement and plan.
+func makeRes(stmt parser.Statement, planner *planner, plan planNode) (Result, error) {
 	result := Result{
 		PGTag: stmt.StatementTag(),
 		Type:  stmt.StatementType(),
@@ -1401,28 +1584,104 @@ func (e *Executor) execStmt(
 		result.Columns = plan.Columns()
 		for _, c := range result.Columns {
 			if err := checkResultType(c.Typ); err != nil {
-				return result, err
+				return Result{}, err
 			}
 		}
-		result.Rows = NewRowContainer(planMaker.session.makeBoundAccount(), result.Columns, 0)
+		result.Rows = sqlbase.NewRowContainer(
+			planner.session.makeBoundAccount(), sqlbase.ColTypeInfoFromResCols(result.Columns), 0,
+		)
 	}
+	return result, nil
+}
 
-	useDistSQL, err := e.shouldUseDistSQL(planMaker, plan)
+// execStmt executes the statement synchronously and returns the statement's result.
+// If mockResults is set, these results will be replaced by the "zero value" of the
+// statement's result type, identical to the mock results returned by execStmtInParallel.
+func (e *Executor) execStmt(
+	stmt parser.Statement, planner *planner, automaticRetryCount int, mockResults bool,
+) (Result, error) {
+	session := planner.session
+
+	planner.phaseTimes[plannerStartLogicalPlan] = timeutil.Now()
+	plan, err := planner.makePlan(session.Ctx(), stmt)
+	planner.phaseTimes[plannerEndLogicalPlan] = timeutil.Now()
 	if err != nil {
-		return result, err
+		return Result{}, err
 	}
 
-	planMaker.phaseTimes[sessionStartExecStmt] = timeutil.Now()
-	if useDistSQL {
-		err = e.execDistSQL(planMaker, plan, &result)
-	} else {
-		err = e.execClassic(planMaker, plan, &result)
+	defer plan.Close(session.Ctx())
+
+	result, err := makeRes(stmt, planner, plan)
+	if err != nil {
+		return Result{}, err
 	}
-	planMaker.phaseTimes[sessionEndExecStmt] = timeutil.Now()
+
+	useDistSQL, err := e.shouldUseDistSQL(planner, plan)
+	if err != nil {
+		result.Close(session.Ctx())
+		return Result{}, err
+	}
+
+	planner.phaseTimes[plannerStartExecStmt] = timeutil.Now()
+	if useDistSQL {
+		err = e.execDistSQL(planner, plan, &result)
+	} else {
+		err = e.execClassic(planner, plan, &result)
+	}
+	planner.phaseTimes[plannerEndExecStmt] = timeutil.Now()
 	e.recordStatementSummary(
-		planMaker, stmt, useDistSQL, automaticRetryCount, result, err,
+		planner, stmt, useDistSQL, automaticRetryCount, result, err,
 	)
-	return result, err
+	if err != nil {
+		result.Close(session.Ctx())
+		return Result{}, err
+	}
+
+	if mockResults {
+		result.Close(session.Ctx())
+		return makeRes(stmt, planner, plan)
+	}
+	return result, nil
+}
+
+// execStmtInParallel executes the statement asynchronously and returns mocked out
+// results. These mocked out results will be the "zero value" of the statement's
+// result type:
+// - parser.Rows -> an empty set of rows
+// - parser.RowsAffected -> zero rows affected
+//
+// TODO(nvanbenschoten): We do not currently support parallelizing distributed SQL
+// queries, so this method can only be used with classical SQL.
+func (e *Executor) execStmtInParallel(stmt parser.Statement, planner *planner) (Result, error) {
+	session := planner.session
+	ctx := session.Ctx()
+
+	plan, err := planner.makePlan(ctx, stmt)
+	if err != nil {
+		return Result{}, err
+	}
+
+	mockResult, err := makeRes(stmt, planner, plan)
+	if err != nil {
+		return Result{}, err
+	}
+
+	session.parallelizeQueue.Add(ctx, plan, func(plan planNode) error {
+		defer plan.Close(ctx)
+
+		result, err := makeRes(stmt, planner, plan)
+		if err != nil {
+			return err
+		}
+		defer result.Close(ctx)
+
+		planner.phaseTimes[plannerStartExecStmt] = timeutil.Now()
+		err = e.execClassic(planner, plan, &result)
+		planner.phaseTimes[plannerEndExecStmt] = timeutil.Now()
+		e.recordStatementSummary(planner, stmt, false, 0, result, err)
+		return err
+	})
+	return mockResult, nil
 }
 
 // updateStmtCounts updates metrics for the number of times the different types of SQL
@@ -1534,6 +1793,11 @@ func checkResultType(typ parser.Type) error {
 	case parser.TypeNameArray:
 	case parser.TypeIntArray:
 	case parser.TypeOid:
+	case parser.TypeRegClass:
+	case parser.TypeRegNamespace:
+	case parser.TypeRegProc:
+	case parser.TypeRegProcedure:
+	case parser.TypeRegType:
 	default:
 		// Compare all types that cannot rely on == equality.
 		istype := typ.FamilyEqual
@@ -1547,22 +1811,6 @@ func checkResultType(typ parser.Type) error {
 		}
 	}
 	return nil
-}
-
-// makeResultColumns converts sqlbase.ColumnDescriptors to ResultColumns.
-func makeResultColumns(colDescs []sqlbase.ColumnDescriptor) ResultColumns {
-	cols := make(ResultColumns, 0, len(colDescs))
-	for _, colDesc := range colDescs {
-		// Convert the sqlbase.ColumnDescriptor to ResultColumn.
-		typ := colDesc.Type.ToDatumType()
-		if typ == nil {
-			panic(fmt.Sprintf("unsupported column type: %s", colDesc.Type.Kind))
-		}
-
-		hidden := colDesc.Hidden
-		cols = append(cols, ResultColumn{Name: colDesc.Name, Typ: typ, hidden: hidden})
-	}
-	return cols
 }
 
 // EvalAsOfTimestamp evaluates and returns the timestamp from an AS OF SYSTEM
@@ -1581,44 +1829,26 @@ func EvalAsOfTimestamp(
 	}
 	switch d := d.(type) {
 	case *parser.DString:
+		s := string(*d)
 		// Allow nanosecond precision because the timestamp is only used by the
 		// system and won't be returned to the user over pgwire.
-		dt, err := parser.ParseDTimestamp(string(*d), time.Nanosecond)
-		if err != nil {
-			return hlc.Timestamp{}, err
+		if dt, err := parser.ParseDTimestamp(s, time.Nanosecond); err == nil {
+			ts.WallTime = dt.Time.UnixNano()
+			break
 		}
-		ts.WallTime = dt.Time.UnixNano()
+		// Attempt to parse as a decimal.
+		if dec, _, err := apd.NewFromString(s); err == nil {
+			if ts, err = decimalToHLC(dec); err == nil {
+				break
+			}
+		}
+		return hlc.Timestamp{}, fmt.Errorf("could not parse '%s' as timestamp", s)
 	case *parser.DInt:
 		ts.WallTime = int64(*d)
 	case *parser.DDecimal:
-		// Format the decimal into a string and split on `.` to extract the nanosecond
-		// walltime and logical tick parts.
-		// TODO(mjibson): use d.Modf() instead of converting to a string.
-		s := d.ToStandard()
-		parts := strings.SplitN(s, ".", 2)
-		nanos, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			return hlc.Timestamp{}, errors.Wrap(err, "parse AS OF SYSTEM TIME argument")
+		if ts, err = decimalToHLC(&d.Decimal); err != nil {
+			return hlc.Timestamp{}, err
 		}
-		var logical int64
-		if len(parts) > 1 {
-			// logicalLength is the number of decimal digits expected in the
-			// logical part to the right of the decimal. See the implementation of
-			// cluster_logical_timestamp().
-			const logicalLength = 10
-			p := parts[1]
-			if lp := len(p); lp > logicalLength {
-				return hlc.Timestamp{}, errors.Errorf("bad AS OF SYSTEM TIME argument: logical part has too many digits")
-			} else if lp < logicalLength {
-				p += strings.Repeat("0", logicalLength-lp)
-			}
-			logical, err = strconv.ParseInt(p, 10, 32)
-			if err != nil {
-				return hlc.Timestamp{}, errors.Wrap(err, "parse AS OF SYSTEM TIME argument")
-			}
-		}
-		ts.WallTime = nanos
-		ts.Logical = int32(logical)
 	default:
 		return hlc.Timestamp{}, fmt.Errorf("unexpected AS OF SYSTEM TIME argument: %s (%T)", d.ResolvedType(), d)
 	}
@@ -1628,6 +1858,39 @@ func EvalAsOfTimestamp(
 	return ts, nil
 }
 
+func decimalToHLC(d *apd.Decimal) (hlc.Timestamp, error) {
+	// Format the decimal into a string and split on `.` to extract the nanosecond
+	// walltime and logical tick parts.
+	// TODO(mjibson): use d.Modf() instead of converting to a string.
+	s := d.ToStandard()
+	parts := strings.SplitN(s, ".", 2)
+	nanos, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return hlc.Timestamp{}, errors.Wrap(err, "parse AS OF SYSTEM TIME argument")
+	}
+	var logical int64
+	if len(parts) > 1 {
+		// logicalLength is the number of decimal digits expected in the
+		// logical part to the right of the decimal. See the implementation of
+		// cluster_logical_timestamp().
+		const logicalLength = 10
+		p := parts[1]
+		if lp := len(p); lp > logicalLength {
+			return hlc.Timestamp{}, errors.Errorf("bad AS OF SYSTEM TIME argument: logical part has too many digits")
+		} else if lp < logicalLength {
+			p += strings.Repeat("0", logicalLength-lp)
+		}
+		logical, err = strconv.ParseInt(p, 10, 32)
+		if err != nil {
+			return hlc.Timestamp{}, errors.Wrap(err, "parse AS OF SYSTEM TIME argument")
+		}
+	}
+	return hlc.Timestamp{
+		WallTime: nanos,
+		Logical:  int32(logical),
+	}, nil
+}
+
 // isAsOf analyzes a select statement to bypass the logic in newPlan(),
 // since that requires the transaction to be started already. If the returned
 // timestamp is not nil, it is the timestamp to which a transaction should
@@ -1635,7 +1898,7 @@ func EvalAsOfTimestamp(
 //
 // max is a lower bound on what the transaction's timestamp will be. Used to
 // check that the user didn't specify a timestamp in the future.
-func isAsOf(planMaker *planner, stmt parser.Statement, max hlc.Timestamp) (*hlc.Timestamp, error) {
+func isAsOf(session *Session, stmt parser.Statement, max hlc.Timestamp) (*hlc.Timestamp, error) {
 	s, ok := stmt.(*parser.Select)
 	if !ok {
 		return nil, nil
@@ -1648,39 +1911,32 @@ func isAsOf(planMaker *planner, stmt parser.Statement, max hlc.Timestamp) (*hlc.
 		return nil, nil
 	}
 
-	ts, err := EvalAsOfTimestamp(&planMaker.evalCtx, sc.From.AsOf, max)
+	evalCtx := session.evalCtx()
+	ts, err := EvalAsOfTimestamp(&evalCtx, sc.From.AsOf, max)
 	return &ts, err
-}
-
-// SetTxnTimestamps sets the transaction's proto timestamps and deadline
-// to ts. This is for use with AS OF queries, and should be called in the
-// retry block (except in the case of prepare which doesn't use retry). The
-// deadline-checking code checks that the `Timestamp` field of the proto
-// hasn't exceeded the deadline. Since we set the Timestamp field each retry,
-// it won't ever exceed the deadline, and thus setting the deadline here is
-// not strictly needed. However, it doesn't do anything incorrect and it will
-// possibly find problems if things change in the future, so it is left in.
-func SetTxnTimestamps(txn *client.Txn, ts hlc.Timestamp) {
-	txn.Proto().Timestamp = ts
-	txn.Proto().OrigTimestamp = ts
-	txn.Proto().MaxTimestamp = ts
-	txn.UpdateDeadlineMaybe(ts)
 }
 
 // convertToErrWithPGCode recognizes errs that should have SQL error codes to be
 // reported to the client and converts err to them. If this doesn't apply, err
 // is returned.
-// Note that this returns a new proto, and no fields from the original one are
-// copied. So only use it in contexts where the only thing that matters in the
-// response is the error detail.
+// Note that this returns a new error, and details from the original error are
+// not preserved in any way (except possibly the message).
+//
 // TODO(andrei): sqlbase.ConvertBatchError() seems to serve similar purposes, but
 // it's called from more specialized contexts. Consider unifying the two.
 func convertToErrWithPGCode(err error) error {
 	if err == nil {
 		return nil
 	}
-	if _, ok := err.(*roachpb.RetryableTxnError); ok {
+	switch tErr := err.(type) {
+	case *roachpb.HandledRetryableTxnError:
 		return sqlbase.NewRetryError(err)
+	case *roachpb.AmbiguousResultError:
+		// TODO(andrei): Once DistSQL starts executing writes, we'll need a
+		// different mechanism to marshal AmbiguousResultErrors from the executing
+		// nodes.
+		return sqlbase.NewStatementCompletionUnknownError(tErr)
+	default:
+		return err
 	}
-	return err
 }

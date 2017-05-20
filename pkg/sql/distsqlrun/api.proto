@@ -21,50 +21,53 @@ package cockroach.sql.distsqlrun;
 option go_package = "distsqlrun";
 
 import "cockroach/pkg/roachpb/data.proto";
-import "cockroach/pkg/roachpb/errors.proto";
 import "cockroach/pkg/sql/distsqlrun/data.proto";
 import "cockroach/pkg/sql/distsqlrun/processors.proto";
+import "cockroach/pkg/util/hlc/timestamp.proto";
 import "cockroach/pkg/util/tracing/span_context_carrier.proto";
 import "gogoproto/gogo.proto";
 
 message SetupFlowRequest {
   optional roachpb.Transaction txn = 1 [(gogoproto.nullable) = false];
+
+  // Version of distsqlrun protocol; a server accepts a certain range of
+  // versions, up to its own version. See server.go for more details.
+  optional uint32 version = 5 [(gogoproto.nullable) = false];
+
   // If set, the context of an active tracing span.
   optional util.tracing.SpanContextCarrier trace_context = 2;
   optional FlowSpec flow = 3 [(gogoproto.nullable) = false];
+
+  optional EvalContext evalContext = 6 [(gogoproto.nullable) = false];
+}
+
+// EvalContext is used to marshall some planner.EvalContext members.
+message EvalContext {
+  optional int64 stmtTimestampNanos = 1 [(gogoproto.nullable) = false];
+  optional int64 txnTimestampNanos = 2 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp clusterTimestamp = 3 [(gogoproto.nullable) = false];
+  // The name of the location according to whose current timezone we're going to
+  // parse timestamps. Used to init EvalContext.Location.
+  optional string location = 4 [(gogoproto.nullable) = false];
+  optional string database = 5 [(gogoproto.nullable) = false];
+  repeated string searchPath = 6;
 }
 
 message SimpleResponse {
-  // TODO(radu): we should be using our own error instead of roachpb.Error.
-  // One important error field for distsql is whether the error is
-  // "authoritative": if a query is distributed on multiple nodes and one node
-  // hits an error, the other nodes may hit errors as well as a consequence
-  // (e.g. streams can't connect to the failed flow). The node that started the
-  // flow needs to distinguish which errors are caused by non-availability of
-  // other nodes so they don't obscure the real error.
-  optional roachpb.Error error = 1;
+  optional Error error = 1;
 }
 
 message ConsumerSignal {
   option (gogoproto.onlyone) = true;
 
-  // TODO(radu): we should be using our own error instead of roachpb.Error.
-  // One important error field for distsql is whether the error is
-  // "authoritative": if a query is distributed on multiple nodes and one node
-  // hits an error, the other nodes may hit errors as well as a consequence
-  // (e.g. streams can't connect to the failed flow). The node that started the
-  // flow needs to distinguish which errors are caused by non-availability of
-  // other nodes so they don't obscure the real error.
-  optional roachpb.Error error = 1;
-
   // The consumer is done (doesn't need to consume any more rows) and is asking
   // the producer to push whatever trailing metadata it has and close its
   // stream.
-  optional DrainRequest drain_request = 2;
+  optional DrainRequest drain_request = 1;
 
   // Used in the RunSyncFlow case; the first message on the client stream must
   // contain this message.
-  optional SetupFlowRequest setup_flow_request = 3;
+  optional SetupFlowRequest setup_flow_request = 2;
 }
 
 message DrainRequest {

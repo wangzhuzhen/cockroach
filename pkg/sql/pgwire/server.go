@@ -48,9 +48,15 @@ const (
 
 // Fully-qualified names for metrics.
 var (
-	MetaConns    = metric.Metadata{Name: "sql.conns"}
-	MetaBytesIn  = metric.Metadata{Name: "sql.bytesin"}
-	MetaBytesOut = metric.Metadata{Name: "sql.bytesout"}
+	MetaConns = metric.Metadata{
+		Name: "sql.conns",
+		Help: "Number of active sql connections"}
+	MetaBytesIn = metric.Metadata{
+		Name: "sql.bytesin",
+		Help: "Number of sql bytes received"}
+	MetaBytesOut = metric.Metadata{
+		Name: "sql.bytesout",
+		Help: "Number of sql bytes sent"}
 )
 
 const (
@@ -146,7 +152,7 @@ func MakeServer(
 	cfg *base.Config,
 	executor *sql.Executor,
 	internalMemMetrics *sql.MemoryMetrics,
-	maxSQLMem int64,
+	parentMemoryMonitor *mon.MemoryMonitor,
 	histogramWindow time.Duration,
 ) *Server {
 	server := &Server{
@@ -159,7 +165,7 @@ func MakeServer(
 		server.metrics.SQLMemMetrics.CurBytesCount,
 		server.metrics.SQLMemMetrics.MaxBytesHist,
 		0, noteworthySQLMemoryUsageBytes)
-	server.sqlMemoryPool.Start(context.Background(), nil, mon.MakeStandaloneBudget(maxSQLMem))
+	server.sqlMemoryPool.Start(context.Background(), parentMemoryMonitor, mon.BoundAccount{})
 
 	server.connMonitor = mon.MakeMonitor("conn",
 		server.metrics.ConnMemMetrics.CurBytesCount,
@@ -415,7 +421,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 		err := v3conn.serve(ctx, s.IsDraining, acc)
 		// If the error that closed the connection is related to an
 		// administrative shutdown, relay that information to the client.
-		if code, ok := pgerror.PGCode(err); ok && code == pgerror.CodeAdminShutdownError {
+		if pgErr, ok := pgerror.GetPGCause(err); ok && pgErr.Code == pgerror.CodeAdminShutdownError {
 			return v3conn.sendError(err)
 		}
 		return err

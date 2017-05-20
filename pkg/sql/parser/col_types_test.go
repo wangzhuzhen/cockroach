@@ -40,7 +40,7 @@ func TestParseColumnType(t *testing.T) {
 		{"REAL", &FloatColType{Name: "REAL"}},
 		{"DOUBLE PRECISION", &FloatColType{Name: "DOUBLE PRECISION"}},
 		{"FLOAT", &FloatColType{Name: "FLOAT"}},
-		{"FLOAT(4)", &FloatColType{Name: "FLOAT", Prec: 4}},
+		{"FLOAT(4)", &FloatColType{Name: "FLOAT", Prec: 4, PrecSpecified: true}},
 		{"DEC", &DecimalColType{Name: "DEC"}},
 		{"DECIMAL", &DecimalColType{Name: "DECIMAL"}},
 		{"NUMERIC", &DecimalColType{Name: "NUMERIC"}},
@@ -65,7 +65,7 @@ func TestParseColumnType(t *testing.T) {
 	}
 	for i, d := range testData {
 		sql := fmt.Sprintf("CREATE TABLE a (b %s)", d.str)
-		stmt, err := ParseOneTraditional(sql)
+		stmt, err := ParseOne(sql)
 		if err != nil {
 			t.Errorf("%d: %s", i, err)
 			continue

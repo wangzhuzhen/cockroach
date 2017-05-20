@@ -18,12 +18,14 @@ package cli
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/pkg/errors"
 )
 
 // statementsValue is an implementation of pflag.Value that appends any
@@ -60,12 +62,13 @@ const (
 	tableDisplayRecords
 	tableDisplaySQL
 	tableDisplayHTML
+	tableDisplayRaw
 )
 
 // Type implements the pflag.Value interface.
 func (f *tableDisplayFormat) Type() string { return "string" }
 
-// String imlements the pflag.Value itnerface.
+// String implements the pflag.Value interface.
 func (f *tableDisplayFormat) String() string {
 	switch *f {
 	case tableDisplayTSV:
@@ -80,6 +83,8 @@ func (f *tableDisplayFormat) String() string {
 		return "sql"
 	case tableDisplayHTML:
 		return "html"
+	case tableDisplayRaw:
+		return "raw"
 	}
 	return ""
 }
@@ -99,9 +104,11 @@ func (f *tableDisplayFormat) Set(s string) error {
 		*f = tableDisplaySQL
 	case "html":
 		*f = tableDisplayHTML
+	case "raw":
+		*f = tableDisplayRaw
 	default:
 		return fmt.Errorf("invalid table display format: %s "+
-			"(possible values: tsv, csv, pretty, records, sql, html)", s)
+			"(possible values: tsv, csv, pretty, records, sql, html, raw)", s)
 	}
 	return nil
 }
@@ -192,6 +199,16 @@ func parseKeyType(value string) (keyType, error) {
 	return 0, fmt.Errorf("unknown key type '%s'", value)
 }
 
+// unquoteArg unquotes the provided argument using Go double-quoted
+// string literal rules.
+func unquoteArg(arg string) (string, error) {
+	s, err := strconv.Unquote(`"` + arg + `"`)
+	if err != nil {
+		return "", errors.Wrapf(err, "invalid argument %q", arg)
+	}
+	return s, nil
+}
+
 type mvccKey engine.MVCCKey
 
 func (k *mvccKey) String() string {
@@ -215,7 +232,7 @@ func (k *mvccKey) Set(value string) error {
 
 	switch typ {
 	case raw:
-		unquoted, err := unquoteArg(keyStr, false)
+		unquoted, err := unquoteArg(keyStr)
 		if err != nil {
 			return err
 		}
